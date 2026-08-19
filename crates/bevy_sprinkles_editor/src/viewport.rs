@@ -1,0 +1,947 @@
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+use std::ops::Range;
+
+use bevy::anti_alias::smaa::{Smaa, SmaaPreset};
+use bevy::asset::RenderAssetUsages;
+use bevy::camera::RenderTarget;
+use bevy::camera::primitives::Aabb;
+use bevy::camera::visibility::NoFrustumCulling;
+use bevy::color::palettes::tailwind::{ZINC_200, ZINC_950};
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
+use bevy::math::Affine2;
+use bevy::picking::hover::Hovered;
+use bevy::post_process::bloom::Bloom;
+use bevy::prelude::*;
+use bevy::render::gpu_readback::{Readback, ReadbackComplete};
+use bevy::render::render_resource::{TextureDimension, TextureFormat, TextureUsages};
+use bevy::window::PresentMode;
+use bevy_sprinkles::prelude::*;
+use bevy_sprinkles::{ParticleBufferHandle, ParticleData};
+
+use crate::io::{EditorBloom, EditorData, EditorSmaaPreset, EditorTonemapping};
+
+use crate::state::{
+    EditorState, GenerateAabbRequest, Inspectable, PlaybackPlayEvent, PlaybackResetEvent,
+    PlaybackSeekEvent,
+};
+use crate::ui::components::binding::EmitterWriter;
+use crate::ui::components::seekbar::SeekbarDragState;
+use crate::ui::components::toasts::ToastEvent;
+use crate::ui::components::viewport::EditorViewport;
+use crate::ui::tokens::PRIMARY_COLOR;
+
+const MIN_ZOOM_DISTANCE: f32 = 0.1;
+const MAX_ZOOM_DISTANCE: f32 = 20.0;
+const ZOOM_SPEED: f32 = 0.5;
+const INITIAL_ORBIT_DISTANCE: f32 = 8.0;
+const ORBIT_OFFSET: Vec3 = Vec3::new(1.0, 0.75, 1.0);
+const ORBIT_TARGET: Vec3 = Vec3::ZERO;
+
+const FLOOR_SIZE: f32 = 192.0;
+const FLOOR_TILE_SIZE: f32 = 4.0;
+
+#[derive(Component)]
+pub struct EditorCamera;
+
+#[derive(Default, Resource)]
+pub struct ViewportInputState {
+    pub dragging: bool,
+}
+
+#[derive(Debug, Resource)]
+pub struct CameraSettings {
+    pub orbit_distance: f32,
+    pub pitch_speed: f32,
+    pub pitch_range: Range<f32>,
+    pub yaw_speed: f32,
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        let pitch_limit = FRAC_PI_2 - 0.01;
+        Self {
+            orbit_distance: INITIAL_ORBIT_DISTANCE,
+            pitch_speed: 0.003,
+            pitch_range: -pitch_limit..pitch_limit,
+            yaw_speed: 0.004,
+        }
+    }
+}
+
+pub fn setup_camera(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    editor_data: Res<EditorData>,
+) {
+    let mut image = Image::new_uninit(
+        default(),
+        TextureDimension::D2,
+        TextureFormat::Bgra8UnormSrgb,
+        RenderAssetUsages::all(),
+    );
+    image.texture_descriptor.usage =
+        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
+    let image_handle = images.add(image);
+
+    commands.spawn((Name::new("UiCamera"), Camera2d));
+
+    let settings = &editor_data.settings;
+    let initial_position = ORBIT_TARGET + ORBIT_OFFSET.normalize() * INITIAL_ORBIT_DISTANCE;
+    let tonemapping = settings
+        .tonemapping
+        .as_ref()
+        .map(to_bevy_tonemapping)
+        .unwrap_or(Tonemapping::None);
+
+    let mut camera = commands.spawn((
+        EditorCamera,
+        Name::new("ViewportCamera"),
+        Camera3d::default(),
+        Camera {
+            order: -1,
+            clear_color: ClearColorConfig::Custom(ZINC_950.into()),
+            ..default()
+        },
+        RenderTarget::Image(image_handle.into()),
+        Transform::from_translation(initial_position).looking_at(ORBIT_TARGET, Vec3::Y),
+        Msaa::Off,
+        tonemapping,
+        DistanceFog {
+            color: ZINC_950.into(),
+            falloff: FogFalloff::Linear {
+                start: 24.0,
+                end: 96.0,
+            },
+            ..default()
+        },
+    ));
+
+    if let Some(bloom) = settings.bloom.as_ref() {
+        camera.insert(to_bevy_bloom(bloom));
+    }
+    if let Some(smaa) = settings.anti_aliasing.as_ref() {
+        camera.insert(Smaa {
+            preset: to_bevy_smaa_preset(smaa),
+        });
+    }
+
+    commands.spawn((
+        DirectionalLight {
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -FRAC_PI_4, 0.0, -FRAC_PI_4)),
+    ));
+}
+
+pub fn setup_floor(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let mesh = meshes.add(Plane3d::new(*Dir3::Y, Vec2::splat(FLOOR_SIZE / 2.)));
+    let material = materials.add(StandardMaterial {
+        base_color_texture: Some(
+            asset_server
+                .load_builder()
+                .with_settings(|settings: &mut ImageLoaderSettings| {
+                    settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                        address_mode_u: ImageAddressMode::Repeat,
+                        address_mode_v: ImageAddressMode::Repeat,
+                        address_mode_w: ImageAddressMode::Repeat,
+                        ..default()
+                    });
+                })
+                .load("embedded://sprinkles/assets/floor.png"),
+        ),
+        uv_transform: Affine2::from_scale(Vec2::splat(FLOOR_SIZE / FLOOR_TILE_SIZE)),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        Name::new("Floor"),
+        Transform::from_xyz(0.0, -2.0, 0.0),
+        Visibility::default(),
+    ));
+}
+
+pub fn orbit_camera(
+    mut camera: Single<&mut Transform, With<EditorCamera>>,
+    viewport: Single<&Hovered, With<EditorViewport>>,
+    mut input_state: ResMut<ViewportInputState>,
+    camera_settings: Res<CameraSettings>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mouse_motion: Res<AccumulatedMouseMotion>,
+) {
+    let pressing =
+        mouse_buttons.pressed(MouseButton::Left) || mouse_buttons.pressed(MouseButton::Right);
+
+    if !pressing {
+        input_state.dragging = false;
+        return;
+    }
+
+    let just_pressed = mouse_buttons.just_pressed(MouseButton::Left)
+        || mouse_buttons.just_pressed(MouseButton::Right);
+
+    if just_pressed && viewport.get() {
+        input_state.dragging = true;
+    }
+
+    if !input_state.dragging {
+        return;
+    }
+
+    let delta = -mouse_motion.delta;
+    let delta_pitch = delta.y * camera_settings.pitch_speed;
+    let delta_yaw = delta.x * camera_settings.yaw_speed;
+
+    let (yaw, pitch, roll) = camera.rotation.to_euler(EulerRot::YXZ);
+
+    let pitch = (pitch + delta_pitch).clamp(
+        camera_settings.pitch_range.start,
+        camera_settings.pitch_range.end,
+    );
+    let yaw = yaw + delta_yaw;
+    camera.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, roll);
+
+    camera.translation = ORBIT_TARGET - camera.forward() * camera_settings.orbit_distance;
+}
+
+pub fn zoom_camera(
+    mut camera: Single<&mut Transform, With<EditorCamera>>,
+    viewport: Single<&Hovered, With<EditorViewport>>,
+    mut camera_settings: ResMut<CameraSettings>,
+    mouse_scroll: Res<AccumulatedMouseScroll>,
+) {
+    if !viewport.get() {
+        return;
+    }
+
+    let delta = mouse_scroll.delta.y;
+    if delta == 0.0 {
+        return;
+    }
+
+    let zoom_delta = -delta * ZOOM_SPEED;
+    camera_settings.orbit_distance =
+        (camera_settings.orbit_distance + zoom_delta).clamp(MIN_ZOOM_DISTANCE, MAX_ZOOM_DISTANCE);
+
+    camera.translation = ORBIT_TARGET - camera.forward() * camera_settings.orbit_distance;
+}
+
+#[derive(Component)]
+pub struct EditorParticlePreview;
+
+pub fn spawn_preview_particle_system(
+    mut commands: Commands,
+    editor_state: Res<EditorState>,
+    assets: Res<Assets<ParticlesAsset>>,
+    existing: Query<Entity, With<EditorParticlePreview>>,
+) {
+    let Some(handle) = &editor_state.current_project else {
+        for entity in existing.iter() {
+            commands.entity(entity).despawn();
+        }
+        return;
+    };
+
+    let Some(asset) = assets.get(handle) else {
+        return;
+    };
+
+    if !existing.is_empty() {
+        return;
+    }
+
+    commands.spawn((
+        Particles3d(handle.clone()),
+        asset.initial_transform.to_transform(),
+        Visibility::default(),
+        EditorMode,
+        EditorParticlePreview,
+        Name::new("Particle Preview"),
+    ));
+}
+
+pub fn despawn_preview_on_project_change(
+    mut commands: Commands,
+    editor_state: Res<EditorState>,
+    existing: Query<(Entity, &Particles3d), With<EditorParticlePreview>>,
+) {
+    if !editor_state.is_changed() {
+        return;
+    }
+
+    for (entity, particle_system) in existing.iter() {
+        let should_despawn = match &editor_state.current_project {
+            Some(handle) => **particle_system != *handle,
+            None => true,
+        };
+
+        if should_despawn {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+#[derive(Event)]
+pub struct RespawnEmittersEvent;
+
+#[derive(Event)]
+pub struct RespawnCollidersEvent;
+
+pub fn handle_respawn_emitters(
+    _trigger: On<RespawnEmittersEvent>,
+    mut commands: Commands,
+    preview_systems: Query<Entity, With<EditorParticlePreview>>,
+    emitter_entities: Query<(Entity, &EmitterEntity)>,
+) {
+    for system_entity in &preview_systems {
+        for (emitter_entity, emitter) in &emitter_entities {
+            if emitter.parent_system == system_entity {
+                commands.entity(emitter_entity).despawn();
+            }
+        }
+        commands
+            .entity(system_entity)
+            .remove::<(ParticleSystemRuntime, Transform)>();
+    }
+}
+
+pub fn handle_respawn_colliders(
+    _trigger: On<RespawnCollidersEvent>,
+    mut commands: Commands,
+    preview_systems: Query<Entity, With<EditorParticlePreview>>,
+    collider_entities: Query<(Entity, &ColliderEntity)>,
+) {
+    for system_entity in &preview_systems {
+        for (collider_entity, collider) in &collider_entities {
+            if collider.parent_system == system_entity {
+                commands.entity(collider_entity).despawn();
+            }
+        }
+        commands
+            .entity(system_entity)
+            .remove::<(ParticleSystemRuntime, Transform)>();
+    }
+}
+
+pub fn respawn_preview_on_emitter_change(
+    _trigger: On<PlaybackResetEvent>,
+    mut commands: Commands,
+    editor_state: Res<EditorState>,
+    assets: Res<Assets<ParticlesAsset>>,
+    preview_query: Query<Entity, (With<EditorParticlePreview>, With<ParticleSystemRuntime>)>,
+    emitter_query: Query<&EmitterEntity>,
+) {
+    let Some(handle) = &editor_state.current_project else {
+        return;
+    };
+
+    let Some(asset) = assets.get(handle) else {
+        return;
+    };
+
+    let Ok(preview_entity) = preview_query.single() else {
+        return;
+    };
+
+    let current_emitter_count = emitter_query
+        .iter()
+        .filter(|e| e.parent_system == preview_entity)
+        .count();
+
+    let asset_emitter_count = asset.emitters.len();
+
+    if current_emitter_count != asset_emitter_count {
+        commands.entity(preview_entity).despawn();
+    }
+}
+
+pub fn handle_playback_reset_event(
+    _trigger: On<PlaybackResetEvent>,
+    assets: Res<Assets<ParticlesAsset>>,
+    mut system_query: Query<
+        (Entity, &Particles3d, &mut ParticleSystemRuntime),
+        With<EditorParticlePreview>,
+    >,
+    mut emitter_query: Query<(&EmitterEntity, &mut EmitterRuntime)>,
+) {
+    for (system_entity, particle_system, mut system_runtime) in system_query.iter_mut() {
+        let Some(asset) = assets.get(particle_system) else {
+            continue;
+        };
+
+        system_runtime.paused = true;
+        for (emitter, mut runtime) in emitter_query.iter_mut() {
+            if emitter.parent_system == system_entity {
+                let fixed_seed = asset
+                    .emitters
+                    .get(runtime.emitter_index)
+                    .and_then(|e| e.time.fixed_seed);
+                runtime.stop(fixed_seed);
+            }
+        }
+    }
+}
+
+pub fn handle_playback_play_event(
+    _trigger: On<PlaybackPlayEvent>,
+    assets: Res<Assets<ParticlesAsset>>,
+    mut system_query: Query<
+        (Entity, &Particles3d, &mut ParticleSystemRuntime),
+        With<EditorParticlePreview>,
+    >,
+    mut emitter_query: Query<(&EmitterEntity, &mut EmitterRuntime)>,
+) {
+    for (system_entity, particle_system, mut system_runtime) in system_query.iter_mut() {
+        let Some(asset) = assets.get(particle_system) else {
+            continue;
+        };
+
+        let sub_target_indices: Vec<usize> = asset
+            .emitters
+            .iter()
+            .filter_map(|e| e.sub_emitter.as_ref().map(|s| s.target_emitter))
+            .collect();
+
+        let all_one_shots_completed = asset
+            .emitters
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !sub_target_indices.contains(idx))
+            .all(|(idx, emitter_data)| {
+                if !emitter_data.time.one_shot {
+                    return true;
+                }
+                emitter_query.iter().any(|(emitter, runtime)| {
+                    emitter.parent_system == system_entity
+                        && runtime.emitter_index == idx
+                        && runtime.one_shot_completed
+                })
+            });
+
+        let has_one_shot = asset
+            .emitters
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !sub_target_indices.contains(idx))
+            .any(|(_, e)| e.time.one_shot);
+
+        if has_one_shot && all_one_shots_completed {
+            for (emitter, mut runtime) in emitter_query.iter_mut() {
+                if emitter.parent_system == system_entity {
+                    runtime.restart(None);
+                }
+            }
+            system_runtime.resume();
+        }
+    }
+}
+
+pub fn handle_playback_seek_event(
+    trigger: On<PlaybackSeekEvent>,
+    system_query: Query<Entity, With<EditorParticlePreview>>,
+    mut emitter_query: Query<(&EmitterEntity, &mut EmitterRuntime)>,
+) {
+    let seek_time = trigger.0;
+
+    for system_entity in system_query.iter() {
+        for (emitter, mut runtime) in emitter_query.iter_mut() {
+            if emitter.parent_system == system_entity {
+                runtime.seek(seek_time);
+            }
+        }
+    }
+}
+
+pub fn draw_collider_gizmos(
+    mut gizmos: Gizmos,
+    colliders: Query<(&ParticlesCollider3D, &ColliderEntity, &Transform)>,
+    editor_state: Res<EditorState>,
+) {
+    let inspected_index = editor_state
+        .inspecting
+        .as_ref()
+        .filter(|i| i.kind == Inspectable::Collider)
+        .map(|i| i.index as usize);
+
+    for (collider, collider_entity, transform) in &colliders {
+        if inspected_index != Some(collider_entity.collider_index) {
+            continue;
+        }
+
+        let color = if collider.enabled {
+            PRIMARY_COLOR
+        } else {
+            ZINC_200
+        };
+
+        match &collider.shape {
+            ParticlesColliderShape3D::Box { size } => {
+                let collider_transform = Transform {
+                    translation: transform.translation,
+                    rotation: transform.rotation,
+                    scale: transform.scale * *size,
+                };
+                gizmos.cube(collider_transform, color);
+            }
+            ParticlesColliderShape3D::Sphere { radius } => {
+                let isometry = Isometry3d::from_translation(transform.translation);
+                let scaled_radius = *radius * transform.scale.max_element();
+                gizmos.sphere(isometry, scaled_radius, color);
+            }
+        }
+    }
+}
+
+pub fn setup_aabb_gizmo_config(mut config_store: ResMut<GizmoConfigStore>) {
+    let (_, aabb_config) = config_store.config_mut::<AabbGizmoConfigGroup>();
+    aabb_config.default_color = Some(Color::WHITE.with_alpha(0.1));
+}
+
+pub fn sync_inspected_emitter_aabb(
+    mut commands: Commands,
+    editor_state: Res<EditorState>,
+    editor_data: Res<EditorData>,
+    assets: Res<Assets<ParticlesAsset>>,
+    preview: Query<Entity, With<EditorParticlePreview>>,
+    emitters: Query<(Entity, &EmitterEntity, &EmitterRuntime)>,
+    new_emitters: Query<(), Added<EmitterEntity>>,
+) {
+    if !editor_state.is_changed()
+        && !editor_data.is_changed()
+        && !assets.is_changed()
+        && new_emitters.is_empty()
+    {
+        return;
+    }
+
+    let show_gizmos = editor_data.settings.show_aabb_gizmos;
+
+    let inspected = editor_state
+        .inspecting
+        .as_ref()
+        .filter(|i| i.kind == Inspectable::Emitter)
+        .map(|i| i.index as usize);
+
+    let visibility_aabb = inspected.and_then(|index| {
+        let handle = editor_state.current_project.as_ref()?;
+        let asset = assets.get(handle)?;
+        asset
+            .emitters
+            .get(index)
+            .map(|e| e.draw_pass.visibility_aabb)
+    });
+
+    for (entity, emitter, runtime) in &emitters {
+        let is_inspected =
+            inspected == Some(runtime.emitter_index) && preview.get(emitter.parent_system).is_ok();
+        let aabb = is_inspected.then_some(visibility_aabb).flatten();
+
+        if let Some(aabb) = aabb {
+            commands.entity(entity).insert(Aabb {
+                center: aabb.center,
+                half_extents: aabb.half_extents,
+            });
+        }
+
+        if aabb.is_some() && show_gizmos {
+            commands.entity(entity).insert(ShowAabbGizmo::default());
+        } else {
+            commands.entity(entity).remove::<ShowAabbGizmo>();
+        }
+    }
+}
+
+#[derive(Component)]
+struct AabbReadback;
+
+#[derive(Resource, Default)]
+pub struct AabbGeneration {
+    active: bool,
+    readback_entity: Option<Entity>,
+    time_remaining: f32,
+    min: Vec3,
+    max: Vec3,
+    has_samples: bool,
+    to_local: Option<Mat4>,
+    restore_paused: bool,
+}
+
+impl AabbGeneration {
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+pub fn handle_generate_aabb_request(
+    trigger: On<GenerateAabbRequest>,
+    assets: Res<Assets<ParticlesAsset>>,
+    editor_state: Res<EditorState>,
+    preview: Query<Entity, With<EditorParticlePreview>>,
+    mut systems: Query<(Entity, &mut ParticleSystemRuntime), With<EditorParticlePreview>>,
+    mut emitters: Query<(
+        &EmitterEntity,
+        &mut EmitterRuntime,
+        &GlobalTransform,
+        &ParticleBufferHandle,
+    )>,
+    mut generation: ResMut<AabbGeneration>,
+    mut commands: Commands,
+) {
+    if generation.active {
+        return;
+    }
+
+    let index = trigger.0;
+
+    let Some(handle) = editor_state.current_project.as_ref() else {
+        return;
+    };
+    let Some(asset) = assets.get(handle) else {
+        return;
+    };
+    let Some(emitter_data) = asset.emitters.get(index) else {
+        return;
+    };
+
+    let mut found = None;
+    for (emitter, mut runtime, global_transform, buffer) in emitters.iter_mut() {
+        if runtime.emitter_index == index && preview.get(emitter.parent_system).is_ok() {
+            runtime.restart(emitter_data.time.fixed_seed);
+            found = Some((
+                buffer.particle_buffer.clone(),
+                *global_transform,
+                emitter.parent_system,
+            ));
+            break;
+        }
+    }
+    let Some((particle_buffer, global_transform, parent_system)) = found else {
+        return;
+    };
+
+    let mut restore_paused = false;
+    for (system_entity, mut system_runtime) in systems.iter_mut() {
+        if system_entity == parent_system {
+            restore_paused = system_runtime.paused;
+            system_runtime.resume();
+        }
+    }
+
+    let to_local = if emitter_data.draw_pass.use_local_coords {
+        None
+    } else {
+        Some(global_transform.to_matrix().inverse())
+    };
+
+    let window = emitter_data.time.lifetime * (1.0 + emitter_data.time.lifetime_randomness)
+        + emitter_data.time.delay
+        + 0.5;
+    let window = if window.is_finite() && window > 0.0 {
+        window.clamp(0.5, 10.0)
+    } else {
+        2.0
+    };
+
+    let readback_entity = commands
+        .spawn((AabbReadback, Readback::buffer(particle_buffer)))
+        .observe(on_aabb_readback)
+        .id();
+
+    *generation = AabbGeneration {
+        active: true,
+        readback_entity: Some(readback_entity),
+        time_remaining: window,
+        min: Vec3::ZERO,
+        max: Vec3::ZERO,
+        has_samples: false,
+        to_local,
+        restore_paused,
+    };
+}
+
+fn on_aabb_readback(event: On<ReadbackComplete>, mut generation: ResMut<AabbGeneration>) {
+    if !generation.active {
+        return;
+    }
+
+    let to_local = generation.to_local;
+    let particles: Vec<ParticleData> = event.to_shader_type();
+
+    for particle in &particles {
+        if !particle.is_active() {
+            continue;
+        }
+
+        let mut position = Vec3::new(
+            particle.position[0],
+            particle.position[1],
+            particle.position[2],
+        );
+        if let Some(matrix) = to_local {
+            position = matrix.transform_point3(position);
+        }
+
+        if generation.has_samples {
+            generation.min = generation.min.min(position);
+            generation.max = generation.max.max(position);
+        } else {
+            generation.min = position;
+            generation.max = position;
+            generation.has_samples = true;
+        }
+    }
+}
+
+pub fn tick_aabb_generation(
+    time: Res<Time>,
+    mut generation: ResMut<AabbGeneration>,
+    mut systems: Query<&mut ParticleSystemRuntime, With<EditorParticlePreview>>,
+    mut emitter_writer: EmitterWriter,
+    mut commands: Commands,
+) {
+    if !generation.active {
+        return;
+    }
+
+    generation.time_remaining -= time.delta_secs();
+    if generation.time_remaining > 0.0 {
+        return;
+    }
+
+    if generation.has_samples {
+        let round = |v: Vec3| (v * 100.0).round() / 100.0;
+        let center = round((generation.min + generation.max) * 0.5);
+        let half_extents = round((generation.max - generation.min) * 0.5);
+        let emitter_name = emitter_writer.emitter().map(|emitter| emitter.name.clone());
+        emitter_writer.modify_emitter(|emitter| {
+            emitter.draw_pass.visibility_aabb = VisibilityAabb {
+                center: center.into(),
+                half_extents: half_extents.into(),
+            };
+            true
+        });
+        if let Some(name) = emitter_name {
+            commands.trigger(ToastEvent::success(format!(
+                "Visibility AABB generated for emitter \"{name}\""
+            )));
+        }
+    }
+
+    if let Some(entity) = generation.readback_entity.take() {
+        commands.entity(entity).despawn();
+    }
+
+    if generation.restore_paused {
+        for mut system_runtime in systems.iter_mut() {
+            system_runtime.pause();
+        }
+    }
+
+    *generation = AabbGeneration::default();
+}
+
+pub fn sync_playback_state(
+    assets: Res<Assets<ParticlesAsset>>,
+    drag_state: Query<&SeekbarDragState>,
+    mut system_query: Query<
+        (Entity, &Particles3d, &mut ParticleSystemRuntime),
+        With<EditorParticlePreview>,
+    >,
+    mut emitter_query: Query<(&EmitterEntity, &mut EmitterRuntime)>,
+) {
+    let is_seeking = drag_state.iter().any(|s| s.dragging);
+
+    for (system_entity, particle_system, mut system_runtime) in system_query.iter_mut() {
+        let Some(asset) = assets.get(particle_system) else {
+            continue;
+        };
+
+        if is_seeking {
+            if !system_runtime.paused {
+                system_runtime.pause();
+            }
+            continue;
+        }
+
+        let sub_target_indices: Vec<usize> = asset
+            .emitters
+            .iter()
+            .filter_map(|e| e.sub_emitter.as_ref().map(|s| s.target_emitter))
+            .collect();
+
+        let all_one_shots_completed = asset
+            .emitters
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !sub_target_indices.contains(idx))
+            .all(|(idx, emitter_data)| {
+                if !emitter_data.time.one_shot {
+                    return true;
+                }
+                emitter_query.iter().any(|(emitter, runtime)| {
+                    emitter.parent_system == system_entity
+                        && runtime.emitter_index == idx
+                        && runtime.one_shot_completed
+                })
+            });
+
+        let has_one_shot = asset
+            .emitters
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !sub_target_indices.contains(idx))
+            .any(|(_, e)| e.time.one_shot);
+
+        if has_one_shot && all_one_shots_completed {
+            if system_runtime.force_loop {
+                for (emitter, mut runtime) in emitter_query.iter_mut() {
+                    if emitter.parent_system == system_entity {
+                        let fixed_seed = asset
+                            .emitters
+                            .get(runtime.emitter_index)
+                            .and_then(|e| e.time.fixed_seed);
+                        runtime.restart(fixed_seed);
+                    }
+                }
+            } else {
+                system_runtime.pause();
+                for (emitter, mut runtime) in emitter_query.iter_mut() {
+                    if emitter.parent_system == system_entity {
+                        runtime.seek(0.0);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if !system_runtime.paused {
+            for (emitter, mut runtime) in emitter_query.iter_mut() {
+                if emitter.parent_system == system_entity
+                    && !runtime.is_emitting()
+                    && !runtime.one_shot_completed
+                {
+                    runtime.play();
+                }
+            }
+        }
+    }
+}
+
+fn to_bevy_tonemapping(value: &EditorTonemapping) -> Tonemapping {
+    match value {
+        EditorTonemapping::Reinhard => Tonemapping::Reinhard,
+        EditorTonemapping::ReinhardLuminance => Tonemapping::ReinhardLuminance,
+        EditorTonemapping::AcesFitted => Tonemapping::AcesFitted,
+        EditorTonemapping::AgX => Tonemapping::AgX,
+        EditorTonemapping::SomewhatBoringDisplayTransform => {
+            Tonemapping::SomewhatBoringDisplayTransform
+        }
+        EditorTonemapping::TonyMcMapface => Tonemapping::TonyMcMapface,
+        EditorTonemapping::BlenderFilmic => Tonemapping::BlenderFilmic,
+    }
+}
+
+fn to_bevy_bloom(value: &EditorBloom) -> Bloom {
+    match value {
+        EditorBloom::Natural => Bloom::NATURAL,
+        EditorBloom::Anamorphic => Bloom::ANAMORPHIC,
+        EditorBloom::OldSchool => Bloom::OLD_SCHOOL,
+        EditorBloom::ScreenBlur => Bloom::SCREEN_BLUR,
+    }
+}
+
+fn to_bevy_smaa_preset(value: &EditorSmaaPreset) -> SmaaPreset {
+    match value {
+        EditorSmaaPreset::Low => SmaaPreset::Low,
+        EditorSmaaPreset::Medium => SmaaPreset::Medium,
+        EditorSmaaPreset::High => SmaaPreset::High,
+        EditorSmaaPreset::Ultra => SmaaPreset::Ultra,
+    }
+}
+
+pub fn sync_viewport_settings(
+    mut commands: Commands,
+    editor_data: Res<EditorData>,
+    mut camera: Query<
+        (
+            Entity,
+            &mut Tonemapping,
+            Option<&mut Bloom>,
+            Option<&mut Smaa>,
+        ),
+        With<EditorCamera>,
+    >,
+    mut window: Query<&mut Window>,
+) {
+    if !editor_data.is_changed() {
+        return;
+    }
+
+    let Ok((entity, mut tonemapping, bloom, smaa)) = camera.single_mut() else {
+        return;
+    };
+
+    let settings = &editor_data.settings;
+
+    if let Ok(mut window) = window.single_mut() {
+        let target_present_mode = if settings.vsync {
+            PresentMode::AutoVsync
+        } else {
+            PresentMode::AutoNoVsync
+        };
+        if window.present_mode != target_present_mode {
+            window.present_mode = target_present_mode;
+        }
+    }
+
+    let target_tonemapping = settings
+        .tonemapping
+        .as_ref()
+        .map(to_bevy_tonemapping)
+        .unwrap_or(Tonemapping::None);
+    *tonemapping = target_tonemapping;
+
+    match (&settings.bloom, bloom) {
+        (Some(value), Some(mut current)) => {
+            *current = to_bevy_bloom(value);
+        }
+        (Some(value), None) => {
+            commands.entity(entity).insert(to_bevy_bloom(value));
+        }
+        (None, Some(_)) => {
+            commands.entity(entity).remove::<Bloom>();
+        }
+        (None, None) => {}
+    }
+
+    match (&settings.anti_aliasing, smaa) {
+        (Some(value), Some(mut current)) => {
+            current.preset = to_bevy_smaa_preset(value);
+        }
+        (Some(value), None) => {
+            commands.entity(entity).insert(Smaa {
+                preset: to_bevy_smaa_preset(value),
+            });
+        }
+        (None, Some(_)) => {
+            commands.entity(entity).remove::<Smaa>();
+        }
+        (None, None) => {}
+    }
+
+    if settings.frustum_culling {
+        commands.entity(entity).remove::<NoFrustumCulling>();
+    } else {
+        commands.entity(entity).insert(NoFrustumCulling);
+    }
+}

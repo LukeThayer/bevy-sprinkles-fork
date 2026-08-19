@@ -1,0 +1,125 @@
+use std::path::PathBuf;
+
+use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
+use bevy_sprinkles::prelude::*;
+
+use crate::io::is_example_path;
+use crate::ui::icons::{ICON_FILE, ICON_NODE_TREE, ICON_SETTINGS};
+
+pub fn plugin(app: &mut App) {
+    app.init_resource::<EditorState>()
+        .init_resource::<DirtyState>()
+        .init_resource::<ActiveSidebarTab>()
+        .add_systems(PostStartup, update_window_title)
+        .add_systems(Update, update_window_title);
+}
+
+#[derive(Resource, Default)]
+pub struct EditorState {
+    pub current_project: Option<Handle<ParticlesAsset>>,
+    pub current_project_path: Option<PathBuf>,
+    pub inspecting: Option<Inspecting>,
+}
+
+impl EditorState {
+    pub fn open_project(
+        &mut self,
+        handle: Handle<ParticlesAsset>,
+        path: PathBuf,
+        dirty_state: &mut DirtyState,
+    ) {
+        let is_example = is_example_path(&path);
+        self.current_project = Some(handle);
+        self.current_project_path = if is_example { None } else { Some(path) };
+        dirty_state.has_unsaved_changes = is_example;
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct DirtyState {
+    pub has_unsaved_changes: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct Inspecting {
+    pub kind: Inspectable,
+    pub index: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inspectable {
+    Emitter,
+    Collider,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarTab {
+    Project,
+    #[default]
+    Outliner,
+    Settings,
+}
+
+impl SidebarTab {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Project => "Project",
+            Self::Outliner => "Outliner",
+            Self::Settings => "Settings",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Project => ICON_FILE,
+            Self::Outliner => ICON_NODE_TREE,
+            Self::Settings => ICON_SETTINGS,
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct ActiveSidebarTab(pub SidebarTab);
+
+#[derive(Event)]
+pub struct PlaybackResetEvent;
+
+#[derive(Event)]
+pub struct PlaybackPlayEvent;
+
+#[derive(Event)]
+pub struct PlaybackSeekEvent(pub f32);
+
+#[derive(Event)]
+pub struct GenerateAabbRequest(pub usize);
+
+fn update_window_title(
+    editor_state: Res<EditorState>,
+    dirty_state: Res<DirtyState>,
+    assets: Res<Assets<ParticlesAsset>>,
+    mut window: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if !editor_state.is_changed() && !dirty_state.is_changed() {
+        return;
+    }
+
+    let Ok(mut window) = window.single_mut() else {
+        return;
+    };
+
+    let project_name = editor_state
+        .current_project
+        .as_ref()
+        .and_then(|handle| assets.get(handle))
+        .map(|asset| asset.name.as_str())
+        .unwrap_or("Untitled");
+
+    let prefix = if dirty_state.has_unsaved_changes {
+        "* "
+    } else {
+        ""
+    };
+
+    window.title = format!("{prefix}{project_name} - Sprinkles Editor");
+}

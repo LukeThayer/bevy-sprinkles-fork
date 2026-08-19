@@ -1,0 +1,924 @@
+use std::time::Duration;
+
+use bevy::input_focus::{FocusCause, InputFocus};
+use bevy::picking::hover::Hovered;
+use bevy::prelude::*;
+use bevy::text::{
+    EditableText, EditableTextFilter, FontFeatureTag, FontFeatures, TextCursorStyle, TextEdit,
+    TextLayoutInfo,
+};
+
+use bevy::ui::UiGlobalTransform;
+use bevy::window::SystemCursorIcon;
+
+use crate::ui::icons::ICON_EXPAND_HORIZONTAL;
+use crate::ui::tokens::{
+    BORDER_COLOR, FONT_PATH, PRIMARY_COLOR, TEXT_BODY_COLOR, TEXT_MUTED_COLOR, TEXT_SIZE,
+    TEXT_SIZE_SM,
+};
+use crate::ui::widgets::cursor::{ActiveCursor, HoverCursor};
+
+pub fn set_text_input_value(editable: &mut EditableText, text: String) {
+    editable.queue_edit(TextEdit::SelectAll);
+    editable.queue_edit(TextEdit::Insert(text.into()));
+}
+
+#[derive(Event)]
+pub struct TextEditCommitEvent {
+    pub entity: Entity,
+    pub text: String,
+}
+
+#[derive(Component)]
+pub struct Placeholder {
+    pub text: String,
+}
+
+#[derive(Component)]
+pub struct PlaceholderNode;
+
+const INPUT_HEIGHT: f32 = 28.0;
+const AFFIX_SIZE: u64 = 16;
+
+pub fn plugin(app: &mut App) {
+    app.add_systems(Update, setup_text_edit_input)
+        .add_systems(
+            Update,
+            (
+                handle_focus_style,
+                handle_numeric_increment,
+                handle_tab_navigation,
+                handle_unfocus,
+                handle_drag_value,
+                handle_click_to_focus,
+                handle_clamp_on_unfocus,
+            ),
+        )
+        .add_systems(PostUpdate, (apply_default_value, handle_suffix).chain())
+        .add_systems(PostUpdate, sync_placeholder_visibility);
+}
+
+#[derive(Component)]
+pub struct EditorTextEdit;
+
+#[derive(Component)]
+struct TextEditWrapper(Entity);
+
+#[derive(Component, Default, Clone, Copy, PartialEq)]
+pub enum TextEditVariant {
+    #[default]
+    Default,
+    NumericF32,
+    NumericI32,
+}
+
+impl TextEditVariant {
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Self::NumericF32 | Self::NumericI32)
+    }
+}
+
+#[derive(Clone)]
+pub enum TextEditPrefix {
+    Icon { path: String },
+    Label { label: String, size: f32 },
+}
+
+impl Default for TextEditPrefix {
+    fn default() -> Self {
+        Self::Icon {
+            path: ICON_EXPAND_HORIZONTAL.to_string(),
+        }
+    }
+}
+
+#[derive(Component)]
+struct TextEditSuffix(String);
+
+#[derive(Component)]
+struct TextEditSuffixNode(Entity);
+
+#[derive(Component)]
+struct TextEditDefaultValue(String);
+
+#[derive(Component, Default)]
+struct DragHitbox {
+    dragging: bool,
+    start_x: f32,
+    start_value: f64,
+}
+
+#[derive(Component, Clone, Copy)]
+struct NumericRange {
+    min: f64,
+    max: f64,
+}
+
+#[derive(Component)]
+struct AllowEmpty;
+
+#[derive(Clone)]
+pub enum FilterType {
+    Decimal,
+    Integer,
+}
+
+#[derive(Component, Clone, Default)]
+struct TextEditConfig {
+    label: Option<String>,
+    variant: TextEditVariant,
+    filter: Option<FilterType>,
+    prefix: Option<TextEditPrefix>,
+    suffix: Option<String>,
+    placeholder: String,
+    default_value: Option<String>,
+    min: f64,
+    max: f64,
+    allow_empty: bool,
+    drag_bottom: bool,
+    initialized: bool,
+}
+
+pub struct TextEditProps {
+    pub label: Option<String>,
+    pub placeholder: String,
+    pub default_value: Option<String>,
+    pub variant: TextEditVariant,
+    pub filter: Option<FilterType>,
+    pub prefix: Option<TextEditPrefix>,
+    pub suffix: Option<String>,
+    pub min: f64,
+    pub max: f64,
+    pub allow_empty: bool,
+    pub drag_bottom: bool,
+}
+
+impl Default for TextEditProps {
+    fn default() -> Self {
+        Self {
+            label: None,
+            placeholder: String::new(),
+            default_value: None,
+            variant: TextEditVariant::Default,
+            filter: None,
+            prefix: None,
+            suffix: None,
+            min: f64::MIN,
+            max: f64::MAX,
+            allow_empty: false,
+            drag_bottom: false,
+        }
+    }
+}
+
+impl TextEditProps {
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+    pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+    pub fn with_prefix(mut self, prefix: TextEditPrefix) -> Self {
+        self.prefix = Some(prefix);
+        self
+    }
+    pub fn with_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.suffix = Some(suffix.into());
+        self
+    }
+    pub fn with_default_value(mut self, value: impl Into<String>) -> Self {
+        self.default_value = Some(value.into());
+        self
+    }
+    pub fn with_min(mut self, min: f64) -> Self {
+        self.min = min;
+        self
+    }
+    pub fn with_max(mut self, max: f64) -> Self {
+        self.max = max;
+        self
+    }
+
+    pub fn allow_empty(mut self) -> Self {
+        self.allow_empty = true;
+        self
+    }
+
+    pub fn drag_bottom(mut self) -> Self {
+        self.drag_bottom = true;
+        self
+    }
+
+    pub fn numeric_f32(mut self) -> Self {
+        self.variant = TextEditVariant::NumericF32;
+        self.filter = Some(FilterType::Decimal);
+        self.prefix = Some(TextEditPrefix::default());
+        self.min = f32::MIN as f64;
+        self.max = f32::MAX as f64;
+        self
+    }
+
+    pub fn numeric_i32(mut self) -> Self {
+        self.variant = TextEditVariant::NumericI32;
+        self.filter = Some(FilterType::Integer);
+        self.prefix = Some(TextEditPrefix::default());
+        self.min = i32::MIN as f64;
+        self.max = i32::MAX as f64;
+        self
+    }
+}
+
+pub fn text_edit(props: TextEditProps) -> impl Scene {
+    let TextEditProps {
+        label,
+        placeholder,
+        default_value,
+        variant,
+        filter,
+        prefix,
+        suffix,
+        min,
+        max,
+        allow_empty,
+        drag_bottom,
+    } = props;
+
+    // NOTE: the input subtree is still built by the deferred `setup_text_edit_input`
+    // system (keyed on `TextEditConfig`); this scene just seeds the root node + config.
+    bsn! {
+        Node {
+            flex_direction: { FlexDirection::Column },
+            row_gap: px(3),
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            flex_basis: px(0),
+        }
+        template_value(TextEditConfig {
+            label,
+            variant,
+            filter,
+            prefix,
+            suffix,
+            placeholder,
+            default_value,
+            min,
+            max,
+            allow_empty,
+            drag_bottom,
+            initialized: false,
+        })
+    }
+}
+
+fn setup_text_edit_input(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut configs: Query<(Entity, &mut TextEditConfig)>,
+) {
+    let font: Handle<Font> = asset_server.load(FONT_PATH);
+    let tabular_figures: FontFeatures = [FontFeatureTag::TABULAR_FIGURES].into();
+
+    for (entity, mut config) in &mut configs {
+        if config.initialized {
+            continue;
+        }
+        config.initialized = true;
+
+        if let Some(ref label) = config.label {
+            let label_entity = commands
+                .spawn((
+                    Text::new(label),
+                    TextFont {
+                        font: font.clone().into(),
+                        font_size: TEXT_SIZE_SM.into(),
+                        weight: FontWeight::MEDIUM,
+                        ..default()
+                    },
+                    TextColor(TEXT_MUTED_COLOR.into()),
+                ))
+                .id();
+            commands.entity(entity).add_child(label_entity);
+        }
+
+        let is_numeric = config.variant.is_numeric();
+        let filter = config.filter.as_ref().map(|f| match f {
+            FilterType::Decimal => {
+                EditableTextFilter::new(|c: char| c.is_ascii_digit() || c == '.' || c == '-')
+            }
+            FilterType::Integer => {
+                EditableTextFilter::new(|c: char| c.is_ascii_digit() || c == '-')
+            }
+        });
+
+        let wrapper_entity = commands
+            .spawn((
+                Node {
+                    width: percent(100),
+                    height: px(INPUT_HEIGHT),
+                    padding: UiRect::all(px(6)),
+                    border: UiRect::all(px(1)),
+                    border_radius: BorderRadius::all(px(2)),
+                    align_items: AlignItems::Center,
+                    column_gap: px(6),
+                    ..default()
+                },
+                BackgroundColor(Color::NONE),
+                BorderColor::all(BORDER_COLOR),
+                Interaction::None,
+                Hovered::default(),
+                HoverCursor(SystemCursorIcon::Text),
+            ))
+            .id();
+
+        commands.entity(entity).add_child(wrapper_entity);
+
+        if is_numeric && !config.drag_bottom {
+            const HITBOX_WIDTH: f32 = INPUT_HEIGHT * 0.9;
+            let hitbox = commands
+                .spawn((
+                    DragHitbox::default(),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: px(HITBOX_WIDTH),
+                        height: px(INPUT_HEIGHT),
+                        left: px(0),
+                        ..default()
+                    },
+                    ZIndex(10),
+                    Interaction::None,
+                    Hovered::default(),
+                    HoverCursor(SystemCursorIcon::ColResize),
+                ))
+                .id();
+            commands.entity(wrapper_entity).add_child(hitbox);
+        }
+
+        if is_numeric && config.drag_bottom {
+            let hitbox = commands
+                .spawn((
+                    DragHitbox::default(),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: percent(50),
+                        height: px(INPUT_HEIGHT / 2.0),
+                        left: percent(25),
+                        top: px(INPUT_HEIGHT + 6.0),
+                        border: UiRect::all(px(1.0)),
+                        ..default()
+                    },
+                    ZIndex(50),
+                    Interaction::None,
+                    Hovered::default(),
+                    HoverCursor(SystemCursorIcon::ColResize),
+                ))
+                .id();
+            commands.entity(wrapper_entity).add_child(hitbox);
+        }
+
+        if let Some(ref prefix) = config.prefix {
+            let prefix_entity = match prefix {
+                TextEditPrefix::Icon { path } => commands
+                    .spawn((
+                        ImageNode::new(asset_server.load(path))
+                            .with_color(TEXT_BODY_COLOR.with_alpha(0.5).into()),
+                        Node {
+                            width: px(AFFIX_SIZE),
+                            height: px(AFFIX_SIZE),
+                            ..default()
+                        },
+                    ))
+                    .id(),
+                TextEditPrefix::Label { label, size } => commands
+                    .spawn((
+                        Text::new(label),
+                        TextFont {
+                            font: font.clone().into(),
+                            font_size: (*size).into(),
+                            ..default()
+                        },
+                        TextColor(TEXT_BODY_COLOR.with_alpha(0.5).into()),
+                        TextLayout::justify(Justify::Center),
+                        Node {
+                            width: px(AFFIX_SIZE),
+                            ..default()
+                        },
+                    ))
+                    .id(),
+            };
+            commands.entity(wrapper_entity).add_child(prefix_entity);
+        }
+
+        let placeholder_text = config
+            .suffix
+            .as_ref()
+            .map(|s| format!("{}{}", config.placeholder, s))
+            .unwrap_or_else(|| config.placeholder.clone());
+
+        let mut text_input = commands.spawn((
+            EditorTextEdit,
+            config.variant,
+            EditableText {
+                cursor_blink_period: Duration::from_millis(500),
+                ..default()
+            },
+            TextCursorStyle {
+                color: TEXT_BODY_COLOR.into(),
+                selection_color: PRIMARY_COLOR.with_alpha(0.35).into(),
+                unfocused_selection_color: Color::NONE,
+                selected_text_color: None,
+            },
+            TextFont {
+                font: font.clone().into(),
+                font_size: TEXT_SIZE.into(),
+                font_features: tabular_figures.clone(),
+                ..default()
+            },
+            TextColor(TEXT_BODY_COLOR.into()),
+            TextLayoutInfo::default(),
+            Node {
+                flex_grow: 1.0,
+                height: percent(100),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+        ));
+
+        if let Some(filter) = filter {
+            text_input.insert(filter);
+        }
+
+        if let Some(ref suffix) = config.suffix {
+            text_input.insert(TextEditSuffix(suffix.clone()));
+        }
+
+        if let Some(ref default_value) = config.default_value {
+            text_input.insert(TextEditDefaultValue(default_value.clone()));
+        }
+
+        if is_numeric {
+            text_input.insert(NumericRange {
+                min: config.min,
+                max: config.max,
+            });
+        }
+
+        if config.allow_empty {
+            text_input.insert(AllowEmpty);
+        }
+
+        let text_input_entity = text_input.id();
+
+        if !placeholder_text.is_empty() {
+            let placeholder_entity = commands
+                .spawn((
+                    PlaceholderNode,
+                    Text::new(placeholder_text.clone()),
+                    TextFont {
+                        font: font.clone().into(),
+                        font_size: TEXT_SIZE.into(),
+                        font_features: tabular_figures.clone(),
+                        ..default()
+                    },
+                    TextColor(TEXT_BODY_COLOR.with_alpha(0.2).into()),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0),
+                        ..default()
+                    },
+                    Pickable::IGNORE,
+                ))
+                .id();
+            commands
+                .entity(text_input_entity)
+                .add_child(placeholder_entity);
+            commands.entity(text_input_entity).insert(Placeholder {
+                text: placeholder_text,
+            });
+        }
+
+        commands.entity(wrapper_entity).add_child(text_input_entity);
+
+        if let Some(ref suffix) = config.suffix {
+            let suffix_entity = commands
+                .spawn((
+                    TextEditSuffixNode(text_input_entity),
+                    Text::new(suffix.clone()),
+                    TextFont {
+                        font: font.clone().into(),
+                        font_size: TEXT_SIZE.into(),
+                        font_features: tabular_figures.clone(),
+                        ..default()
+                    },
+                    TextColor(TEXT_MUTED_COLOR.into()),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        top: px(5.5),
+                        display: Display::None,
+                        ..default()
+                    },
+                ))
+                .id();
+            commands.entity(wrapper_entity).add_child(suffix_entity);
+        }
+        commands
+            .entity(wrapper_entity)
+            .insert(TextEditWrapper(text_input_entity));
+    }
+}
+
+fn handle_focus_style(
+    focus: Res<InputFocus>,
+    mut wrappers: Query<(&TextEditWrapper, &mut BorderColor, &Hovered)>,
+) {
+    for (wrapper, mut border_color, hovered) in &mut wrappers {
+        let color = match (focus.get() == Some(wrapper.0), hovered.get()) {
+            (true, _) => PRIMARY_COLOR,
+            (_, true) => BORDER_COLOR.lighter(0.05),
+            _ => BORDER_COLOR,
+        };
+        *border_color = BorderColor::all(color);
+    }
+}
+
+fn apply_default_value(
+    mut commands: Commands,
+    mut text_edits: Query<(
+        Entity,
+        &TextEditDefaultValue,
+        &TextEditVariant,
+        &mut EditableText,
+        Option<&NumericRange>,
+    )>,
+) {
+    for (entity, default_value, variant, mut editable, range) in &mut text_edits {
+        if editable.value().to_string().is_empty() {
+            let text = if variant.is_numeric() {
+                let value = clamp_value(default_value.0.parse().unwrap_or(0.0), range);
+                format_numeric_value(value, *variant)
+            } else {
+                default_value.0.clone()
+            };
+            editable.queue_edit(TextEdit::Insert(text.into()));
+        }
+        commands.entity(entity).remove::<TextEditDefaultValue>();
+    }
+}
+
+fn handle_suffix(
+    focus: Res<InputFocus>,
+    text_edits: Query<(Entity, &EditableText, &TextLayoutInfo, &ChildOf), With<TextEditSuffix>>,
+    mut suffix_nodes: Query<(&TextEditSuffixNode, &mut Node), Without<TextEditWrapper>>,
+    parents: Query<&ChildOf>,
+    configs: Query<&TextEditConfig>,
+) {
+    const WRAPPER_PADDING: f32 = 6.0;
+    const PREFIX_EXTRA: f32 = AFFIX_SIZE as f32 + 6.0;
+    for (entity, editable, layout_info, child_of) in &text_edits {
+        let Some((_, mut node)) = suffix_nodes.iter_mut().find(|(link, _)| link.0 == entity) else {
+            continue;
+        };
+
+        let has_prefix = parents
+            .get(child_of.parent())
+            .ok()
+            .and_then(|wrapper_parent| configs.get(wrapper_parent.parent()).ok())
+            .is_some_and(|config| config.prefix.is_some());
+
+        let offset = WRAPPER_PADDING + if has_prefix { PREFIX_EXTRA } else { 0.0 };
+
+        let text = editable.value().to_string();
+        let show = focus.get() != Some(entity) && !text.is_empty();
+        node.left = px(layout_info.size.x + offset);
+        node.display = if show { Display::Flex } else { Display::None };
+    }
+}
+
+fn handle_tab_navigation(
+    mut focus: ResMut<InputFocus>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    text_edits: Query<(Entity, &UiGlobalTransform), With<EditorTextEdit>>,
+    mut editables: Query<&mut EditableText>,
+) {
+    if !keyboard.just_pressed(KeyCode::Tab) {
+        return;
+    }
+
+    let Some(focused_entity) = focus.get() else {
+        return;
+    };
+
+    if text_edits.get(focused_entity).is_err() {
+        return;
+    }
+
+    let shift = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+
+    let mut entities: Vec<(Entity, Vec2)> = text_edits
+        .iter()
+        .map(|(e, gt)| (e, gt.translation))
+        .collect();
+    entities.sort_by(|a, b| a.1.y.total_cmp(&b.1.y).then(a.1.x.total_cmp(&b.1.x)));
+
+    let Some(current_idx) = entities.iter().position(|(e, _)| *e == focused_entity) else {
+        return;
+    };
+
+    let len = entities.len();
+    let next_idx = if shift {
+        (current_idx + len - 1) % len
+    } else {
+        (current_idx + 1) % len
+    };
+
+    let next_entity = entities[next_idx].0;
+    focus.set(next_entity, FocusCause::Navigated);
+
+    if let Ok(mut editable) = editables.get_mut(next_entity) {
+        editable.queue_edit(TextEdit::SelectAll);
+    }
+}
+
+fn handle_click_to_focus(
+    mut focus: ResMut<InputFocus>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    wrappers: Query<(&TextEditWrapper, &Interaction, &Children)>,
+    drag_hitboxes: Query<&DragHitbox>,
+) {
+    if !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    for (wrapper, interaction, children) in &wrappers {
+        let is_dragging = children
+            .iter()
+            .any(|c| drag_hitboxes.get(c).is_ok_and(|d| d.dragging));
+        if *interaction == Interaction::Pressed && !is_dragging {
+            focus.set(wrapper.0, FocusCause::Pressed);
+        }
+    }
+}
+
+fn handle_unfocus(
+    mut focus: ResMut<InputFocus>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    text_edits: Query<&ChildOf, With<EditorTextEdit>>,
+    wrappers: Query<&Interaction, With<TextEditWrapper>>,
+) {
+    let Some(focused_entity) = focus.get() else {
+        return;
+    };
+    let Ok(child_of) = text_edits.get(focused_entity) else {
+        return;
+    };
+    let Ok(interaction) = wrappers.get(child_of.parent()) else {
+        return;
+    };
+
+    let clicked_outside =
+        mouse.get_just_pressed().next().is_some() && *interaction == Interaction::None;
+    let key_dismiss = keyboard.just_pressed(KeyCode::Escape)
+        || keyboard.just_pressed(KeyCode::Enter)
+        || keyboard.just_pressed(KeyCode::NumpadEnter);
+
+    if clicked_outside || key_dismiss {
+        focus.clear();
+    }
+}
+
+fn handle_clamp_on_unfocus(
+    mut commands: Commands,
+    focus: Res<InputFocus>,
+    mut prev_focus: Local<Option<Entity>>,
+    mut text_edits: Query<
+        (
+            &TextEditVariant,
+            &mut EditableText,
+            Option<&TextEditSuffix>,
+            Option<&NumericRange>,
+            Option<&AllowEmpty>,
+        ),
+        With<EditorTextEdit>,
+    >,
+) {
+    let prev = *prev_focus;
+    *prev_focus = focus.get();
+
+    let Some(was_focused) = prev else { return };
+    if focus.get() == Some(was_focused) {
+        return;
+    }
+
+    let Ok((variant, mut editable, suffix, range, allow_empty)) = text_edits.get_mut(was_focused)
+    else {
+        return;
+    };
+
+    let text = strip_suffix(&editable.value().to_string(), suffix);
+
+    commands.trigger(TextEditCommitEvent {
+        entity: was_focused,
+        text: text.clone(),
+    });
+
+    if !variant.is_numeric() {
+        return;
+    }
+
+    if text.is_empty() && allow_empty.is_some() {
+        return;
+    }
+
+    let value = text.parse().unwrap_or(0.0);
+    update_input_value(&mut editable, value, *variant, range);
+}
+
+fn handle_numeric_increment(
+    focus: Res<InputFocus>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut text_edits: Query<
+        (
+            Entity,
+            &TextEditVariant,
+            &mut EditableText,
+            Option<&TextEditSuffix>,
+            Option<&NumericRange>,
+        ),
+        With<EditorTextEdit>,
+    >,
+) {
+    let Some(focused_entity) = focus.get() else {
+        return;
+    };
+    let Ok((_, variant, mut editable, suffix, range)) = text_edits.get_mut(focused_entity) else {
+        return;
+    };
+    if !variant.is_numeric() {
+        return;
+    }
+
+    let direction = match (
+        keyboard.just_pressed(KeyCode::ArrowUp),
+        keyboard.just_pressed(KeyCode::ArrowDown),
+    ) {
+        (true, _) => 1.0,
+        (_, true) => -1.0,
+        _ => return,
+    };
+
+    let shift = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+    let step = if shift { 10.0 } else { 1.0 };
+    let text = editable.value().to_string();
+    let new_value = parse_numeric_value(&text, suffix) + (direction * step);
+    let rounded = (new_value * 100.0).round() / 100.0;
+
+    update_input_value(&mut editable, rounded, *variant, range);
+}
+
+fn handle_drag_value(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut drag_hitboxes: Query<(Entity, &mut DragHitbox, &Interaction, &ChildOf)>,
+    wrappers: Query<&TextEditWrapper>,
+    mut text_edits: Query<
+        (
+            &TextEditVariant,
+            &mut EditableText,
+            Option<&TextEditSuffix>,
+            Option<&NumericRange>,
+        ),
+        With<EditorTextEdit>,
+    >,
+) {
+    let Ok(window) = windows.single() else { return };
+    let cursor_pos = window.cursor_position();
+
+    for (entity, mut hitbox, interaction, child_of) in &mut drag_hitboxes {
+        let Ok(wrapper) = wrappers.get(child_of.parent()) else {
+            continue;
+        };
+        let input_entity = wrapper.0;
+
+        if mouse.just_pressed(MouseButton::Left) && *interaction == Interaction::Pressed {
+            if let Some(pos) = cursor_pos {
+                let start_value = if let Ok((_, editable, suffix, _)) = text_edits.get(input_entity)
+                {
+                    let text = editable.value().to_string();
+                    parse_numeric_value(&text, suffix)
+                } else {
+                    continue;
+                };
+                hitbox.dragging = true;
+                hitbox.start_x = pos.x;
+                hitbox.start_value = start_value;
+                commands
+                    .entity(entity)
+                    .insert(ActiveCursor(SystemCursorIcon::ColResize));
+            }
+        }
+
+        if mouse.just_released(MouseButton::Left) {
+            if hitbox.dragging {
+                if let Ok((_, editable, suffix, _)) = text_edits.get(input_entity) {
+                    let text = strip_suffix(&editable.value().to_string(), suffix);
+                    commands.trigger(TextEditCommitEvent {
+                        entity: input_entity,
+                        text,
+                    });
+                }
+            }
+            hitbox.dragging = false;
+            commands.entity(entity).remove::<ActiveCursor>();
+        }
+
+        if hitbox.dragging {
+            if let Some(pos) = cursor_pos {
+                let Ok((variant, mut editable, _, range)) = text_edits.get_mut(input_entity) else {
+                    continue;
+                };
+
+                let alt_mode = keyboard.pressed(KeyCode::SuperLeft)
+                    || keyboard.pressed(KeyCode::SuperRight)
+                    || keyboard.pressed(KeyCode::AltLeft)
+                    || keyboard.pressed(KeyCode::AltRight);
+
+                let (amount, sensitivity) = match (*variant, alt_mode) {
+                    (TextEditVariant::NumericI32, false) => (1.0, 5.0),
+                    (TextEditVariant::NumericI32, true) => (10.0, 10.0),
+                    (_, false) => (0.1, 5.0),
+                    (_, true) => (1.0, 10.0),
+                };
+
+                let steps = ((pos.x - hitbox.start_x) / sensitivity).floor() as f64;
+                let new_value = hitbox.start_value + (steps * amount);
+                let rounded = (new_value * 100.0).round() / 100.0;
+
+                update_input_value(&mut editable, rounded, *variant, range);
+            }
+        }
+    }
+}
+
+fn sync_placeholder_visibility(
+    editables: Query<(&EditableText, &Children), With<Placeholder>>,
+    mut placeholders: Query<&mut Visibility, With<PlaceholderNode>>,
+) {
+    for (editable, children) in &editables {
+        let is_empty = editable.value().to_string().is_empty();
+        for child in children.iter() {
+            if let Ok(mut visibility) = placeholders.get_mut(child) {
+                *visibility = if is_empty {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
+        }
+    }
+}
+
+fn strip_suffix(text: &str, suffix: Option<&TextEditSuffix>) -> String {
+    suffix
+        .and_then(|s| text.strip_suffix(&format!(" {}", s.0)))
+        .unwrap_or(text)
+        .to_string()
+}
+
+fn parse_numeric_value(text: &str, suffix: Option<&TextEditSuffix>) -> f64 {
+    strip_suffix(text, suffix).parse().unwrap_or(0.0)
+}
+
+fn format_numeric_value(value: f64, variant: TextEditVariant) -> String {
+    match variant {
+        TextEditVariant::NumericI32 => (value.round() as i32).to_string(),
+        TextEditVariant::NumericF32 => {
+            let mut text = value.to_string();
+            if !text.contains('.') {
+                text.push_str(".0");
+            }
+            text
+        }
+        TextEditVariant::Default => value.to_string(),
+    }
+}
+
+fn clamp_value(value: f64, range: Option<&NumericRange>) -> f64 {
+    match range {
+        Some(r) => value.clamp(r.min, r.max),
+        None => value,
+    }
+}
+
+fn update_input_value(
+    editable: &mut EditableText,
+    value: f64,
+    variant: TextEditVariant,
+    range: Option<&NumericRange>,
+) {
+    let clamped = clamp_value(value, range);
+    set_text_input_value(editable, format_numeric_value(clamped, variant));
+}

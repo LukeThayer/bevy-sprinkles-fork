@@ -1,0 +1,21 @@
+(
+    sprinkles_version: "0.3",
+    name: "Test Particle System (Whatever Extension)",
+    dimension: D3,
+    emitters: [
+        (
+            name: "Test Emitter",
+            enabled: true,
+            time: (
+                lifetime: 1.5,
+            ),
+            draw_pass: (
+                mesh: Sphere(),
+                material: Standard(()),
+            ),
+            emission: (
+                particles_amount: 8,
+            ),
+        ),
+    ],
+)

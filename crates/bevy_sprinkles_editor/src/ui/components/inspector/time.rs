@@ -1,0 +1,56 @@
+use bevy::prelude::*;
+
+use crate::ui::icons::{ICON_SEEDLING, ICON_TIME};
+use crate::ui::widgets::inspector_field::InspectorFieldProps;
+
+use super::InspectorSection;
+
+pub fn plugin(_app: &mut App) {}
+
+pub fn time_section() -> (impl Bundle, InspectorSection) {
+    (
+        (),
+        InspectorSection::new(
+            "Time",
+            vec![
+                vec![
+                    InspectorFieldProps::new("time.lifetime")
+                        .with_icon(ICON_TIME)
+                        .with_suffix("s")
+                        .into(),
+                    InspectorFieldProps::new("time.lifetime_randomness")
+                        .percent()
+                        .with_icon(ICON_TIME)
+                        .into(),
+                ],
+                vec![
+                    InspectorFieldProps::new("time.delay")
+                        .with_min(0.)
+                        .with_icon(ICON_TIME)
+                        .with_suffix("s")
+                        .into(),
+                ],
+                vec![
+                    InspectorFieldProps::new("time.explosiveness")
+                        .percent()
+                        .into(),
+                    InspectorFieldProps::new("time.spawn_time_randomness")
+                        .percent()
+                        .into(),
+                ],
+                vec![
+                    InspectorFieldProps::new("time.fixed_fps")
+                        .u32_or_empty()
+                        .with_placeholder("Unlimited")
+                        .into(),
+                    InspectorFieldProps::new("time.fixed_seed")
+                        .optional_u32()
+                        .with_icon(ICON_SEEDLING)
+                        .with_placeholder("Random")
+                        .into(),
+                ],
+                vec![InspectorFieldProps::new("time.one_shot").bool().into()],
+            ],
+        ),
+    )
+}

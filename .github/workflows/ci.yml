@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  bevy_sprinkles:
+    name: bevy_sprinkles
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            relevant:
+              - 'Cargo.toml'
+              - 'crates/bevy_sprinkles/**'
+
+      - name: Install system dependencies
+        if: steps.filter.outputs.relevant == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Install Rust
+        if: steps.filter.outputs.relevant == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        if: steps.filter.outputs.relevant == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        if: steps.filter.outputs.relevant == 'true'
+        run: cargo check -p bevy_sprinkles
+
+      - name: Format
+        if: steps.filter.outputs.relevant == 'true'
+        run: cargo fmt -p bevy_sprinkles -- --check
+
+      - name: Test
+        if: steps.filter.outputs.relevant == 'true'
+        run: cargo test -p bevy_sprinkles
+
+  bevy_sprinkles_editor:
+    name: bevy_sprinkles_editor
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            relevant:
+              - 'Cargo.toml'
+              - 'crates/bevy_sprinkles_editor/**'
+
+      - name: Install system dependencies
+        if: steps.filter.outputs.relevant == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Install Rust
+        if: steps.filter.outputs.relevant == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        if: steps.filter.outputs.relevant == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        if: steps.filter.outputs.relevant == 'true'
+        run: cargo check -p bevy_sprinkles_editor
+
+      - name: Format
+        if: steps.filter.outputs.relevant == 'true'
+        run: cargo fmt -p bevy_sprinkles_editor -- --check
+
+      - name: Test
+        if: steps.filter.outputs.relevant == 'true'
+        run: cargo test -p bevy_sprinkles_editor

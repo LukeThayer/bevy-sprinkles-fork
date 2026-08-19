@@ -1,0 +1,41 @@
+pub const ICON_ADD: &str = "embedded://sprinkles/assets/icons/ri-add-line.png";
+pub const ICON_ARROW_DOWN: &str = "embedded://sprinkles/assets/icons/ri-arrow-down-s-line.png";
+pub const ICON_ARROW_LEFT_RIGHT: &str =
+    "embedded://sprinkles/assets/icons/ri-arrow-left-right-fill.png";
+pub const ICON_BOX: &str = "embedded://sprinkles/assets/icons/ri-box-2-fill.png";
+pub const ICON_CHECK: &str = "embedded://sprinkles/assets/icons/ri-check-fill.png";
+pub const ICON_CHECKBOX_CIRCLE: &str =
+    "embedded://sprinkles/assets/icons/ri-checkbox-circle-fill.png";
+pub const ICON_CLOSE_CIRCLE: &str = "embedded://sprinkles/assets/icons/ri-close-circle-fill.png";
+pub const ICON_CLOSE: &str = "embedded://sprinkles/assets/icons/ri-close-fill.png";
+pub const ICON_CONE: &str = "embedded://sprinkles/assets/icons/blender-cone.png";
+pub const ICON_CUBE: &str = "embedded://sprinkles/assets/icons/blender-cube.png";
+pub const ICON_EMPTY_AXIS: &str = "embedded://sprinkles/assets/icons/blender-empty-axis.png";
+pub const ICON_EXPAND_HORIZONTAL: &str =
+    "embedded://sprinkles/assets/icons/ri-expand-horizontal-s-line.png";
+pub const ICON_FCURVE: &str = "embedded://sprinkles/assets/icons/blender-fcurve.png";
+pub const ICON_FILE: &str = "embedded://sprinkles/assets/icons/ri-file-line.png";
+pub const ICON_FILE_ADD: &str = "embedded://sprinkles/assets/icons/ri-file-add-line.png";
+pub const ICON_FOLDER_IMAGE: &str = "embedded://sprinkles/assets/icons/ri-folder-image-line.png";
+pub const ICON_FOLDER_OPEN: &str = "embedded://sprinkles/assets/icons/ri-folder-open-line.png";
+pub const ICON_HASHTAG: &str = "embedded://sprinkles/assets/icons/ri-hashtag.png";
+pub const ICON_HEART: &str = "embedded://sprinkles/assets/icons/ri-heart-3-fill.png";
+pub const ICON_INFORMATION: &str = "embedded://sprinkles/assets/icons/ri-information-fill.png";
+pub const ICON_MESH_CYLINDER: &str = "embedded://sprinkles/assets/icons/blender-mesh-cylinder.png";
+pub const ICON_MESH_PLANE: &str = "embedded://sprinkles/assets/icons/blender-mesh-plane.png";
+pub const ICON_MESH_TORUS: &str = "embedded://sprinkles/assets/icons/blender-mesh-torus.png";
+pub const ICON_MESH_UVSPHERE: &str = "embedded://sprinkles/assets/icons/blender-mesh-uvsphere.png";
+pub const ICON_MORE: &str = "embedded://sprinkles/assets/icons/ri-more-fill.png";
+pub const ICON_NODE_TREE: &str = "embedded://sprinkles/assets/icons/ri-node-tree.png";
+pub const ICON_PAUSE: &str = "embedded://sprinkles/assets/icons/ri-pause-fill.png";
+pub const ICON_PIVOT_BOUNDBOX: &str =
+    "embedded://sprinkles/assets/icons/blender-pivot-boundbox.png";
+pub const ICON_PLAY: &str = "embedded://sprinkles/assets/icons/ri-play-fill.png";
+pub const ICON_REPEAT: &str = "embedded://sprinkles/assets/icons/ri-repeat-fill.png";
+pub const ICON_SEEDLING: &str = "embedded://sprinkles/assets/icons/ri-seedling-fill.png";
+pub const ICON_SETTINGS: &str = "embedded://sprinkles/assets/icons/ri-settings-4-line.png";
+pub const ICON_SHOWERS: &str = "embedded://sprinkles/assets/icons/ri-showers-fill.png";
+pub const ICON_SPHERE: &str = "embedded://sprinkles/assets/icons/blender-sphere.png";
+pub const ICON_STOP: &str = "embedded://sprinkles/assets/icons/ri-stop-fill.png";
+pub const ICON_TEXTURE: &str = "embedded://sprinkles/assets/icons/blender-texture.png";
+pub const ICON_TIME: &str = "embedded://sprinkles/assets/icons/ri-time-line.png";

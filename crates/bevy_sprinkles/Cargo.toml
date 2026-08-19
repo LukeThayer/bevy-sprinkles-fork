@@ -1,0 +1,30 @@
+[package]
+name = "bevy_sprinkles"
+version = "0.3.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "GPU particle system for Bevy"
+readme = "../../README.md"
+repository = "https://github.com/doceazedo/sprinkles"
+keywords = ["bevy", "particle-system", "particles", "vfx"]
+categories = ["game-development", "simulation"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["preset-textures"]
+preset-textures = []
+
+[dependencies]
+bevy = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
+thiserror = { workspace = true }
+bytemuck = { workspace = true }
+bitflags = { workspace = true }
+paste = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1"
+

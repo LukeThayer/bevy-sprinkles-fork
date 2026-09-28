@@ -3214,6 +3214,19 @@ names the stage because that is the first thing an author asks."
 
 ## Task 20: The Drives list view
 
+
+> **Acceptance criterion carried from Task 19.** Task 19 wired a drive affordance to 9 of
+> `EmitterProp::ALL`'s 17 variants — every one with a matching authored numeric field. The other 8
+> have no field to hang an affordance off: **`SpawnProbability` has no authored field anywhere**
+> (it is inherently drive-only — Task 6 created it as a new uniform precisely because `amount`
+> cannot be scaled), `Tint` and `EmissionRadius` are Variant/Gradient-typed or live outside the
+> wired files, and five belong to Task 22's material FX section.
+> So today those targets are **implemented, tested, and unreachable from the UI** — the dead-dial
+> defect inverted. This task closes it: the Drives list must be able to **CREATE** a drive by
+> picking a target, not merely display and reorder existing ones. A target picker over
+> `EmitterProp::ALL` (plus `TransformProp`/`LightProp`) reaches every variant regardless of whether
+> a field exists to hang a button on. Verify by asserting every `EmitterProp::ALL` variant is
+> offered by the picker — a count-based test, so a future variant cannot be silently omitted.
 **Files:** create `crates/bevy_sprinkles_editor/src/ui/components/drives.rs`; modify `sidebar.rs`.
 
 **Interfaces:** consumes Task 19's `drives_on`/`upsert_drive`.

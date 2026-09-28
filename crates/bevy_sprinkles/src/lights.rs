@@ -335,16 +335,21 @@ mod tests {
                 false,
                 ParticlesAuthors::default(),
             );
-            let mut light = LightData::default();
-            light.intensity = 1000.0;
-            // A ramp from 0 at phase 0 to 1 at phase 1, so a phase change is
-            // directly observable as an intensity change.
-            light.intensity_over_life = Some(CurveTexture::new(vec![
-                CurvePoint::new(0.0, 0.0),
-                CurvePoint::new(1.0, 1.0),
-            ]));
-            light.time.lifetime = 1.0;
-            light.time.delay = 0.0;
+            let light = LightData {
+                intensity: 1000.0,
+                // A ramp from 0 at phase 0 to 1 at phase 1, so a phase change
+                // is directly observable as an intensity change.
+                intensity_over_life: Some(CurveTexture::new(vec![
+                    CurvePoint::new(0.0, 0.0),
+                    CurvePoint::new(1.0, 1.0),
+                ])),
+                time: crate::asset::EmitterTime {
+                    lifetime: 1.0,
+                    delay: 0.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
             a.lights = vec![light];
             assets.add(a)
         };

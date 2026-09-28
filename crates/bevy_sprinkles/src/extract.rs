@@ -160,7 +160,13 @@ pub struct EmitterUniforms {
     pub use_initial_color_gradient: u32,
     pub turbulence_enabled: u32,
     pub particle_flags: u32,
-    pub _pad7: u32,
+    /// Fraction of eligible slots that actually spawn, 0..1.
+    ///
+    /// Exists because `amount` cannot be scaled at runtime: it is also the
+    /// per-slot simulation gate, so lowering it strands live particles in
+    /// truncated slots where they freeze and never despawn. This gates
+    /// spawning without resizing the pool.
+    pub spawn_probability: f32,
 
     pub initial_color: [f32; 4],
 
@@ -391,23 +397,54 @@ fn resolve_curve_texture(
         .and_then(|c| cache.get(c))
 }
 
-/// Applies the spawn-affecting scalar overrides to freshly built emitter uniforms.
+/// Applies Spawn- and Sim-stage drives to this emitter's simulation uniform.
 ///
-/// Deliberately never touches `u.amount`: in this engine `amount` is the fixed
-/// particle-pool size AND the per-slot simulation gate (`idx >= amount` skips a
-/// slot in the compute shader), so lowering it at runtime would strand already-live
-/// particles in the truncated slots (they'd freeze and never despawn). Runtime
-/// density control therefore isn't a spawn-scalar knob.
-pub(crate) fn apply_spawn_override(
-    u: &mut EmitterUniforms,
-    o: &crate::r#override::ParticleOverride,
-) {
-    if let Some(lt) = o.lifetime_mul {
-        u.lifetime *= lt;
+/// Both stages land here because they share one buffer; they differ in when
+/// the compute shader reads them, not in where they live. Spawn values are
+/// read once at particle birth; Sim values (gravity, turbulence) are read
+/// every step and therefore reshape particles already in flight.
+///
+/// Deliberately never touches `u.amount` — see the field's constraint in this
+/// module and `EmitterProp::SpawnProbability`'s doc. `amount` is the pool size
+/// AND the per-slot gate, so scaling it strands live particles.
+///
+/// `EmitterProp::Drag` has no corresponding field on `EmitterUniforms`: this
+/// engine's compute shader implements no velocity damping at all (see the
+/// `// TODO: requires implementing damping` in `asset/mod.rs`'s `ParticleFlags`).
+/// There is nothing to route it to, so it is a documented no-op rather than an
+/// invented field — driving it does nothing until damping itself exists.
+pub(crate) fn apply_sim_drives(u: &mut EmitterUniforms, r: &crate::drives::EmitterResolved) {
+    use crate::asset::EmitterProp as P;
+
+    if let Some(v) = r.spawn.get(&P::SpawnProbability) {
+        u.spawn_probability = v.clamp(0.0, 1.0);
     }
-    if let Some(sp) = o.speed_mul {
-        u.initial_velocity_min *= sp;
-        u.initial_velocity_max *= sp;
+    if let Some(v) = r.spawn.get(&P::Lifetime) {
+        u.lifetime *= v;
+    }
+    if let Some(v) = r.spawn.get(&P::InitialSpeed) {
+        u.initial_velocity_min *= v;
+        u.initial_velocity_max *= v;
+    }
+    if let Some(v) = r.spawn.get(&P::SpawnSize) {
+        u.scale_min *= v;
+        u.scale_max *= v;
+    }
+    if let Some(v) = r.spawn.get(&P::Spread) {
+        u.spread *= v;
+    }
+    if let Some(v) = r.spawn.get(&P::EmissionRadius) {
+        u.emission_sphere_radius *= v;
+        u.emission_ring_radius *= v;
+        u.emission_ring_inner_radius *= v;
+    }
+    if let Some(v) = r.sim.get(&P::Gravity) {
+        u.gravity = [u.gravity[0] * v, u.gravity[1] * v, u.gravity[2] * v];
+    }
+    // EmitterProp::Drag: no field exists (see doc comment above) — deliberately
+    // not routed.
+    if let Some(v) = r.sim.get(&P::TurbulenceStrength) {
+        u.turbulence_noise_strength *= v;
     }
 }
 
@@ -500,7 +537,9 @@ fn build_base_uniforms(
             }
             flags.bits()
         },
-        _pad7: 0,
+        // 1.0 = ungated (every eligible slot spawns), the authored default
+        // before any Spawn-stage drive touches `EmitterProp::SpawnProbability`.
+        spawn_probability: 1.0,
 
         initial_color: match &emitter.colors.initial_color {
             SolidOrGradientColor::Solid { color } => *color,
@@ -589,8 +628,7 @@ pub fn extract_particle_systems(
         Query<(
             &Particles3d,
             &ParticleSystemRuntime,
-            Option<&crate::r#override::ParticleOverride>,
-            Option<&crate::r#override::ParticleEmitterOverrides>,
+            Option<&crate::drives::EffectDrives>,
         )>,
     >,
     camera_query: Extract<Query<&GlobalTransform, With<Camera3d>>>,
@@ -621,7 +659,7 @@ pub fn extract_particle_systems(
         let Some(sub_buf) = sub_emitter_buf else {
             continue;
         };
-        let Ok((particle_system, _, _, _)) = system_query.get(emitter_entity.parent_system) else {
+        let Ok((particle_system, _, _)) = system_query.get(emitter_entity.parent_system) else {
             continue;
         };
         let Some(asset) = assets.get(particle_system) else {
@@ -649,7 +687,7 @@ pub fn extract_particle_systems(
         baked_opt,
     ) in emitter_query.iter()
     {
-        let Ok((particle_system, _system_runtime, whole_ovr, per_emitter_ovr)) =
+        let Ok((particle_system, _system_runtime, effect_drives)) =
             system_query.get(emitter_entity.parent_system)
         else {
             continue;
@@ -730,11 +768,11 @@ pub fn extract_particle_systems(
             sub_emitter_uniforms,
             spawn_transform,
         );
-        let override_opt =
-            crate::r#override::effective_override(&emitter.name, whole_ovr, per_emitter_ovr);
-        if let Some(ovr) = override_opt {
-            apply_spawn_override(&mut base_uniforms, ovr);
-        }
+        let empty_resolved = crate::drives::EmitterResolved::default();
+        let resolved = effect_drives
+            .and_then(|d| d.0.emitters.get(runtime.emitter_index))
+            .unwrap_or(&empty_resolved);
+        apply_sim_drives(&mut base_uniforms, resolved);
         base_uniforms.trail_size = trail_size;
         base_uniforms.trail_stretch_time = trail_stretch_time;
         base_uniforms.trail_history_size = trail_history_frames;
@@ -893,57 +931,139 @@ pub fn extract_colliders(
 }
 
 #[cfg(test)]
-mod override_tests {
+mod drive_tests {
     use super::*;
-    use crate::r#override::ParticleOverride;
+    use crate::asset::EmitterProp;
+    use crate::drives::EmitterResolved;
 
-    fn base(amount: u32) -> EmitterUniforms {
-        let mut u = EmitterUniforms::default();
-        u.amount = amount;
-        u.lifetime = 1.0;
-        u.initial_velocity_min = 2.0;
-        u.initial_velocity_max = 4.0;
-        u
+    fn resolved(pairs: &[(EmitterProp, f32)]) -> EmitterResolved {
+        let mut r = EmitterResolved::default();
+        for (p, v) in pairs {
+            match p.stage() {
+                crate::asset::Stage::Spawn => {
+                    r.spawn.insert(*p, *v);
+                }
+                crate::asset::Stage::Sim => {
+                    r.sim.insert(*p, *v);
+                }
+                crate::asset::Stage::Render => panic!("render props do not reach this uniform"),
+            }
+        }
+        r
     }
 
     #[test]
-    fn lifetime_and_speed_scale_but_amount_is_never_touched() {
-        let mut u = base(8);
-        let o = ParticleOverride {
-            lifetime_mul: Some(0.5),
-            speed_mul: Some(3.0),
+    fn amount_is_never_mutated_by_drives() {
+        // amount is BOTH the pool size and the per-slot simulation gate
+        // (idx >= amount skips a slot), so lowering it strands live particles
+        // in truncated slots where they freeze and never despawn.
+        let mut u = EmitterUniforms {
+            amount: 64,
             ..Default::default()
         };
-        apply_spawn_override(&mut u, &o);
-        assert_eq!(u.lifetime, 0.5);
-        assert_eq!(u.initial_velocity_min, 6.0);
-        assert_eq!(u.initial_velocity_max, 12.0);
-        // Regression guard: `amount` is the compute shader's simulation gate, so it
-        // must never be mutated at runtime (doing so strands live particles).
-        assert_eq!(
-            u.amount, 8,
-            "amount must never be mutated by apply_spawn_override"
+        apply_sim_drives(
+            &mut u,
+            &resolved(&[
+                (EmitterProp::SpawnProbability, 0.1),
+                (EmitterProp::Lifetime, 0.5),
+            ]),
         );
+        assert_eq!(u.amount, 64, "amount must never be mutated by apply_sim_drives");
     }
 
     #[test]
-    fn none_fields_are_noops() {
-        let mut u = base(8);
-        let before = (
-            u.amount,
-            u.lifetime,
-            u.initial_velocity_min,
-            u.initial_velocity_max,
+    fn spawn_probability_is_carried_and_clamped_to_unit() {
+        let mut u = EmitterUniforms {
+            spawn_probability: 1.0,
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::SpawnProbability, 0.25)]));
+        assert_eq!(u.spawn_probability, 0.25);
+
+        let mut u = EmitterUniforms {
+            spawn_probability: 1.0,
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::SpawnProbability, 4.0)]));
+        assert_eq!(u.spawn_probability, 1.0, "a probability above one is meaningless");
+
+        let mut u = EmitterUniforms {
+            spawn_probability: 1.0,
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::SpawnProbability, -3.0)]));
+        assert_eq!(u.spawn_probability, 0.0);
+    }
+
+    #[test]
+    fn a_spawn_drive_multiplies_the_authored_value() {
+        let mut u = EmitterUniforms {
+            lifetime: 2.0,
+            initial_velocity_min: 1.0,
+            initial_velocity_max: 3.0,
+            ..Default::default()
+        };
+        apply_sim_drives(
+            &mut u,
+            &resolved(&[
+                (EmitterProp::Lifetime, 0.5),
+                (EmitterProp::InitialSpeed, 2.0),
+            ]),
         );
-        apply_spawn_override(&mut u, &ParticleOverride::default());
-        assert_eq!(
-            (
-                u.amount,
-                u.lifetime,
-                u.initial_velocity_min,
-                u.initial_velocity_max
-            ),
-            before
+        assert_eq!(u.lifetime, 1.0);
+        assert_eq!(u.initial_velocity_min, 2.0);
+        assert_eq!(u.initial_velocity_max, 6.0);
+    }
+
+    #[test]
+    fn a_sim_drive_scales_gravity() {
+        let mut u = EmitterUniforms {
+            gravity: [0.0, -10.0, 0.0],
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::Gravity, 0.5)]));
+        assert_eq!(u.gravity, [0.0, -5.0, 0.0]);
+    }
+
+    #[test]
+    fn an_empty_resolution_changes_nothing() {
+        let before = EmitterUniforms {
+            lifetime: 2.0,
+            spawn_probability: 1.0,
+            ..Default::default()
+        };
+        let mut u = before;
+        apply_sim_drives(&mut u, &EmitterResolved::default());
+        assert_eq!(u.lifetime, before.lifetime);
+        assert_eq!(u.spawn_probability, before.spawn_probability);
+    }
+
+    #[test]
+    fn a_drag_drive_is_a_documented_noop_no_field_exists_to_route_it_to() {
+        // EmitterUniforms has no damping/drag field at all -- this engine's
+        // compute shader implements no velocity damping (see the `// TODO:
+        // requires implementing damping` in asset/mod.rs). Resolving Drag
+        // must not panic, invent a field, or perturb anything else.
+        let before = EmitterUniforms {
+            lifetime: 2.0,
+            ..Default::default()
+        };
+        let mut u = before;
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::Drag, 0.5)]));
+        assert_eq!(u.lifetime, before.lifetime);
+    }
+
+    /// `EmitterParams` in `particle_simulate.wgsl` shares this struct's GPU
+    /// buffer and must declare the same fields. Nothing links the two, so a
+    /// field added on the Rust side alone compiles clean, tests clean, and
+    /// corrupts every field after it at runtime. This is a tripwire, not a
+    /// proof: it pins the field this task adds.
+    #[test]
+    fn the_wgsl_emitter_params_declares_spawn_probability() {
+        let src = include_str!("shaders/particle_simulate.wgsl");
+        assert!(
+            src.contains("spawn_probability: f32"),
+            "particle_simulate.wgsl must declare spawn_probability to match EmitterUniforms",
         );
     }
 }

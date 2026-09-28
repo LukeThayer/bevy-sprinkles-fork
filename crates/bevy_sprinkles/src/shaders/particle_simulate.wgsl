@@ -84,7 +84,10 @@ struct EmitterParams {
     use_initial_color_gradient: u32,
     turbulence_enabled: u32,
     particle_flags: u32,
-    _pad7: u32,
+    // Fraction of eligible slots that actually spawn, 0..1. See the matching
+    // field's doc on `EmitterUniforms` in extract.rs (the RUST side of this
+    // LAYOUT-LOCKSTEP struct) for why this exists instead of scaling `amount`.
+    spawn_probability: f32,
 
     initial_color: vec4<f32>,
 
@@ -386,6 +389,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             } else {
                 should_restart = adjusted_phase >= params.prev_system_phase &&
                                adjusted_phase < params.system_phase;
+            }
+        }
+
+        // Density control without resizing the pool: `amount` is also the per-slot
+        // simulation gate, so scaling it would strand live particles in truncated
+        // slots. Gating `should_restart` here (rather than an early `return`) leaves
+        // the pool intact and only skips new births -- a slot denied its restart
+        // this cycle falls through to the `else if (is_active)` below exactly like
+        // any other non-restarting slot, so an already-alive particle keeps
+        // updating instead of freezing. Hashed on the slot index and cycle so a
+        // given slot's decision is stable within a cycle rather than flickering
+        // every step.
+        if (should_restart && params.spawn_probability < 1.0) {
+            let gate = hash_to_float(hash(idx ^ (params.cycle * 2654435761u)));
+            if (gate >= params.spawn_probability) {
+                should_restart = false;
             }
         }
 

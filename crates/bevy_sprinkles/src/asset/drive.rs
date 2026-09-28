@@ -57,7 +57,7 @@ pub enum EmitterProp {
     /// This exists instead of a `Rate` that scales `amount`, because `amount`
     /// is simultaneously the particle-pool size and the per-slot simulation
     /// gate — scaling it strands live particles in truncated slots where they
-    /// freeze and never despawn (`extract.rs::apply_spawn_override`'s doc
+    /// freeze and never despawn (`extract.rs::apply_sim_drives`'s doc
     /// comment states this). A target named `Rate` would invite exactly that
     /// forbidden implementation.
     SpawnProbability,

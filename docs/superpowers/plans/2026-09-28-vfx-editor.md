@@ -2880,6 +2880,20 @@ nothing. A sibling project shipped exactly that bug."
 
 ## Task 17: Length-wise UVs on ribbon and tube trails
 
+
+> **RULING — this task is VERIFY-AND-PIN, not implement. The premise below is wrong.**
+> The plan says "the gap is only length-wise UVs". There is no gap: both trail generators already
+> emit exactly the UVs this task wanted. `create_ribbon_trail_mesh` computes
+> `section_frac = row / total_subdivs` (0→1 along the length) and pushes `[0.0, section_frac]` /
+> `[1.0, section_frac]` — U across the width, V along the length. `create_tube_trail_mesh` does the
+> same with `section_frac = ring / total_rings` and `[u, section_frac]`, U running around the
+> circumference. Both already insert `ATTRIBUTE_UV_0`.
+> The plan also guessed the function names wrong: they are `create_ribbon_trail_mesh` and
+> `create_tube_trail_mesh`, both private in `mesh.rs`.
+> **What is genuinely missing is protection.** `mesh.rs` has ZERO tests. Nothing would catch a
+> future tidy-up that swapped U and V, and the only symptom would be a beam whose texture scrolls
+> ACROSS it instead of ALONG it — precisely the bug this task exists to prevent. So: verify, then
+> pin both generators with tests. Do not rewrite working UV maths.
 **Files:** modify `crates/bevy_sprinkles/src/mesh.rs`.
 
 **Interfaces:** none new. `ParticleMesh::RibbonTrail`/`TubeTrail` already generate strip geometry with `sections`.

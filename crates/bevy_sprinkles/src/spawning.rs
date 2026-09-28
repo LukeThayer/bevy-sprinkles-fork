@@ -354,7 +354,6 @@ pub fn setup_particle_systems(
                 ParticleMaterialHandle(material_handle),
                 emitter.initial_transform.to_transform(),
                 Visibility::default(),
-                crate::r#override::OverrideBakedTextures::default(),
             ));
 
             if !shadow_caster {
@@ -757,56 +756,6 @@ pub fn sync_particle_material(
     }
 }
 
-/// Applies `ParticleOverride::emissive` to each emitter's per-instance material.
-/// Runs after `sync_particle_material` so a config-driven rebuild doesn't clobber it.
-pub fn apply_emissive_override(
-    overrides: Query<&crate::r#override::ParticleOverride>,
-    per_emitter: Query<&crate::r#override::ParticleEmitterOverrides>,
-    particle_systems: Query<&Particles3d>,
-    emitter_query: Query<(&EmitterEntity, &EmitterRuntime, &ParticleMaterialHandle)>,
-    assets: Res<Assets<ParticlesAsset>>,
-    mut materials: ResMut<Assets<ParticleMaterial>>,
-) {
-    for (emitter, runtime, material_handle) in emitter_query.iter() {
-        let Some(emitter_data) = get_emitter_data(
-            emitter.parent_system,
-            runtime.emitter_index,
-            &particle_systems,
-            &assets,
-        ) else {
-            continue;
-        };
-
-        let ovr = crate::r#override::effective_override(
-            &emitter_data.name,
-            overrides.get(emitter.parent_system).ok(),
-            per_emitter.get(emitter.parent_system).ok(),
-        );
-
-        // Effective emissive = the override if set, else the asset's authored value.
-        // `None` must revert to the asset value, mirroring every other override layer.
-        let effective_emissive = if let Some(e) = ovr.and_then(|o| o.emissive) {
-            e
-        } else {
-            let DrawPassMaterial::Standard(m) = &emitter_data.draw_pass.material else {
-                continue;
-            };
-            Color::linear_rgba(m.emissive[0], m.emissive[1], m.emissive[2], m.emissive[3]).into()
-        };
-
-        // Avoid per-frame material churn: `Assets::get_mut` marks the asset changed
-        // even when writing an identical value, so only write when the effective
-        // value actually differs from what's currently stored.
-        let Some(material) = materials.get(&material_handle.0) else {
-            continue;
-        };
-        if material.base.emissive != effective_emissive {
-            if let Some(mut material) = materials.get_mut(&material_handle.0) {
-                material.base.emissive = effective_emissive;
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

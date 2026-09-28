@@ -613,7 +613,6 @@ pub fn extract_particle_systems(
             &ParticleBufferHandle,
             &GlobalTransform,
             Option<&SubEmitterBufferHandle>,
-            Option<&crate::r#override::OverrideBakedTextures>,
         )>,
     >,
     system_query: Extract<
@@ -645,7 +644,6 @@ pub fn extract_particle_systems(
         _buffer_handle,
         _global_transform,
         sub_emitter_buf,
-        _baked_opt,
     ) in emitter_query.iter()
     {
         let Some(sub_buf) = sub_emitter_buf else {
@@ -676,7 +674,6 @@ pub fn extract_particle_systems(
         buffer_handle,
         global_transform,
         sub_emitter_buf,
-        baked_opt,
     ) in emitter_query.iter()
     {
         let Ok((particle_system, _system_runtime, effect_drives)) =
@@ -807,13 +804,11 @@ pub fn extract_particle_systems(
             SolidOrGradientColor::Solid { .. } => None,
         };
 
-        let color_over_lifetime_texture_handle = baked_opt
-            .and_then(|b| b.color.clone())
-            .or_else(|| gradient_cache.get(&emitter.colors.color_over_lifetime));
+        let color_over_lifetime_texture_handle =
+            gradient_cache.get(&emitter.colors.color_over_lifetime);
 
-        let scale_over_lifetime_texture_handle = baked_opt
-            .and_then(|b| b.size.clone())
-            .or_else(|| resolve_curve_texture(&emitter.scale.scale_over_lifetime, &curve_cache));
+        let scale_over_lifetime_texture_handle =
+            resolve_curve_texture(&emitter.scale.scale_over_lifetime, &curve_cache);
         let alpha_over_lifetime_texture_handle =
             resolve_curve_texture(&emitter.colors.alpha_over_lifetime, &curve_cache);
         let emission_over_lifetime_texture_handle =

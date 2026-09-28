@@ -21,6 +21,4 @@ pub use crate::runtime::{
     SubEmitterBufferHandle,
 };
 
-pub use crate::r#override::{ParticleEmitterOverrides, ParticleOverride};
-
 pub use crate::drives::ParticleVariables;

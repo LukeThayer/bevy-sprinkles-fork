@@ -164,8 +164,6 @@ mod extract;
 /// Particle material extension for GPU-driven particle rendering.
 pub mod material;
 mod mesh;
-/// Per-instance runtime overrides for particle systems.
-pub mod r#override;
 /// Convenience re-exports for common particle system types.
 pub mod prelude;
 /// Runtime components and state for active particle systems.
@@ -191,14 +189,13 @@ use mesh::ParticleMeshCache;
 use runtime::check_particle_system_finished;
 use sort::ParticleSortPlugin;
 use spawning::{
-    apply_emissive_override, cleanup_particle_entities, setup_particle_systems, sync_collider_data,
-    sync_particle_buffers, sync_particle_material, sync_particle_mesh, update_particle_time,
-    write_emitter_uniforms,
+    cleanup_particle_entities, setup_particle_systems, sync_collider_data, sync_particle_buffers,
+    sync_particle_material, sync_particle_mesh, update_particle_time, write_emitter_uniforms,
 };
 use textures::{
     CurveTextureCache, FallbackCurveTexture, FallbackGradientTexture, GradientTextureCache,
-    bake_override_textures, create_fallback_curve_texture, create_fallback_gradient_texture,
-    prepare_curve_textures, prepare_gradient_textures,
+    create_fallback_curve_texture, create_fallback_gradient_texture, prepare_curve_textures,
+    prepare_gradient_textures,
 };
 
 /// Plugin that adds GPU particle system support to a Bevy app.
@@ -228,8 +225,6 @@ impl Plugin for SprinklesPlugin {
             .add_systems(Startup, create_fallback_curve_texture)
             .add_systems(PostUpdate, prepare_curve_textures);
 
-        app.add_systems(PostUpdate, bake_override_textures);
-
         app.init_resource::<ParticleMeshCache>();
 
         app.add_plugins(MaterialPlugin::<runtime::ParticleMaterial>::default());
@@ -241,7 +236,6 @@ impl Plugin for SprinklesPlugin {
                 sync_particle_buffers.after(setup_particle_systems),
                 sync_particle_mesh.after(sync_particle_buffers),
                 sync_particle_material,
-                apply_emissive_override.after(sync_particle_material),
                 sync_collider_data,
                 update_particle_time,
                 check_particle_system_finished.after(update_particle_time),

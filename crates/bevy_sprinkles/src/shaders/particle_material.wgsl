@@ -16,11 +16,12 @@
     DRIVE_SLOT_SCROLL_V,
     DRIVE_SLOT_FLOW,
     DRIVE_SLOT_EROSION,
+    DRIVE_SLOT_FRESNEL,
 }
 #import bevy_pbr::{
     mesh_functions,
     mesh_view_bindings::{view, globals},
-    view_transformations::position_world_to_clip,
+    view_transformations::{position_world_to_clip, depth_ndc_to_view_z},
 }
 
 #ifdef PREPASS_PIPELINE
@@ -38,6 +39,18 @@
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing, alpha_discard},
 }
+// FX_SOFT only: `prepass_depth` (bevy_pbr::prepass_utils, gated `#ifdef
+// DEPTH_PREPASS` in its own source) only exists when the VIEW/camera has a
+// depth prepass enabled -- a property of the camera, independent of this
+// material's own FX_SOFT flag. Importing it only under FX_SOFT means an
+// effect that doesn't use soft particles never requires a depth prepass;
+// gated only here (not also by DEPTH_PREPASS) is deliberate -- a
+// soft-particle effect rendered by a camera without one is a documented
+// misconfiguration (see FxSettings::soft_fade) that should fail loudly at
+// shader-compile time, not be silently patched over.
+#ifdef FX_SOFT
+#import bevy_pbr::prepass_utils::prepass_depth
+#endif
 #endif
 
 const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
@@ -1296,6 +1309,27 @@ fn fragment(
         );
     }
 #endif
+#ifdef FX_FRESNEL
+    // Rim brightening: a dot product and a power, but it's much of why a
+    // stylized mesh reads as volumetric rather than as a flat painted shape.
+    // Uses the raw vertex normal/position (unaffected by FX_SCROLL/FX_FLOW's
+    // UV distortion), so it composes independently of them.
+    //
+    // For a camera-facing billboard the normal points at the camera
+    // everywhere, so `dot(n, v)` is ~1 everywhere and the rim is
+    // near-uniform -- this earns its keep on mesh particles (cones, spheres,
+    // tubes), not quads. An author who tries it on a quad first will
+    // conclude it is broken; it isn't, it just has nothing to rim.
+    let fresnel_n = normalize(in.world_normal);
+    let fresnel_v = normalize(view.world_position.xyz - in.world_position.xyz);
+    let fresnel_power = fx.flow_fresnel.w * emitter_uniforms.drive_slots[DRIVE_SLOT_FRESNEL];
+    let fresnel_rim = pow(1.0 - saturate(dot(fresnel_n, fresnel_v)), max(fresnel_power, 0.001));
+    pbr_input.material.base_color = vec4<f32>(
+        pbr_input.material.base_color.rgb
+            + pbr_input.material.base_color.rgb * fresnel_rim * fx.erosion_soft.z,
+        pbr_input.material.base_color.a,
+    );
+#endif
     // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
     // effect's emissive contribution is unchanged. Scaling rgb only leaves
     // the exposure-weight alpha channel (read in pbr_functions.wgsl) alone.
@@ -1390,6 +1424,27 @@ fn fragment(
         );
     }
 #endif
+#ifdef FX_FRESNEL
+    // Rim brightening: a dot product and a power, but it's much of why a
+    // stylized mesh reads as volumetric rather than as a flat painted shape.
+    // Uses the raw vertex normal/position (unaffected by FX_SCROLL/FX_FLOW's
+    // UV distortion), so it composes independently of them.
+    //
+    // For a camera-facing billboard the normal points at the camera
+    // everywhere, so `dot(n, v)` is ~1 everywhere and the rim is
+    // near-uniform -- this earns its keep on mesh particles (cones, spheres,
+    // tubes), not quads. An author who tries it on a quad first will
+    // conclude it is broken; it isn't, it just has nothing to rim.
+    let fresnel_n = normalize(in.world_normal);
+    let fresnel_v = normalize(view.world_position.xyz - in.world_position.xyz);
+    let fresnel_power = fx.flow_fresnel.w * emitter_uniforms.drive_slots[DRIVE_SLOT_FRESNEL];
+    let fresnel_rim = pow(1.0 - saturate(dot(fresnel_n, fresnel_v)), max(fresnel_power, 0.001));
+    pbr_input.material.base_color = vec4<f32>(
+        pbr_input.material.base_color.rgb
+            + pbr_input.material.base_color.rgb * fresnel_rim * fx.erosion_soft.z,
+        pbr_input.material.base_color.a,
+    );
+#endif
     // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
     // effect's emissive contribution is unchanged. Scaling rgb only leaves
     // the exposure-weight alpha channel (read in pbr_functions.wgsl) alone.
@@ -1398,6 +1453,40 @@ fn fragment(
         pbr_input.material.emissive.a,
     );
     pbr_input.material.base_color = pbr_input.material.base_color * particle_color;
+#ifdef FX_SOFT
+    // Fade as the fragment approaches whatever opaque geometry is behind it
+    // -- the hard intersection line where a quad clips the floor is the
+    // single most common tell of amateur VFX; this is the whole fix.
+    //
+    // Forward fragment ONLY: `prepass_depth` reads the depth texture the
+    // depth prepass *produced*, i.e. a texture that must already be
+    // complete. The other two fragment functions in this file (the
+    // depth-only discard prepass and the deferred/normal/motion prepass)
+    // execute DURING that same prepass and cannot meaningfully read their
+    // own not-yet-finished output -- at best garbage, at worst a
+    // driver-undefined read of a texture bound as both render target and
+    // sampled resource in the same pass. Only this forward fragment runs in
+    // a later pass, after the depth prepass has completed for the frame, so
+    // it's the only one of the three where this read is coherent. See the
+    // `#ifdef FX_SOFT #import ... prepass_depth #endif` above for why the
+    // camera must carry `DepthPrepass` for this to compile at all.
+    //
+    // `in.position.z` is already device/NDC depth (the @builtin(position)
+    // fragment input is post-perspective-divide), the same space
+    // `prepass_depth` returns -- both convert through
+    // `depth_ndc_to_view_z` into linear view-space units before
+    // subtracting, so the fade distance means the same thing at every
+    // camera range. Under reversed-Z, nearer is a LARGER raw depth value,
+    // but view-space z is uniformly negative (view space: -z is forward),
+    // so the plain subtraction is already correct without a sign flip.
+    let soft_scene_depth = prepass_depth(in.position, 0u);
+    let soft_this_view_z = depth_ndc_to_view_z(in.position.z);
+    let soft_scene_view_z = depth_ndc_to_view_z(soft_scene_depth);
+    let soft_fade = saturate(
+        abs(soft_scene_view_z - soft_this_view_z) / max(fx.erosion_soft.w, 0.0001),
+    );
+    pbr_input.material.base_color.a = pbr_input.material.base_color.a * soft_fade;
+#endif
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
 
     let particle_alpha = pbr_input.material.base_color.a;

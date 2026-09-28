@@ -326,4 +326,61 @@ mod tests {
             "the erosion rim color is silently dead in whichever fragment lost it",
         );
     }
+
+    /// `DRIVE_SLOT_FRESNEL` is resolved into `emitter_uniforms.drive_slots`
+    /// (`asset/drive.rs`) but nothing forces the shader to ever read it back.
+    /// Fresnel follows the established both-fragments shape (deferred-prepass
+    /// and forward) exactly like scroll/flow/erosion, so it gets the same
+    /// exactly-2 guard as those.
+    #[test]
+    fn the_fresnel_drive_slot_is_actually_read_by_the_fragment_shader() {
+        let src = include_str!("shaders/particle_material.wgsl");
+        assert_occurs_in_both_fragments(
+            src,
+            "drive_slots[DRIVE_SLOT_FRESNEL]",
+            "the fresnel drive is silently dead in whichever fragment lost it",
+        );
+    }
+
+    /// Unlike every other FX block, soft particles deliberately do NOT follow
+    /// the both-fragments shape: `prepass_depth` reads the depth texture the
+    /// depth prepass *produces*, so it can only be sampled coherently from a
+    /// fragment that runs in a LATER pass than the one writing that texture.
+    /// Of this file's three fragment functions, only the forward fragment
+    /// (`#ifndef PREPASS_PIPELINE`) qualifies -- the depth-only prepass
+    /// fragment and the deferred/normal/motion prepass fragment both execute
+    /// DURING the depth prepass itself. `assert_occurs_in_both_fragments`
+    /// would be the WRONG guard here: it would demand a second, structurally
+    /// invalid copy of this block. This asserts an exact count of 1 instead,
+    /// which is the guard that actually matches the constraint -- see the
+    /// task-14 report for the vendored bevy_pbr citations this rests on.
+    fn assert_occurs_only_in_forward_fragment(src: &str, needle: &str, defect: &str) {
+        let count = src.matches(needle).count();
+        assert_eq!(
+            count, 1,
+            "expected `{needle}` to appear exactly once in \
+             particle_material.wgsl (in the forward fragment only -- \
+             prepass_depth cannot be read coherently from a fragment that \
+             executes during the same depth prepass that produces it) -- \
+             {defect}. Found {count} occurrence(s): 0 means the forward \
+             fragment lost it, anything above 1 means it leaked into a \
+             prepass-stage fragment where the depth texture it reads is not \
+             yet complete.",
+        );
+    }
+
+    #[test]
+    fn soft_particle_fade_is_read_only_by_the_forward_fragment() {
+        let src = include_str!("shaders/particle_material.wgsl");
+        assert_occurs_only_in_forward_fragment(
+            src,
+            "prepass_depth(in.position, 0u)",
+            "the soft-particle depth sample is silently dead, or leaked into a prepass fragment",
+        );
+        assert_occurs_only_in_forward_fragment(
+            src,
+            "fx.erosion_soft.w",
+            "the soft-fade distance drive is silently dead, or leaked into a prepass fragment",
+        );
+    }
 }

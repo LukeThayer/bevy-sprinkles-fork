@@ -7,6 +7,7 @@ use bevy::camera::RenderTarget;
 use bevy::camera::primitives::Aabb;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::color::palettes::tailwind::{ZINC_200, ZINC_950};
+use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
@@ -116,6 +117,14 @@ pub fn setup_camera(
             },
             ..default()
         },
+        // Required for FX_SOFT (soft particles): `prepass_depth` in
+        // particle_material.wgsl reads the depth texture this component
+        // makes available to the main pass. Without it, any effect
+        // authoring `soft_fade > 0.0` fails to compile its shader
+        // (`bevy_pbr::prepass_utils::prepass_depth` is itself gated on the
+        // `DEPTH_PREPASS` shader def, which bevy only sets when a view's
+        // camera carries this marker). See `FxSettings::soft_fade`'s doc.
+        DepthPrepass,
     ));
 
     if let Some(bloom) = settings.bloom.as_ref() {

@@ -45,6 +45,13 @@ pub struct FxSettings {
     pub fresnel_boost: f32,
     /// Depth-fade distance in world units. `0` disables. Removes the hard
     /// intersection line where a quad clips the floor.
+    ///
+    /// Requires the consuming app's camera to carry bevy's
+    /// [`DepthPrepass`](bevy::core_pipeline::prepass::DepthPrepass)
+    /// component (`bevy_sprinkles_editor`'s viewport camera does). Without
+    /// it, an effect with `soft_fade > 0.0` fails to compile its fragment
+    /// shader -- the depth texture this feature reads only exists on a view
+    /// that opted into a depth prepass.
     pub soft_fade: f32,
     /// Sample the base texture's red channel as a mask and colour it through
     /// this gradient, instead of using the texture's own colour.

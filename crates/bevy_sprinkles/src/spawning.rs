@@ -279,8 +279,6 @@ fn build_extension(
             fresnel: fx.fresnel_enabled(),
             soft: fx.soft_enabled(),
             gradient: fx.gradient_enabled(),
-            // No FxSettings field drives FX_LIT yet; see FxDefs::lit's doc.
-            lit: false,
         },
     }
 }

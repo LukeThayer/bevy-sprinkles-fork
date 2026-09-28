@@ -134,9 +134,6 @@ pub struct FxDefs {
     pub soft: bool,
     /// Pushes `FX_GRADIENT`.
     pub gradient: bool,
-    /// Pushes `FX_LIT`. No [`crate::asset::FxSettings`] field drives this
-    /// yet -- reserved for a later Phase 3 task, always `false` for now.
-    pub lit: bool,
 }
 
 impl From<&ParticleMaterialExtension> for FxDefs {
@@ -203,7 +200,6 @@ impl MaterialExtension for ParticleMaterialExtension {
         push(defs.fresnel, "FX_FRESNEL");
         push(defs.soft, "FX_SOFT");
         push(defs.gradient, "FX_GRADIENT");
-        push(defs.lit, "FX_LIT");
 
         Ok(())
     }
@@ -399,6 +395,31 @@ mod tests {
             src,
             "fx.erosion_soft.w",
             "the soft-fade distance drive is silently dead, or leaked into a prepass fragment",
+        );
+    }
+
+    /// Lit particles are a runtime branch, not a shader def -- there is no
+    /// `FX_LIT` any more (removed alongside `FxDefs.lit`, which pushed a def
+    /// no `#ifdef` in this file ever read). This is the only thing
+    /// protecting that branch: a tidy-up that called `apply_pbr_lighting`
+    /// unconditionally -- exactly the bug a sibling project shipped in its
+    /// own particle-ish material -- would compile clean and only show up as
+    /// "unlit particles are lit anyway" in play.
+    ///
+    /// Restricted to the forward fragment for the same structural reason as
+    /// `soft_particle_fade_is_read_only_by_the_forward_fragment` above,
+    /// though the constraint here is different: the deferred-prepass
+    /// fragment writes a gbuffer via `deferred_output` and does not light at
+    /// all (lighting happens later, from the gbuffer, outside this shader),
+    /// and the depth-only prepass fragment only discards -- neither has a
+    /// lighting decision to branch on in the first place.
+    #[test]
+    fn the_unlit_branch_is_read_only_by_the_forward_fragment() {
+        let src = include_str!("shaders/particle_material.wgsl");
+        assert_occurs_only_in_forward_fragment(
+            src,
+            "pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT",
+            "the unlit runtime branch is silently dead, or leaked into a prepass fragment",
         );
     }
 }

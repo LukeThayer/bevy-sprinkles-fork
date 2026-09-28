@@ -424,6 +424,15 @@ pub struct StandardParticleMaterial {
     ///
     /// Normals, occlusion textures, roughness, metallic, reflectance, emissive,
     /// shadows, alpha mode and ambient light are ignored if this is set to `true`.
+    ///
+    /// Forwarded to [`StandardMaterial::unlit`] by `to_standard_material`
+    /// below, which is what actually makes this work: the particle
+    /// fragment shader reads it back out at runtime
+    /// (`STANDARD_MATERIAL_FLAGS_UNLIT_BIT` in
+    /// `shaders/particle_material.wgsl`'s forward fragment) rather than
+    /// through a compile-time shader def -- see the comment beside that
+    /// read for why a def is unnecessary here, in a shader that does not
+    /// share bevy's own `pbr.wgsl` unlit-gating pitfall.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unlit: bool,
 
@@ -660,5 +669,55 @@ impl DrawPassMaterial {
             }
         }
         hasher.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::app::ScheduleRunnerPlugin;
+    use bevy::asset::AssetPlugin;
+    use bevy::prelude::{App, MinimalPlugins};
+    use std::time::Duration;
+
+    /// A minimal `App` good enough to hand `to_standard_material` a real
+    /// `AssetServer` -- neither material built below sets a texture, so
+    /// `load_tex`'s `Option::map` never actually calls `asset_server.load`,
+    /// and no fixture files need to exist on disk for this test.
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(
+            MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(10))),
+        );
+        app.add_plugins(AssetPlugin::default());
+        app
+    }
+
+    /// `unlit` is the one field the particle fragment shader reads back at
+    /// runtime (`STANDARD_MATERIAL_FLAGS_UNLIT_BIT` in
+    /// `shaders/particle_material.wgsl`'s forward fragment) to decide
+    /// whether to light a particle at all. That only works if the authored
+    /// flag actually survives the trip through `to_standard_material` into
+    /// the `StandardMaterial` bevy's PBR pipeline sets the flag bit from --
+    /// nothing else pins the `unlit: self.unlit` forward line above, and a
+    /// silently dropped forward would look, in play, exactly like the
+    /// dead-shader-def bug this task removed (`FxDefs.lit`/`FX_LIT`): a
+    /// setting that appears to exist and does nothing.
+    #[test]
+    fn to_standard_material_forwards_the_unlit_flag_in_both_directions() {
+        let app = test_app();
+        let asset_server = app.world().resource::<AssetServer>();
+
+        let lit = StandardParticleMaterial {
+            unlit: false,
+            ..Default::default()
+        };
+        let unlit = StandardParticleMaterial {
+            unlit: true,
+            ..Default::default()
+        };
+
+        assert!(!lit.to_standard_material(asset_server, &[]).unlit);
+        assert!(unlit.to_standard_material(asset_server, &[]).unlit);
     }
 }

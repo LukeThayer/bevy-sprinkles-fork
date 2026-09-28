@@ -1531,6 +1531,23 @@ fn fragment(
 
     var out: FragmentOutput;
 
+    // Runtime-branched on the material's `unlit` flag, deliberately -- NOT a
+    // shader def. An earlier plan draft assumed this needed `#ifdef`-gating
+    // because bevy's own `pbr.wgsl:81-85` branches the unlit bit outside
+    // `apply_pbr_lighting`, so a shader calling that fn unconditionally
+    // would ignore `unlit` entirely (this exact bug shipped in a sibling
+    // project's ToonMaterial). It does not apply here: this fragment reads
+    // `STANDARD_MATERIAL_FLAGS_UNLIT_BIT` itself and only calls
+    // `apply_pbr_lighting` in the else branch below, so `unlit` already
+    // reaches the fragment correctly through `StandardParticleMaterial::
+    // to_standard_material`'s `unlit: self.unlit` forward
+    // (asset/particle_material.rs). See
+    // `bevy_sprinkles::asset::particle_material::tests` for the Rust-side
+    // pin and this file's `assert_occurs_only_in_forward_fragment` test in
+    // `material.rs` for the shader-side one. There is no `FX_LIT` def --
+    // one was pushed in `specialize` with no `#ifdef` anywhere to read it,
+    // and was removed rather than wired up, since this runtime branch
+    // already does the job.
     let is_unlit = (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) != 0u;
 
     if is_unlit {

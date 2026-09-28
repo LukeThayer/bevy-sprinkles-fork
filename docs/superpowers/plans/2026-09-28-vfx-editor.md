@@ -2719,6 +2719,12 @@ the most common amateur-VFX tell -- into a fade."
 
 ## Task 15: Gradient remap
 
+
+> **Acceptance criterion carried from Task 11's review.** `build_extension` currently hardcodes
+> `gradient_texture: None` (`spawning.rs`), because baking needs a `GradientTextureCache` that was
+> not threaded through. Adding the `FX_GRADIENT` WGSL reader **without** also baking a real
+> texture here would leave the feature reading an absent binding. Both halves land in this task, or
+> neither does.
 **Files:** modify `crates/bevy_sprinkles/src/shaders/particle_material.wgsl`; modify `crates/bevy_sprinkles/src/spawning.rs` to bake the gradient.
 
 **Interfaces:** consumes Task 11's `gradient_texture`, `FX_GRADIENT`, and the existing `GradientTextureCache`.
@@ -2757,6 +2763,12 @@ git commit -m "feat(fx): gradient remap, so one greyscale mask serves many looks
 
 ## Task 16: Lit particles — and making the existing `unlit` flag actually work
 
+
+> **Acceptance criterion carried from Task 11's review.** `FxDefs.lit` is currently hardcoded
+> `false` as a literal in `build_extension` (`spawning.rs`), because the brief gave it no driving
+> `FxSettings` field. This task must replace that literal with a real predicate (`!m.unlit`) and
+> must not leave `lit` as a constant. A def that is declared but never pushed makes its feature
+> silently inert with nothing noticing — the defect class this branch has already hit four times.
 **Files:** modify `crates/bevy_sprinkles/src/shaders/particle_material.wgsl`, `crates/bevy_sprinkles/src/material.rs`.
 
 **Interfaces:** consumes Task 11's `FxDefs::lit`; `StandardParticleMaterial::unlit` already exists.

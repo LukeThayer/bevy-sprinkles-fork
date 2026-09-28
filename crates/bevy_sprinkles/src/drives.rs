@@ -6,7 +6,7 @@ use crate::asset::{
     Drive, DriveOp, DriveTarget, EmitterProp, LightProp, ParticlesAsset, Stage, TransformProp,
     VariableDecl, DRIVE_SLOT_COUNT,
 };
-use crate::runtime::Particles3d;
+use crate::runtime::{EmitterEntity, EmitterRuntime, Particles3d};
 
 /// The host game's per-instance knob values for one effect entity.
 ///
@@ -262,6 +262,86 @@ pub fn evaluate_drives(
         match resolved {
             Some(mut slot) => slot.0 = next,
             None => { commands.entity(entity).insert(EffectDrives(next)); }
+        }
+    }
+}
+
+/// Writes ECS-stage drives onto each emitter entity's `Transform`.
+///
+/// This is how per-axis scale is driven. Per-PARTICLE scale is a single
+/// scalar (`ParticleData::position.w`) and stays that way by ruling; the
+/// per-axis need is served here, at emitter level, where
+/// `particle_material.wgsl` already consumes a per-axis `emitter_scale` vec3
+/// built from this Transform.
+///
+/// **Scale channels multiply; position/rotation channels replace.** Scale
+/// (`ScaleX`/`Y`/`Z`/`Uniform`) multiplies the emitter's AUTHORED scale, read
+/// fresh from `asset.emitters[i].initial_transform` every frame rather than
+/// from the live `Transform`: recomputing from the authored baseline each
+/// frame is idempotent, whereas multiplying the live `Transform` in place
+/// would compound every frame and drift. This also means an authored
+/// non-1.0 scale (a beam shaped `(1, 5, 1)`) survives being driven -- it is
+/// the base the drive scales, not a value a drive silently discards.
+/// Position (`PosX`/`Y`/`Z`) and rotation (`RotX`/`Y`/`Z`, degrees) instead
+/// REPLACE outright: multiplying a position or an angle by a factor is not a
+/// meaningful authoring operation, so the resolved value simply becomes the
+/// channel's value.
+///
+/// A channel absent from `EmitterResolved::transform` (nothing drives it, or
+/// every drive on it is muted) is left untouched on the live `Transform` --
+/// for a channel that is never driven at all, that means it keeps whatever
+/// `setup_particle_systems` spawned it at from the same authored value this
+/// system reads.
+///
+/// `ScaleUniform` and a per-axis scale drive (e.g. `ScaleX`) on the same
+/// emitter are two DIFFERENT `TransformProp` keys in `r.transform`, each
+/// already folded to one value by `resolve_drives` -- declaration order
+/// governs THAT fold (two drives on the SAME key), but does not reach this
+/// system: `r.transform` is a `HashMap`, which carries no memory of which
+/// key was inserted first, so the order this loop visits `ScaleUniform` vs
+/// `ScaleX` is effectively unspecified rather than "whichever was declared
+/// last" as the naive reading suggests. Whichever this loop happens to
+/// visit last wins the axis they share; the other channel's own axes (Y/Z
+/// for a lone `ScaleX`) are unaffected either way, since `ScaleUniform`
+/// overwrites all three components and a per-axis prop only ever touches
+/// its own. Not forbidden here -- the editor warns about the pairing in
+/// Task 19 -- but a caller should not rely on declaration order to predict
+/// which one wins.
+pub fn apply_transform_drives(
+    assets: Res<Assets<ParticlesAsset>>,
+    systems: Query<(&EffectDrives, &Particles3d)>,
+    mut emitters: Query<(&EmitterEntity, &EmitterRuntime, &mut Transform)>,
+) {
+    for (emitter, runtime, mut transform) in emitters.iter_mut() {
+        let Ok((drives, particles)) = systems.get(emitter.parent_system) else { continue };
+        let Some(r) = drives.0.emitters.get(runtime.emitter_index) else { continue };
+        if r.transform.is_empty() {
+            continue;
+        }
+        let Some(asset) = assets.get(&particles.0) else { continue };
+        let Some(authored) = asset.emitters.get(runtime.emitter_index) else { continue };
+        let authored_scale = authored.initial_transform.scale;
+
+        for (prop, v) in &r.transform {
+            match prop {
+                TransformProp::ScaleUniform => transform.scale = authored_scale * *v,
+                TransformProp::ScaleX => transform.scale.x = authored_scale.x * *v,
+                TransformProp::ScaleY => transform.scale.y = authored_scale.y * *v,
+                TransformProp::ScaleZ => transform.scale.z = authored_scale.z * *v,
+                TransformProp::PosX => transform.translation.x = *v,
+                TransformProp::PosY => transform.translation.y = *v,
+                TransformProp::PosZ => transform.translation.z = *v,
+                TransformProp::RotX | TransformProp::RotY | TransformProp::RotZ => {
+                    let (x, y, z) = transform.rotation.to_euler(EulerRot::XYZ);
+                    let rad = v.to_radians();
+                    let (x, y, z) = match prop {
+                        TransformProp::RotX => (rad, y, z),
+                        TransformProp::RotY => (x, rad, z),
+                        _ => (x, y, rad),
+                    };
+                    transform.rotation = Quat::from_euler(EulerRot::XYZ, x, y, z);
+                }
+            }
         }
     }
 }
@@ -530,5 +610,100 @@ mod tests {
 
         let warned = app.world().entity(e).get::<UnknownVariablesWarned>();
         assert!(warned.is_some(), "the entity must be marked as already warned");
+    }
+
+    #[test]
+    fn a_scale_drive_multiplies_the_authored_scale_per_axis() {
+        // The authored emitter scale is (1, 2, 1) -- non-uniform on Y -- so a
+        // drive that RESOLVES to 5.0 is distinguishable from one that MULTIPLIES
+        // the authored value: replacing would land Y at 5.0, multiplying lands
+        // it at 10.0. This is the case that catches the brief's original bug
+        // (`transform.scale.y = *v`, an absolute write that discards a beam's
+        // authored length the moment anything drives it).
+        let mut app = test_app();
+        app.add_systems(Update, apply_transform_drives.after(evaluate_drives));
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut a = asset_with_drives(vec![Drive {
+                variable: VariableId(0),
+                target: DriveTarget::Transform { index: 0, prop: TransformProp::ScaleY },
+                curve: flat(1.0),
+                output: Range { min: 0.0, max: 5.0 },
+                op: DriveOp::Replace,
+                muted: false,
+            }]);
+            let mut emitter = EmitterData::default();
+            emitter.initial_transform.scale = Vec3::new(1.0, 2.0, 1.0);
+            a.emitters = vec![emitter];
+            assets.add(a)
+        };
+
+        let mut vars = ParticleVariables::default();
+        vars.set("v", 1.0);
+        let system = app.world_mut().spawn((Particles3d(handle), vars)).id();
+        // Stand in for the emitter child that setup_particle_systems creates,
+        // spawned with the same authored scale it would receive from
+        // `InitialTransform::to_transform`.
+        let emitter = app.world_mut().spawn((
+            Transform::from_scale(Vec3::new(1.0, 2.0, 1.0)),
+            EmitterEntity { parent_system: system },
+            EmitterRuntime::new(0, Some(1)),
+        )).id();
+
+        app.update();
+
+        let t = app.world().entity(emitter).get::<Transform>().unwrap();
+        assert_eq!(t.scale.y, 10.0, "authored 2.0 * resolved 5.0 == 10.0 -- a multiply, not a replace");
+        assert_eq!(t.scale.x, 1.0, "X must be untouched -- the point is per-axis");
+        assert_eq!(t.scale.z, 1.0, "Z must be untouched");
+    }
+
+    #[test]
+    fn a_rotation_drive_replaces_the_current_angle_rather_than_adding_to_it() {
+        // A non-zero starting rotation on every axis, so "replace" (become the
+        // resolved 35 degrees) is distinguishable from "add" (0.2 rad + 35
+        // degrees), and so the untouched X/Z axes prove they survive. 35
+        // degrees (not 90) deliberately avoids the XYZ Euler gimbal-lock
+        // singularity at the middle (Y) axis, where sin(y) = ±1 makes X and Z
+        // decompose as a coupled sum/difference instead of independent angles
+        // -- a driven Y of exactly 90 degrees made this test's own X/Z
+        // assertions fail before this comment was added, which is how that
+        // singularity was found.
+        let mut app = test_app();
+        app.add_systems(Update, apply_transform_drives.after(evaluate_drives));
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let a = asset_with_drives(vec![Drive {
+                variable: VariableId(0),
+                target: DriveTarget::Transform { index: 0, prop: TransformProp::RotY },
+                curve: flat(1.0),
+                output: Range { min: 0.0, max: 35.0 },
+                op: DriveOp::Replace,
+                muted: false,
+            }]);
+            assets.add(a)
+        };
+
+        let mut vars = ParticleVariables::default();
+        vars.set("v", 1.0);
+        let system = app.world_mut().spawn((Particles3d(handle), vars)).id();
+        let emitter = app.world_mut().spawn((
+            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, 0.3, 0.2, 0.1)),
+            EmitterEntity { parent_system: system },
+            EmitterRuntime::new(0, Some(1)),
+        )).id();
+
+        app.update();
+
+        let t = app.world().entity(emitter).get::<Transform>().unwrap();
+        let (x, y, z) = t.rotation.to_euler(EulerRot::XYZ);
+        assert!(
+            (y - 35f32.to_radians()).abs() < 1e-4,
+            "RotY must replace the prior 0.2 rad with the resolved 35 degrees, not add to it (got {y})"
+        );
+        assert!((x - 0.3).abs() < 1e-4, "X untouched, got {x}");
+        assert!((z - 0.1).abs() < 1e-4, "Z untouched, got {z}");
     }
 }

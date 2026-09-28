@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 
-use crate::asset::VariableDecl;
+use crate::asset::{
+    Drive, DriveOp, DriveTarget, EmitterProp, LightProp, ParticlesAsset, Stage, TransformProp,
+    VariableDecl, DRIVE_SLOT_COUNT,
+};
 
 /// The host game's per-instance knob values for one effect entity.
 ///
@@ -69,6 +72,142 @@ impl ParticleVariables {
     }
 }
 
+/// Everything a single effect instance's drives resolved to this frame.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedDrives {
+    /// Per-emitter resolved values, indexed by emitter index.
+    pub emitters: Vec<EmitterResolved>,
+    /// Per-light resolved values, indexed by light index.
+    pub lights: Vec<LightResolved>,
+}
+
+/// `None` in a slot means "no drive touched this"; the consumer keeps the
+/// emitter's authored value. That is deliberately distinct from `Some(1.0)`,
+/// which means a drive computed exactly one — the difference matters for
+/// `DriveOp::Replace` on a property whose authored value is not 1.
+#[derive(Clone, Debug)]
+pub struct EmitterResolved {
+    /// Resolved [`Stage::Spawn`] properties for this emitter, read once at
+    /// particle birth.
+    pub spawn: HashMap<EmitterProp, f32>,
+    /// Resolved [`Stage::Sim`] properties for this emitter, read every step.
+    pub sim: HashMap<EmitterProp, f32>,
+    /// Resolved [`Stage::Render`] properties, indexed by
+    /// [`EmitterProp::slot`] — dense with `ParticleEmitterUniforms::drive_slots`'s
+    /// layout (see [`DRIVE_SLOT_COUNT`]'s doc for the lockstep this depends on).
+    pub render: [Option<f32>; DRIVE_SLOT_COUNT],
+    /// Resolved channels of this emitter's own `Transform`.
+    pub transform: HashMap<TransformProp, f32>,
+}
+
+impl Default for EmitterResolved {
+    fn default() -> Self {
+        Self {
+            spawn: HashMap::new(),
+            sim: HashMap::new(),
+            render: [None; DRIVE_SLOT_COUNT],
+            transform: HashMap::new(),
+        }
+    }
+}
+
+/// Resolved properties of one effect-owned light.
+#[derive(Clone, Debug, Default)]
+pub struct LightResolved {
+    /// Resolved light properties, keyed by which one they drive.
+    pub props: HashMap<LightProp, f32>,
+}
+
+/// Samples one drive to a finite scalar, or `None` if it contributes nothing.
+///
+/// `values` is indexed by `VariableId`, so this never does a string lookup.
+/// Every arithmetic result is checked for finiteness at the boundary rather
+/// than trusting the inputs: the curve's control points, the output bounds and
+/// the host's variable are three independent places a NaN can enter, and only
+/// one of them (the host's) is guarded upstream.
+fn sample(drive: &Drive, values: &[f32]) -> Option<f32> {
+    if drive.muted {
+        return None;
+    }
+    let t = *values.get(drive.variable.0 as usize)?;
+    if !t.is_finite() {
+        return None;
+    }
+    let unit = drive.curve.sample(t.clamp(0.0, 1.0));
+    if !unit.is_finite() {
+        return None;
+    }
+    let (lo, hi) = (drive.output.min, drive.output.max);
+    if !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    let out = lo + (hi - lo) * unit;
+    out.is_finite().then_some(out)
+}
+
+/// Folds one contribution onto whatever earlier drives left behind.
+///
+/// `Replace` discards the accumulator entirely, including the consumer's
+/// authored value — which is why a `Replace` after a `Multiply` wipes it, and
+/// why the Drives list in the editor is reorderable rather than a set.
+fn fold(acc: Option<f32>, value: f32, op: DriveOp) -> Option<f32> {
+    let next = match (op, acc) {
+        (DriveOp::Replace, _) => value,
+        (DriveOp::Multiply, Some(a)) => a * value,
+        (DriveOp::Multiply, None) => value,
+        (DriveOp::Add, Some(a)) => a + value,
+        (DriveOp::Add, None) => value,
+    };
+    next.is_finite().then_some(next)
+}
+
+/// Resolves every drive in `asset` against already-resolved variable `values`.
+///
+/// Pure: no ECS, no GPU, no frames. Cost is one curve sample per drive per
+/// instance — a variable curve yields ONE scalar, not a per-particle ramp,
+/// which is exactly why variable curves are sampled here on the CPU while
+/// lifetime curves stay baked into GPU textures.
+pub fn resolve_drives(values: &[f32], asset: &ParticlesAsset) -> ResolvedDrives {
+    let mut out = ResolvedDrives {
+        emitters: vec![EmitterResolved::default(); asset.emitters.len()],
+        lights: vec![LightResolved::default(); asset.lights.len()],
+    };
+
+    for drive in &asset.drives {
+        let Some(value) = sample(drive, values) else { continue };
+        match &drive.target {
+            DriveTarget::Emitter { index, prop } => {
+                let Some(e) = out.emitters.get_mut(*index as usize) else { continue };
+                match prop.stage() {
+                    Stage::Spawn => {
+                        let acc = e.spawn.get(prop).copied();
+                        if let Some(v) = fold(acc, value, drive.op) { e.spawn.insert(*prop, v); }
+                    }
+                    Stage::Sim => {
+                        let acc = e.sim.get(prop).copied();
+                        if let Some(v) = fold(acc, value, drive.op) { e.sim.insert(*prop, v); }
+                    }
+                    Stage::Render => {
+                        let Some(slot) = prop.slot() else { continue };
+                        e.render[slot] = fold(e.render[slot], value, drive.op);
+                    }
+                }
+            }
+            DriveTarget::Transform { index, prop } => {
+                let Some(e) = out.emitters.get_mut(*index as usize) else { continue };
+                let acc = e.transform.get(prop).copied();
+                if let Some(v) = fold(acc, value, drive.op) { e.transform.insert(*prop, v); }
+            }
+            DriveTarget::Light { index, prop } => {
+                let Some(l) = out.lights.get_mut(*index as usize) else { continue };
+                let acc = l.props.get(prop).copied();
+                if let Some(v) = fold(acc, value, drive.op) { l.props.insert(*prop, v); }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +260,154 @@ mod tests {
         b.set("temperature", 0.0);
         assert_eq!(a.resolve_values(&decls())[0], 1.0);
         assert_eq!(b.resolve_values(&decls())[0], 0.0);
+    }
+
+    use crate::asset::{
+        CurveTexture, CurvePoint, Drive, DriveOp, DriveTarget, EmitterProp, ParticlesAsset,
+        ParticlesAuthors, ParticlesDimension, EmitterData, VariableId,
+    };
+
+    /// A curve that returns `v` everywhere, so a test asserts on the drive's
+    /// arithmetic rather than on curve interpolation.
+    fn flat(v: f64) -> CurveTexture {
+        CurveTexture::new(vec![CurvePoint::new(0.0, v), CurvePoint::new(1.0, v)])
+    }
+
+    fn asset_with_drives(drives: Vec<Drive>) -> ParticlesAsset {
+        let mut a = ParticlesAsset::new(
+            "t".into(), ParticlesDimension::D3, Default::default(),
+            vec![EmitterData::default()], vec![], false, ParticlesAuthors::default(),
+        );
+        a.variables = vec![VariableDecl { name: "v".into(), default: 0.0, range: Range { min: 0.0, max: 1.0 } }];
+        a.drives = drives;
+        a
+    }
+
+    fn d(prop: EmitterProp, curve: CurveTexture, output: Range, op: DriveOp) -> Drive {
+        Drive {
+            variable: VariableId(0),
+            target: DriveTarget::Emitter { index: 0, prop },
+            curve, output, op, muted: false,
+        }
+    }
+
+    #[test]
+    fn a_render_drive_lands_in_its_slot_and_nowhere_else() {
+        let a = asset_with_drives(vec![
+            d(EmitterProp::SizeMul, flat(1.0), Range { min: 0.0, max: 4.0 }, DriveOp::Replace),
+        ]);
+        let r = resolve_drives(&[1.0], &a);
+        let slot = EmitterProp::SizeMul.slot().unwrap();
+        assert_eq!(r.emitters[0].render[slot], Some(4.0));
+        for (i, s) in r.emitters[0].render.iter().enumerate() {
+            if i != slot { assert_eq!(*s, None, "slot {i} must be untouched"); }
+        }
+    }
+
+    #[test]
+    fn spawn_and_sim_drives_land_in_separate_maps() {
+        let a = asset_with_drives(vec![
+            d(EmitterProp::SpawnSize, flat(1.0), Range { min: 0.0, max: 2.0 }, DriveOp::Replace),
+            d(EmitterProp::Gravity,   flat(1.0), Range { min: 0.0, max: 3.0 }, DriveOp::Replace),
+        ]);
+        let r = resolve_drives(&[1.0], &a);
+        assert_eq!(r.emitters[0].spawn.get(&EmitterProp::SpawnSize), Some(&2.0));
+        assert_eq!(r.emitters[0].sim.get(&EmitterProp::Gravity), Some(&3.0));
+        assert!(r.emitters[0].spawn.get(&EmitterProp::Gravity).is_none());
+        assert!(r.emitters[0].sim.get(&EmitterProp::SpawnSize).is_none());
+    }
+
+    #[test]
+    fn the_output_range_remaps_the_curve() {
+        let a = asset_with_drives(vec![
+            d(EmitterProp::Alpha, flat(0.5), Range { min: 2.0, max: 4.0 }, DriveOp::Replace),
+        ]);
+        let r = resolve_drives(&[1.0], &a);
+        assert_eq!(r.emitters[0].render[EmitterProp::Alpha.slot().unwrap()], Some(3.0));
+    }
+
+    #[test]
+    fn drives_on_one_target_apply_in_declaration_order() {
+        // Replace must discard the Multiply that came before it, and be kept
+        // by the Multiply that comes after: 1*2 -> replaced by 5 -> *3 = 15.
+        let a = asset_with_drives(vec![
+            d(EmitterProp::SizeMul, flat(1.0), Range { min: 2.0, max: 2.0 }, DriveOp::Multiply),
+            d(EmitterProp::SizeMul, flat(1.0), Range { min: 5.0, max: 5.0 }, DriveOp::Replace),
+            d(EmitterProp::SizeMul, flat(1.0), Range { min: 3.0, max: 3.0 }, DriveOp::Multiply),
+        ]);
+        let r = resolve_drives(&[1.0], &a);
+        assert_eq!(r.emitters[0].render[EmitterProp::SizeMul.slot().unwrap()], Some(15.0));
+    }
+
+    #[test]
+    fn a_muted_drive_contributes_nothing() {
+        let mut drive = d(EmitterProp::Alpha, flat(1.0), Range { min: 9.0, max: 9.0 }, DriveOp::Replace);
+        drive.muted = true;
+        let a = asset_with_drives(vec![drive]);
+        let r = resolve_drives(&[1.0], &a);
+        assert_eq!(r.emitters[0].render[EmitterProp::Alpha.slot().unwrap()], None);
+    }
+
+    #[test]
+    fn an_authored_nan_never_reaches_a_slot() {
+        // Review Focus 3. A NaN in a uniform propagates through the vertex
+        // shader and can blank the whole draw call, which an author reads as
+        // "my effect vanished" with nothing pointing at the bad number.
+        let a = asset_with_drives(vec![
+            d(EmitterProp::Alpha, flat(f64::NAN), Range { min: 0.0, max: 1.0 }, DriveOp::Replace),
+        ]);
+        let r = resolve_drives(&[1.0], &a);
+        let got = r.emitters[0].render[EmitterProp::Alpha.slot().unwrap()];
+        assert!(got.is_none() || got.unwrap().is_finite(), "got {got:?}");
+    }
+
+    #[test]
+    fn a_nan_output_bound_never_reaches_a_slot() {
+        let a = asset_with_drives(vec![
+            d(EmitterProp::Alpha, flat(1.0), Range { min: 0.0, max: f32::NAN }, DriveOp::Replace),
+        ]);
+        let r = resolve_drives(&[1.0], &a);
+        let got = r.emitters[0].render[EmitterProp::Alpha.slot().unwrap()];
+        assert!(got.is_none() || got.unwrap().is_finite(), "got {got:?}");
+    }
+
+    #[test]
+    fn a_degenerate_curve_and_a_zero_width_range_still_resolve_finitely() {
+        // Review Focus 5: zero control points, and min == max.
+        let a = asset_with_drives(vec![
+            d(EmitterProp::Alpha, CurveTexture::new(vec![]), Range { min: 1.0, max: 1.0 }, DriveOp::Replace),
+        ]);
+        let r = resolve_drives(&[1.0], &a);
+        let got = r.emitters[0].render[EmitterProp::Alpha.slot().unwrap()];
+        assert!(got.is_none() || got.unwrap().is_finite(), "got {got:?}");
+    }
+
+    #[test]
+    fn an_effect_with_no_drives_resolves_to_all_none() {
+        let a = asset_with_drives(vec![]);
+        let r = resolve_drives(&[0.0], &a);
+        assert_eq!(r.emitters.len(), 1);
+        assert!(r.emitters[0].render.iter().all(|s| s.is_none()));
+        assert!(r.emitters[0].spawn.is_empty());
+        assert!(r.emitters[0].sim.is_empty());
+    }
+
+    #[test]
+    fn a_transform_drive_lands_on_the_emitter_its_index_names() {
+        // Pins that Transform's index is an EMITTER index, not a
+        // reserved-must-be-zero slot: with two emitters, a drive on index 1
+        // must touch emitters[1] and leave emitters[0] alone.
+        let mut a = asset_with_drives(vec![Drive {
+            variable: VariableId(0),
+            target: DriveTarget::Transform { index: 1, prop: TransformProp::ScaleY },
+            curve: flat(1.0),
+            output: Range { min: 0.0, max: 3.0 },
+            op: DriveOp::Replace,
+            muted: false,
+        }]);
+        a.emitters = vec![EmitterData::default(), EmitterData::default()];
+        let r = resolve_drives(&[1.0], &a);
+        assert_eq!(r.emitters[1].transform.get(&TransformProp::ScaleY), Some(&3.0));
+        assert!(r.emitters[0].transform.is_empty(), "the other emitter must be untouched");
     }
 }

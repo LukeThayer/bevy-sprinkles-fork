@@ -293,20 +293,34 @@ pub fn evaluate_drives(
 /// `setup_particle_systems` spawned it at from the same authored value this
 /// system reads.
 ///
-/// `ScaleUniform` and a per-axis scale drive (e.g. `ScaleX`) on the same
-/// emitter are two DIFFERENT `TransformProp` keys in `r.transform`, each
-/// already folded to one value by `resolve_drives` -- declaration order
-/// governs THAT fold (two drives on the SAME key), but does not reach this
-/// system: `r.transform` is a `HashMap`, which carries no memory of which
-/// key was inserted first, so the order this loop visits `ScaleUniform` vs
-/// `ScaleX` is effectively unspecified rather than "whichever was declared
-/// last" as the naive reading suggests. Whichever this loop happens to
-/// visit last wins the axis they share; the other channel's own axes (Y/Z
-/// for a lone `ScaleX`) are unaffected either way, since `ScaleUniform`
-/// overwrites all three components and a per-axis prop only ever touches
-/// its own. Not forbidden here -- the editor warns about the pairing in
-/// Task 19 -- but a caller should not rely on declaration order to predict
-/// which one wins.
+/// **`ScaleUniform` and a per-axis scale drive on the same emitter resolve
+/// deterministically, in a fixed declared order, never by iterating
+/// `r.transform`'s `HashMap`** (whose default hasher is randomly seeded per
+/// process, so an order derived from it could differ between two runs of the
+/// same binary against the same file -- not something an author could reason
+/// about or reproduce). `ScaleUniform` applies first and multiplies all three
+/// authored axes; a per-axis channel then overrides its own axis on top of
+/// that. A uniform baseline with per-axis refinement is deliberate,
+/// conventional transform-editor behaviour, not an accident of iteration
+/// order.
+///
+/// **Rotation never decomposes the live `Transform`'s quaternion.** Doing so
+/// previously mismatched how rotation is authored in two ways at once: the
+/// wrong Euler sequence (`XYZ` here vs. `InitialTransform`'s documented
+/// `ZYX`) AND the wrong argument order (`(x, y, z)` vs. `ZYX`'s
+/// `(yaw, pitch, roll)` = `(z, y, x)`) -- so the moment any single `Rot*`
+/// channel was driven on an emitter whose authored rotation had more than
+/// one non-zero component, the UNDRIVEN axes were silently reinterpreted
+/// through the wrong basis, and re-decomposing per driven axis independently
+/// also reintroduced gimbal-lock coupling at the singularity. Instead, all
+/// three degrees are settled against the AUTHORED `Vec3`
+/// (`initial_transform.rotation`; `x` = roll, `y` = pitch, `z` = yaw, per
+/// that field's own doc comment) and composed exactly ONCE, in the same
+/// `EulerRot::ZYX` order and argument order `InitialTransform::to_transform`
+/// uses -- so this system can never see a quaternion `to_euler` would
+/// decompose ambiguously, and multiple `Rot*` channels driven on the same
+/// emitter in the same frame compose correctly together instead of each
+/// clobbering the others' axis through a live-quaternion round trip.
 pub fn apply_transform_drives(
     assets: Res<Assets<ParticlesAsset>>,
     systems: Query<(&EffectDrives, &Particles3d)>,
@@ -315,33 +329,55 @@ pub fn apply_transform_drives(
     for (emitter, runtime, mut transform) in emitters.iter_mut() {
         let Ok((drives, particles)) = systems.get(emitter.parent_system) else { continue };
         let Some(r) = drives.0.emitters.get(runtime.emitter_index) else { continue };
-        if r.transform.is_empty() {
-            continue;
-        }
         let Some(asset) = assets.get(&particles.0) else { continue };
         let Some(authored) = asset.emitters.get(runtime.emitter_index) else { continue };
-        let authored_scale = authored.initial_transform.scale;
+        let it = &authored.initial_transform;
 
-        for (prop, v) in &r.transform {
-            match prop {
-                TransformProp::ScaleUniform => transform.scale = authored_scale * *v,
-                TransformProp::ScaleX => transform.scale.x = authored_scale.x * *v,
-                TransformProp::ScaleY => transform.scale.y = authored_scale.y * *v,
-                TransformProp::ScaleZ => transform.scale.z = authored_scale.z * *v,
-                TransformProp::PosX => transform.translation.x = *v,
-                TransformProp::PosY => transform.translation.y = *v,
-                TransformProp::PosZ => transform.translation.z = *v,
-                TransformProp::RotX | TransformProp::RotY | TransformProp::RotZ => {
-                    let (x, y, z) = transform.rotation.to_euler(EulerRot::XYZ);
-                    let rad = v.to_radians();
-                    let (x, y, z) = match prop {
-                        TransformProp::RotX => (rad, y, z),
-                        TransformProp::RotY => (x, rad, z),
-                        _ => (x, y, rad),
-                    };
-                    transform.rotation = Quat::from_euler(EulerRot::XYZ, x, y, z);
-                }
-            }
+        // Scale: a FIXED order (ScaleUniform, then X, then Y, then Z), never
+        // `r.transform`'s HashMap iteration order. See the doc comment above.
+        if let Some(v) = r.transform.get(&TransformProp::ScaleUniform) {
+            transform.scale = it.scale * *v;
+        }
+        if let Some(v) = r.transform.get(&TransformProp::ScaleX) {
+            transform.scale.x = it.scale.x * *v;
+        }
+        if let Some(v) = r.transform.get(&TransformProp::ScaleY) {
+            transform.scale.y = it.scale.y * *v;
+        }
+        if let Some(v) = r.transform.get(&TransformProp::ScaleZ) {
+            transform.scale.z = it.scale.z * *v;
+        }
+
+        // Position: replace outright, one axis at a time.
+        if let Some(v) = r.transform.get(&TransformProp::PosX) {
+            transform.translation.x = *v;
+        }
+        if let Some(v) = r.transform.get(&TransformProp::PosY) {
+            transform.translation.y = *v;
+        }
+        if let Some(v) = r.transform.get(&TransformProp::PosZ) {
+            transform.translation.z = *v;
+        }
+
+        // Rotation: settle all three degrees against the authored triple,
+        // then compose exactly once -- never decompose the live quaternion.
+        // See the doc comment above for why.
+        let rot_x = TransformProp::RotX;
+        let rot_y = TransformProp::RotY;
+        let rot_z = TransformProp::RotZ;
+        if r.transform.contains_key(&rot_x)
+            || r.transform.contains_key(&rot_y)
+            || r.transform.contains_key(&rot_z)
+        {
+            let roll = r.transform.get(&rot_x).copied().unwrap_or(it.rotation.x);
+            let pitch = r.transform.get(&rot_y).copied().unwrap_or(it.rotation.y);
+            let yaw = r.transform.get(&rot_z).copied().unwrap_or(it.rotation.z);
+            transform.rotation = Quat::from_euler(
+                EulerRot::ZYX,
+                yaw.to_radians(),
+                pitch.to_radians(),
+                roll.to_radians(),
+            );
         }
     }
 }
@@ -660,37 +696,48 @@ mod tests {
     }
 
     #[test]
-    fn a_rotation_drive_replaces_the_current_angle_rather_than_adding_to_it() {
-        // A non-zero starting rotation on every axis, so "replace" (become the
-        // resolved 35 degrees) is distinguishable from "add" (0.2 rad + 35
-        // degrees), and so the untouched X/Z axes prove they survive. 35
-        // degrees (not 90) deliberately avoids the XYZ Euler gimbal-lock
-        // singularity at the middle (Y) axis, where sin(y) = ±1 makes X and Z
-        // decompose as a coupled sum/difference instead of independent angles
-        // -- a driven Y of exactly 90 degrees made this test's own X/Z
-        // assertions fail before this comment was added, which is how that
-        // singularity was found.
+    fn a_rotation_drive_replaces_only_its_axis_leaving_the_others_at_their_authored_degrees() {
+        // Authored the way real content is: initial_transform.rotation with
+        // three DISTINCT non-zero components (10 = roll/X, 20 = pitch/Y,
+        // 30 = yaw/Z, all in degrees, per InitialTransform::rotation's own
+        // doc comment), converted to the pre-drive Transform via the exact
+        // same `InitialTransform::to_transform` conversion
+        // `setup_particle_systems` uses -- not hand-built with
+        // `EulerRot::XYZ`, which is the bug convention this test used to
+        // (accidentally) match.
+        //
+        // Driving RotY alone must replace ONLY pitch; roll and yaw must still
+        // read back as their exact authored degrees. That is the assertion
+        // the old XYZ-decompose implementation could not pass once more than
+        // one authored component was non-zero -- a ZYX-authored
+        // (10, 20, 30) decomposes under XYZ to roughly (-1.1, 22.2, 28.5),
+        // not (10, driven, 30).
         let mut app = test_app();
         app.add_systems(Update, apply_transform_drives.after(evaluate_drives));
 
         let handle = {
             let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
-            let a = asset_with_drives(vec![Drive {
+            let mut a = asset_with_drives(vec![Drive {
                 variable: VariableId(0),
                 target: DriveTarget::Transform { index: 0, prop: TransformProp::RotY },
                 curve: flat(1.0),
-                output: Range { min: 0.0, max: 35.0 },
+                output: Range { min: 0.0, max: 50.0 },
                 op: DriveOp::Replace,
                 muted: false,
             }]);
+            let mut emitter = EmitterData::default();
+            emitter.initial_transform.rotation = Vec3::new(10.0, 20.0, 30.0);
+            a.emitters = vec![emitter];
             assets.add(a)
         };
 
         let mut vars = ParticleVariables::default();
         vars.set("v", 1.0);
         let system = app.world_mut().spawn((Particles3d(handle), vars)).id();
+        let mut spawn_it = crate::asset::InitialTransform::default();
+        spawn_it.rotation = Vec3::new(10.0, 20.0, 30.0);
         let emitter = app.world_mut().spawn((
-            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, 0.3, 0.2, 0.1)),
+            spawn_it.to_transform(),
             EmitterEntity { parent_system: system },
             EmitterRuntime::new(0, Some(1)),
         )).id();
@@ -698,12 +745,86 @@ mod tests {
         app.update();
 
         let t = app.world().entity(emitter).get::<Transform>().unwrap();
-        let (x, y, z) = t.rotation.to_euler(EulerRot::XYZ);
+        // Decompose with the SAME convention InitialTransform composes with,
+        // to read back the authored/resolved degrees rather than some other
+        // basis's numbers.
+        let (yaw, pitch, roll) = t.rotation.to_euler(EulerRot::ZYX);
         assert!(
-            (y - 35f32.to_radians()).abs() < 1e-4,
-            "RotY must replace the prior 0.2 rad with the resolved 35 degrees, not add to it (got {y})"
+            (pitch.to_degrees() - 50.0).abs() < 1e-2,
+            "RotY must replace pitch with the resolved 50 degrees, got {}",
+            pitch.to_degrees()
         );
-        assert!((x - 0.3).abs() < 1e-4, "X untouched, got {x}");
-        assert!((z - 0.1).abs() < 1e-4, "Z untouched, got {z}");
+        assert!(
+            (roll.to_degrees() - 10.0).abs() < 1e-2,
+            "roll (RotX, undriven) must still read back as its authored 10 degrees, got {}",
+            roll.to_degrees()
+        );
+        assert!(
+            (yaw.to_degrees() - 30.0).abs() < 1e-2,
+            "yaw (RotZ, undriven) must still read back as its authored 30 degrees, got {}",
+            yaw.to_degrees()
+        );
+    }
+
+    #[test]
+    fn scale_uniform_and_a_per_axis_channel_resolve_in_a_fixed_order_not_hashmap_order() {
+        // ScaleUniform (resolves to 3.0) and ScaleY (resolves to 5.0) both
+        // driven on the same emitter, whose authored scale is (1, 2, 1).
+        // ScaleUniform must apply FIRST, multiplying all three authored axes
+        // to (3, 6, 3); ScaleY must then override Y on top of its OWN
+        // authored axis (2.0 * 5.0 = 10.0), not on top of the uniform result
+        // (6.0 * 5.0 = 30.0). This is the collision the old raw
+        // `for (prop, v) in &r.transform` iteration could not resolve
+        // deterministically -- which of the two won X's shared axis (Y) was
+        // whichever key the HashMap's randomly-seeded-per-process hasher
+        // happened to visit last, not something an author could reason about
+        // or reproduce from one run to the next.
+        let mut app = test_app();
+        app.add_systems(Update, apply_transform_drives.after(evaluate_drives));
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut a = asset_with_drives(vec![
+                Drive {
+                    variable: VariableId(0),
+                    target: DriveTarget::Transform { index: 0, prop: TransformProp::ScaleUniform },
+                    curve: flat(1.0),
+                    output: Range { min: 0.0, max: 3.0 },
+                    op: DriveOp::Replace,
+                    muted: false,
+                },
+                Drive {
+                    variable: VariableId(0),
+                    target: DriveTarget::Transform { index: 0, prop: TransformProp::ScaleY },
+                    curve: flat(1.0),
+                    output: Range { min: 0.0, max: 5.0 },
+                    op: DriveOp::Replace,
+                    muted: false,
+                },
+            ]);
+            let mut emitter = EmitterData::default();
+            emitter.initial_transform.scale = Vec3::new(1.0, 2.0, 1.0);
+            a.emitters = vec![emitter];
+            assets.add(a)
+        };
+
+        let mut vars = ParticleVariables::default();
+        vars.set("v", 1.0);
+        let system = app.world_mut().spawn((Particles3d(handle), vars)).id();
+        let emitter = app.world_mut().spawn((
+            Transform::from_scale(Vec3::new(1.0, 2.0, 1.0)),
+            EmitterEntity { parent_system: system },
+            EmitterRuntime::new(0, Some(1)),
+        )).id();
+
+        app.update();
+
+        let t = app.world().entity(emitter).get::<Transform>().unwrap();
+        assert_eq!(t.scale.x, 3.0, "X: only ScaleUniform touches X -- authored 1.0 * 3.0");
+        assert_eq!(
+            t.scale.y, 10.0,
+            "Y: ScaleY overrides on top of its OWN authored axis (2.0 * 5.0 = 10.0), not the uniform result (6.0 * 5.0 = 30.0)"
+        );
+        assert_eq!(t.scale.z, 3.0, "Z: only ScaleUniform touches Z -- authored 1.0 * 3.0");
     }
 }

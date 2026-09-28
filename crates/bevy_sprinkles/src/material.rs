@@ -253,4 +253,29 @@ mod tests {
              fragment shader, or the emissive drive is silently dead",
         );
     }
+
+    /// `ParticleMaterialExtension::flow_texture` is loaded and bound
+    /// (`build_extension` in spawning.rs, `#[texture(103)]`/`#[sampler(104)]`
+    /// above), but nothing in Rust forces the shader to ever sample it or
+    /// read `DRIVE_SLOT_FLOW` back out. A texture binding the shader declares
+    /// but never samples is a feature wired to nothing -- the same
+    /// dead-dial/dead-slot defect class the emissive test above guards,
+    /// which this branch has hit four separate times. This greps the shader
+    /// source directly rather than trusting a runtime effect.
+    #[test]
+    fn the_flow_texture_and_drive_slot_are_actually_read_by_the_fragment_shader() {
+        let src = include_str!("shaders/particle_material.wgsl");
+        assert!(
+            src.contains("textureSample(flow_texture, flow_sampler"),
+            "particle_material.wgsl must sample flow_texture through \
+             flow_sampler in the fragment shader, or the flow-map binding is \
+             wired to nothing",
+        );
+        assert!(
+            src.contains("drive_slots[DRIVE_SLOT_FLOW]"),
+            "particle_material.wgsl must read \
+             emitter_uniforms.drive_slots[DRIVE_SLOT_FLOW] somewhere in the \
+             fragment shader, or the flow drive is silently dead",
+        );
+    }
 }

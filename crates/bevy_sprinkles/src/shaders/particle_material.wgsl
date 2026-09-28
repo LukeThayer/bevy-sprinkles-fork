@@ -14,6 +14,7 @@
     DRIVE_SLOT_EMISSIVE,
     DRIVE_SLOT_SCROLL_U,
     DRIVE_SLOT_SCROLL_V,
+    DRIVE_SLOT_FLOW,
 }
 #import bevy_pbr::{
     mesh_functions,
@@ -52,11 +53,15 @@ const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<storage, read> sorted_particles: array<Particle>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> emitter_uniforms: ParticleEmitterUniforms;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> fx: FxUniform;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var flow_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var flow_sampler: sampler;
 #endif
 #else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<storage, read> sorted_particles: array<Particle>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> emitter_uniforms: ParticleEmitterUniforms;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> fx: FxUniform;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var flow_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var flow_sampler: sampler;
 #endif
 
 // computes a shortest-arc rotation matrix that aligns the Y axis to a direction
@@ -1246,6 +1251,15 @@ fn fragment(
     );
     frag_in.uv = in.uv * fx.scroll_tiling.zw + scroll_rate * globals.time;
 #endif
+#ifdef FX_FLOW
+    // Offsetting the base UV by a second, independently scrolling texture is
+    // what makes fire and smoke CHURN. A single scrolling layer reads as a
+    // sliding sheet no matter how good the texture is.
+    let flow_uv = in.uv * fx.scroll_tiling.zw + fx.flow_fresnel.yz * globals.time;
+    let flow = textureSample(flow_texture, flow_sampler, flow_uv).rg * 2.0 - 1.0;
+    let flow_amount = fx.flow_fresnel.x * emitter_uniforms.drive_slots[DRIVE_SLOT_FLOW];
+    frag_in.uv = frag_in.uv + flow * flow_amount;
+#endif
 
     var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
     // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
@@ -1301,6 +1315,15 @@ fn fragment(
         emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_V],
     );
     frag_in.uv = in.uv * fx.scroll_tiling.zw + scroll_rate * globals.time;
+#endif
+#ifdef FX_FLOW
+    // Offsetting the base UV by a second, independently scrolling texture is
+    // what makes fire and smoke CHURN. A single scrolling layer reads as a
+    // sliding sheet no matter how good the texture is.
+    let flow_uv = in.uv * fx.scroll_tiling.zw + fx.flow_fresnel.yz * globals.time;
+    let flow = textureSample(flow_texture, flow_sampler, flow_uv).rg * 2.0 - 1.0;
+    let flow_amount = fx.flow_fresnel.x * emitter_uniforms.drive_slots[DRIVE_SLOT_FLOW];
+    frag_in.uv = frag_in.uv + flow * flow_amount;
 #endif
 
     var pbr_input = pbr_input_from_standard_material(frag_in, is_front);

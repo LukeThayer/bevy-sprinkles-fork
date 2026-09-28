@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use bevy::prelude::*;
-use super::{CurveTexture, Range, variables::VariableId};
+use super::{CurveTexture, ParticlesAsset, Range, variables::VariableId};
 
 /// When a resolved drive value is read by the thing that consumes it.
 ///
@@ -238,6 +240,45 @@ pub struct Drive {
     pub muted: bool,
 }
 
+/// Rejects the shapes a hand-authored `.ron` can break invisibly.
+///
+/// Every one of these would otherwise produce an effect that loads clean and
+/// then renders stock forever, which is the single worst failure mode for an
+/// authoring tool: the author sees no error and no effect, and has nothing to
+/// search for. Returns the FIRST violation, naming the offender — the tests
+/// match on that text, so the wording is part of the contract.
+pub fn validate_drives(a: &ParticlesAsset) -> Result<(), String> {
+    let mut names: HashSet<&str> = HashSet::new();
+    for v in &a.variables {
+        if v.name.trim().is_empty() {
+            return Err("a variable has an empty name".to_string());
+        }
+        if !names.insert(v.name.as_str()) {
+            return Err(format!("duplicate variable name {:?}", v.name));
+        }
+    }
+
+    for (i, d) in a.drives.iter().enumerate() {
+        if d.variable.0 as usize >= a.variables.len() {
+            return Err(format!(
+                "drive {i} names undeclared variable {:?} ({} declared)",
+                d.variable, a.variables.len()
+            ));
+        }
+        let (kind, index, len) = match &d.target {
+            DriveTarget::Emitter { index, .. } => ("emitter", *index, a.emitters.len()),
+            DriveTarget::Transform { index, .. } => ("emitter", *index, a.emitters.len()),
+            DriveTarget::Light { index, .. } => ("light", *index, a.lights.len()),
+        };
+        if index as usize >= len {
+            return Err(format!(
+                "drive {i} names {kind} index {index}, but only {len} exist"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +311,80 @@ mod tests {
     fn a_non_render_prop_has_no_slot() {
         assert!(EmitterProp::Gravity.slot().is_none());
         assert!(EmitterProp::SpawnSize.slot().is_none());
+    }
+
+    use crate::asset::{ParticlesAsset, ParticlesDimension, ParticlesAuthors, EmitterData, VariableDecl};
+
+    fn asset_with(variables: Vec<VariableDecl>, drives: Vec<Drive>) -> ParticlesAsset {
+        let mut a = ParticlesAsset::new(
+            "t".into(), ParticlesDimension::D3, Default::default(),
+            vec![EmitterData::default()], vec![], false, ParticlesAuthors::default(),
+        );
+        a.variables = variables;
+        a.drives = drives;
+        a
+    }
+
+    fn drive_on(variable: u16, target: DriveTarget) -> Drive {
+        Drive {
+            variable: VariableId(variable),
+            target,
+            curve: CurveTexture::default(),
+            output: Range { min: 0.0, max: 1.0 },
+            op: DriveOp::Multiply,
+            muted: false,
+        }
+    }
+
+    fn one_var() -> Vec<VariableDecl> {
+        vec![VariableDecl { name: "temperature".into(), ..Default::default() }]
+    }
+
+    #[test]
+    fn a_drive_naming_an_undeclared_variable_is_rejected() {
+        let a = asset_with(vec![], vec![drive_on(0, DriveTarget::Emitter {
+            index: 0, prop: EmitterProp::Tint,
+        })]);
+        let err = validate_drives(&a).unwrap_err();
+        assert!(err.contains("variable"), "message must name the problem: {err}");
+    }
+
+    #[test]
+    fn a_drive_naming_an_out_of_range_emitter_is_rejected() {
+        let a = asset_with(one_var(), vec![drive_on(0, DriveTarget::Emitter {
+            index: 7, prop: EmitterProp::Tint,
+        })]);
+        let err = validate_drives(&a).unwrap_err();
+        assert!(err.contains("emitter"), "message must name the problem: {err}");
+    }
+
+    #[test]
+    fn a_drive_naming_an_out_of_range_light_is_rejected() {
+        let a = asset_with(one_var(), vec![drive_on(0, DriveTarget::Light {
+            index: 0, prop: LightProp::Intensity,
+        })]);
+        let err = validate_drives(&a).unwrap_err();
+        assert!(err.contains("light"), "message must name the problem: {err}");
+    }
+
+    #[test]
+    fn two_variables_may_not_share_a_name() {
+        let a = asset_with(
+            vec![
+                VariableDecl { name: "heat".into(), ..Default::default() },
+                VariableDecl { name: "heat".into(), ..Default::default() },
+            ],
+            vec![],
+        );
+        let err = validate_drives(&a).unwrap_err();
+        assert!(err.contains("heat"), "message must name the duplicate: {err}");
+    }
+
+    #[test]
+    fn a_valid_asset_passes() {
+        let a = asset_with(one_var(), vec![drive_on(0, DriveTarget::Emitter {
+            index: 0, prop: EmitterProp::Tint,
+        })]);
+        assert!(validate_drives(&a).is_ok());
     }
 }

@@ -2509,6 +2509,21 @@ Implement `MaterialExtension::specialize` to push a def per enabled flag, keepin
 
 This requires `AsBindGroup`'s `bind_group_data` to be `FxDefs` — add `#[bind_group_data(FxDefs)]` to the struct and `impl From<&ParticleMaterialExtension> for FxDefs`. Pipeline specialization keys on it, so each feature combination compiles once and is cached.
 
+- [ ] **Step 4b (REQUIRED, added after Task 8): wire `DRIVE_SLOT_EMISSIVE` into the fragment.**
+
+  `EmitterProp::EmissiveIntensity` (slot 3) is resolved, folded and written into the uniform by
+  Tasks 4-5, and **nothing reads it**. The plan originally assigned its shader wiring to no task at
+  all — slots 0-2 were wired in Task 5 and slots 4-8 are wired by Tasks 11-14, leaving 3 an orphan.
+  That is the same dead-dial defect that got `Drag` removed in Task 6, and here it must be wired
+  rather than removed, because HDR emissive authoring is one of the spec's lighting pillars and
+  because Task 8 deletes `apply_emissive_override` on the stated grounds that this replaces it.
+
+  Multiply the fragment's emissive contribution by
+  `emitter_uniforms.drive_slots[DRIVE_SLOT_EMISSIVE]`. An untouched slot carries 1.0, so an
+  undriven effect is unchanged. Pin it with a test that the constant is read somewhere in
+  `particle_material.wgsl`, in the style of Task 5's lockstep test — a slot written but never read
+  is invisible to every other test in the suite.
+
 - [ ] **Step 5: Implement scroll in the fragment shader**
 
 In `particle_material.wgsl`, add the bindings and, at the top of the fragment entry point where the base UV is first computed, insert:

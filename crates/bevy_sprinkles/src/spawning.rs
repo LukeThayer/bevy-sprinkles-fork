@@ -214,17 +214,38 @@ fn transform_align_to_u32(align: Option<crate::asset::TransformAlign>) -> u32 {
     }
 }
 
+/// Resolves [`FxSettings::gradient_remap`] into a baked, sampleable texture
+/// handle through `cache` -- the exact same [`GradientTextureCache`] (and
+/// thus the exact same cache-key-keyed `get_or_create`) that an emitter's own
+/// colour-over-lifetime gradient bakes through in
+/// [`prepare_gradient_textures`](crate::textures::prepare_gradient_textures)
+/// (`textures/baked.rs`). Two emitters whose `gradient_remap` gradients are
+/// equal (`Gradient::cache_key`) share one baked handle rather than each
+/// paying for their own texture.
+///
+/// Pulled out of `build_extension` as its own pure function -- taking only
+/// plain, `Default`-constructible values (`GradientTextureCache`,
+/// `Assets<Image>`), not `AssetServer` or any ECS scaffolding -- specifically
+/// so a unit test can drive it directly. `build_extension` itself has no
+/// test coverage (see `spawning.rs`'s test module, which only covers
+/// `fold_render_slots`), so without this split a revert of the `.map()` call
+/// below back to a hardcoded `None` would compile and pass every test in the
+/// suite -- exactly the "wired to nothing" defect class this feature's
+/// acceptance criterion exists to prevent.
+fn resolve_gradient_texture(
+    fx: &FxSettings,
+    cache: &mut GradientTextureCache,
+    images: &mut Assets<Image>,
+) -> Option<Handle<Image>> {
+    fx.gradient_remap
+        .as_ref()
+        .map(|gradient| cache.get_or_create(gradient, images))
+}
+
 /// Builds the [`ParticleMaterialExtension`] from a buffer pair plus an
 /// authored [`FxSettings`]: the clamped GPU uniform, the loaded feature
 /// textures, and the shader-def flags that pick which `#ifdef` blocks the
 /// fragment compiles.
-///
-/// `fx.gradient_remap`, when set, is baked into a sampleable texture through
-/// `gradient_cache` -- the exact same [`GradientTextureCache`] (and thus the
-/// exact same cache-key-keyed `get_or_create`) that an emitter's own
-/// colour-over-lifetime gradient bakes through in `extract.rs`. Two emitters
-/// whose `gradient_remap` gradients are equal (`Gradient::cache_key`) share
-/// one baked handle rather than each paying for their own texture.
 fn build_extension(
     sorted_particles: Handle<ShaderBuffer>,
     emitter_uniforms: Handle<ShaderBuffer>,
@@ -242,10 +263,7 @@ fn build_extension(
         .erosion_texture
         .as_ref()
         .map(|t| t.load(asset_server, assets_folders));
-    let gradient_texture = fx
-        .gradient_remap
-        .as_ref()
-        .map(|gradient| gradient_cache.get_or_create(gradient, images));
+    let gradient_texture = resolve_gradient_texture(fx, gradient_cache, images);
 
     ParticleMaterialExtension {
         sorted_particles,
@@ -876,5 +894,61 @@ mod tests {
         resolved.render[2] = Some(4.0);
         let slots = fold_render_slots(Some(&resolved));
         assert_eq!(slots[2], 4.0);
+    }
+
+    fn one_stop_gradient(r: f32) -> crate::asset::Gradient {
+        crate::asset::Gradient {
+            stops: vec![crate::asset::GradientStop {
+                color: [r, 0.0, 0.0, 1.0],
+                position: 0.0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// This is the one that catches a revert of `resolve_gradient_texture`'s
+    /// `.map()` call back to a hardcoded `None`: an authored
+    /// `gradient_remap` must actually resolve to a baked handle, not just
+    /// have a WGSL reader waiting for one.
+    #[test]
+    fn an_authored_gradient_resolves_to_a_baked_handle() {
+        let fx = FxSettings {
+            gradient_remap: Some(one_stop_gradient(1.0)),
+            ..Default::default()
+        };
+        let mut cache = GradientTextureCache::default();
+        let mut images = Assets::<Image>::default();
+        let handle = resolve_gradient_texture(&fx, &mut cache, &mut images);
+        assert!(handle.is_some(), "an authored gradient must bake a texture");
+    }
+
+    #[test]
+    fn no_gradient_remap_resolves_to_no_texture() {
+        let fx = FxSettings::default();
+        let mut cache = GradientTextureCache::default();
+        let mut images = Assets::<Image>::default();
+        let handle = resolve_gradient_texture(&fx, &mut cache, &mut images);
+        assert!(handle.is_none(), "an unauthored effect must not bake anything");
+    }
+
+    #[test]
+    fn two_equal_gradients_resolve_to_the_same_baked_handle() {
+        let fx_a = FxSettings {
+            gradient_remap: Some(one_stop_gradient(0.5)),
+            ..Default::default()
+        };
+        let fx_b = FxSettings {
+            gradient_remap: Some(one_stop_gradient(0.5)),
+            ..Default::default()
+        };
+        let mut cache = GradientTextureCache::default();
+        let mut images = Assets::<Image>::default();
+        let handle_a = resolve_gradient_texture(&fx_a, &mut cache, &mut images).unwrap();
+        let handle_b = resolve_gradient_texture(&fx_b, &mut cache, &mut images).unwrap();
+        assert_eq!(
+            handle_a.id(),
+            handle_b.id(),
+            "two emitters authoring an equal gradient must share one baked texture"
+        );
     }
 }

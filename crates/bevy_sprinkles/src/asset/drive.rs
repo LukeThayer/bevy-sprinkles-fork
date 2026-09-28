@@ -107,6 +107,10 @@ pub enum EmitterProp {
 
 impl EmitterProp {
     /// Every variant, so tests and editor menus cannot drift from the enum.
+    /// That guarantee is checked, not just asserted: see
+    /// `tests::emitter_prop_all_matches_the_reflected_enum_exactly`, which
+    /// compares this list against the enum's own `#[derive(Reflect)]`
+    /// variant metadata rather than against itself.
     pub const ALL: [EmitterProp; 17] = [
         Self::SpawnProbability, Self::Lifetime, Self::InitialSpeed, Self::SpawnSize,
         Self::Spread, Self::EmissionRadius,
@@ -181,7 +185,10 @@ pub enum TransformProp {
 impl TransformProp {
     /// Every variant, so the editor's Drives-list target picker
     /// (`ui/components/drives.rs`) cannot silently drop one -- mirrors
-    /// [`EmitterProp::ALL`]'s reasoning exactly.
+    /// [`EmitterProp::ALL`]'s reasoning exactly, including the check:
+    /// `tests::transform_prop_all_matches_the_reflected_enum_exactly`
+    /// verifies this list against the enum's own reflected variants, not
+    /// against itself.
     pub const ALL: [TransformProp; 10] = [
         Self::ScaleX, Self::ScaleY, Self::ScaleZ, Self::ScaleUniform,
         Self::RotX, Self::RotY, Self::RotZ,
@@ -205,7 +212,8 @@ pub enum LightProp {
 }
 
 impl LightProp {
-    /// Every variant. See [`TransformProp::ALL`].
+    /// Every variant. See [`TransformProp::ALL`]; same check here in
+    /// `tests::light_prop_all_matches_the_reflected_enum_exactly`.
     pub const ALL: [LightProp; 5] = [
         Self::Intensity, Self::Range, Self::Hue, Self::Saturation, Self::Value,
     ];
@@ -356,6 +364,83 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), LightProp::ALL.len());
+    }
+
+    // --- `ALL` against the enum's OWN reflected variants, not against itself
+    //
+    // Task 20 review, Important 1: the tests above (and the ones in
+    // `drives.rs` that build the picker's option lists from these `ALL`
+    // arrays) only ever check `ALL` against `ALL` -- a variant added to
+    // `EmitterProp`/`TransformProp`/`LightProp` and forgotten in `ALL` would
+    // compile clean and pass every one of them, because none of them ever
+    // consult the enum itself. These do: `T::type_info()` /
+    // `EnumInfo::variant_len()` / `EnumInfo::variant_at()` read the variant
+    // list the `#[derive(Reflect)]` macro generated from the enum
+    // definition -- the same mechanism
+    // `inspector::utils::variants_from_reflect` already uses in the editor
+    // to populate comboboxes from arbitrary enums without a hand-maintained
+    // list -- so this is a source of truth this file never writes by hand.
+    // Sorted-vector equality (not just length) also catches a substitution:
+    // the right COUNT but the wrong MEMBER (e.g. a copy-paste that lists
+    // `ScaleY` twice instead of `ScaleY` and `ScaleZ`).
+
+    fn reflected_variant_names<T: bevy::reflect::Typed>() -> Vec<&'static str> {
+        let bevy::reflect::TypeInfo::Enum(enum_info) = T::type_info() else {
+            panic!("expected an enum TypeInfo");
+        };
+        (0..enum_info.variant_len())
+            .filter_map(|i| enum_info.variant_at(i))
+            .map(|v| v.name())
+            .collect()
+    }
+
+    #[test]
+    fn emitter_prop_all_matches_the_reflected_enum_exactly() {
+        let mut reflected: Vec<String> = reflected_variant_names::<EmitterProp>()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut declared: Vec<String> =
+            EmitterProp::ALL.iter().map(|p| format!("{p:?}")).collect();
+        reflected.sort();
+        declared.sort();
+        assert_eq!(
+            declared, reflected,
+            "EmitterProp::ALL must contain exactly the enum's reflected variants -- \
+             no fewer (a forgotten addition), no more, and no substitutions"
+        );
+    }
+
+    #[test]
+    fn transform_prop_all_matches_the_reflected_enum_exactly() {
+        let mut reflected: Vec<String> = reflected_variant_names::<TransformProp>()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut declared: Vec<String> =
+            TransformProp::ALL.iter().map(|p| format!("{p:?}")).collect();
+        reflected.sort();
+        declared.sort();
+        assert_eq!(
+            declared, reflected,
+            "TransformProp::ALL must contain exactly the enum's reflected variants"
+        );
+    }
+
+    #[test]
+    fn light_prop_all_matches_the_reflected_enum_exactly() {
+        let mut reflected: Vec<String> = reflected_variant_names::<LightProp>()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut declared: Vec<String> =
+            LightProp::ALL.iter().map(|p| format!("{p:?}")).collect();
+        reflected.sort();
+        declared.sort();
+        assert_eq!(
+            declared, reflected,
+            "LightProp::ALL must contain exactly the enum's reflected variants"
+        );
     }
 
     fn asset_with(variables: Vec<VariableDecl>, drives: Vec<Drive>) -> ParticlesAsset {

@@ -173,8 +173,17 @@ pub fn target_warnings(asset: &ParticlesAsset, target: &DriveTarget) -> Vec<Stri
 }
 
 /// Every `EmitterProp` the picker offers, in `EmitterProp::ALL`'s own order.
-/// This is the whole reason a future variant cannot be silently omitted: the
-/// picker's option list is not a hand-written subset, it IS `ALL`.
+/// The picker's option list is not a hand-written subset, it IS `ALL` -- so
+/// that half of "a future variant cannot be silently omitted" is structural.
+/// The OTHER half, that `ALL` itself cannot silently fall behind the enum,
+/// is a separate check in `bevy_sprinkles`:
+/// `asset::drive::tests::emitter_prop_all_matches_the_reflected_enum_exactly`
+/// compares `ALL` against the enum's own `#[derive(Reflect)]` variant
+/// metadata, not against itself. (The count-based test below,
+/// `the_target_picker_offers_every_emitter_prop_variant_by_count`, only
+/// guards THIS function's own shape against drifting from `ALL` -- e.g. a
+/// future filter narrowing it -- it is not a substitute for that other
+/// check, which is why both exist.)
 pub fn emitter_prop_picker_options() -> Vec<EmitterProp> {
     EmitterProp::ALL.to_vec()
 }

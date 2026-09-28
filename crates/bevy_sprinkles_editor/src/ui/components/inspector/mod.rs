@@ -4,7 +4,10 @@ mod collider_properties;
 mod collision;
 mod colors;
 mod draw_pass;
-mod drive_button;
+// `pub(crate)`: `components::drives` (Task 20's flat list) reuses several of
+// this module's row-editing pieces verbatim (`spawn_drive_row`, its marker
+// components, `stage_label`) rather than reimplementing them.
+pub(crate) mod drive_button;
 mod emission;
 mod particle_flags;
 mod project_properties;

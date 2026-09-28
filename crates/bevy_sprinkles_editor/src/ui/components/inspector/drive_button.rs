@@ -91,7 +91,10 @@ pub fn upsert_drive(asset: &mut ParticlesAsset, target: DriveTarget, variable: V
 /// Spells out an `EmitterProp`'s stage as the question an author actually
 /// asks, rather than the enum name. Exhaustive on `Stage`, no wildcard arm --
 /// a new stage is a compile error here until it says what it means.
-fn stage_label(prop: EmitterProp) -> &'static str {
+///
+/// `pub(crate)`: reused verbatim by `drives.rs`'s flat list, which states the
+/// same stage next to every row regardless of which kind of target it is.
+pub(crate) fn stage_label(prop: EmitterProp) -> &'static str {
     match prop.stage() {
         Stage::Spawn => "Spawn: affects only new particles",
         Stage::Sim => "Sim: affects particles already in flight",
@@ -181,31 +184,38 @@ struct DriveRowsContainer(Entity);
 #[derive(Component)]
 struct DriveRow;
 
+// The six row-marker types below, and `spawn_drive_row` that spawns them,
+// are `pub(crate)`: `drives.rs`'s flat list reuses this ENTIRE row (variable
+// combo, curve edit, output min/max, op combo, mute checkbox, delete button)
+// verbatim rather than reimplementing it, which means it also reuses every
+// observer below unchanged -- those observers query by component type, not
+// by which module spawned the entity, so a `drives.rs` row wired with these
+// same markers is handled by the exact same code path as a popover row.
 #[derive(Component, Clone, Copy)]
-struct DriveVariableCombo(usize);
+pub(crate) struct DriveVariableCombo(pub(crate) usize);
 
 #[derive(Component, Clone, Copy)]
-struct DriveOpCombo(usize);
+pub(crate) struct DriveOpCombo(pub(crate) usize);
 
 #[derive(Component, Clone, Copy)]
-struct DriveMuteCheckbox(usize);
+pub(crate) struct DriveMuteCheckbox(pub(crate) usize);
 
 #[derive(Component, Clone, Copy)]
-struct DriveDeleteButton(usize);
+pub(crate) struct DriveDeleteButton(pub(crate) usize);
 
 #[derive(Component, Clone, Copy)]
-struct DriveCurveTarget(usize);
+pub(crate) struct DriveCurveTarget(pub(crate) usize);
 
 #[derive(Component, Clone, Copy, PartialEq)]
-enum OutputBound {
+pub(crate) enum OutputBound {
     Min,
     Max,
 }
 
 #[derive(Component, Clone, Copy)]
-struct DriveOutputField {
-    index: usize,
-    bound: OutputBound,
+pub(crate) struct DriveOutputField {
+    pub(crate) index: usize,
+    pub(crate) bound: OutputBound,
 }
 
 #[derive(Component)]
@@ -436,7 +446,11 @@ fn rebuild_drive_rows(
     }
 }
 
-fn spawn_drive_row(
+/// `pub(crate)`: reused verbatim by `drives.rs`'s flat list. See the module
+/// doc's note above `DriveVariableCombo` for why reusing this wholesale, and
+/// letting the existing observers below handle the results, is safe -- they
+/// dispatch on component type, not on which module spawned the row.
+pub(crate) fn spawn_drive_row(
     parent: &mut ChildSpawnerCommands,
     index: usize,
     drive: &Drive,
@@ -542,7 +556,7 @@ fn spawn_drive_row(
 
 // --- Row commits ----------------------------------------------------------
 
-fn handle_drive_variable_change(
+pub(crate) fn handle_drive_variable_change(
     trigger: On<ComboBoxChangeEvent>,
     combos: Query<&DriveVariableCombo>,
     editor_state: Res<EditorState>,
@@ -568,7 +582,7 @@ fn handle_drive_variable_change(
     }
 }
 
-fn handle_drive_op_change(
+pub(crate) fn handle_drive_op_change(
     trigger: On<ComboBoxChangeEvent>,
     combos: Query<&DriveOpCombo>,
     editor_state: Res<EditorState>,
@@ -598,7 +612,7 @@ fn handle_drive_op_change(
     }
 }
 
-fn handle_drive_mute_commit(
+pub(crate) fn handle_drive_mute_commit(
     trigger: On<CheckboxCommitEvent>,
     checkboxes: Query<&DriveMuteCheckbox>,
     editor_state: Res<EditorState>,
@@ -623,7 +637,7 @@ fn handle_drive_mute_commit(
     }
 }
 
-fn handle_drive_delete_click(
+pub(crate) fn handle_drive_delete_click(
     trigger: On<ButtonClickEvent>,
     buttons: Query<&DriveDeleteButton>,
     editor_state: Res<EditorState>,
@@ -646,7 +660,7 @@ fn handle_drive_delete_click(
     dirty_state.has_unsaved_changes = true;
 }
 
-fn handle_drive_curve_commit(
+pub(crate) fn handle_drive_curve_commit(
     trigger: On<CurveEditCommitEvent>,
     targets: Query<&DriveCurveTarget>,
     editor_state: Res<EditorState>,
@@ -669,7 +683,7 @@ fn handle_drive_curve_commit(
     dirty_state.has_unsaved_changes = true;
 }
 
-fn handle_drive_output_commit(
+pub(crate) fn handle_drive_output_commit(
     trigger: On<TextEditCommitEvent>,
     fields: Query<&DriveOutputField>,
     parents: Query<&ChildOf>,

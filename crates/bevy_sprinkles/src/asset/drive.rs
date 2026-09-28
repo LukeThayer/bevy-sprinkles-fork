@@ -178,6 +178,17 @@ pub enum TransformProp {
     PosZ,
 }
 
+impl TransformProp {
+    /// Every variant, so the editor's Drives-list target picker
+    /// (`ui/components/drives.rs`) cannot silently drop one -- mirrors
+    /// [`EmitterProp::ALL`]'s reasoning exactly.
+    pub const ALL: [TransformProp; 10] = [
+        Self::ScaleX, Self::ScaleY, Self::ScaleZ, Self::ScaleUniform,
+        Self::RotX, Self::RotY, Self::RotZ,
+        Self::PosX, Self::PosY, Self::PosZ,
+    ];
+}
+
 /// A property of an effect-owned light. Always ECS-stage.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Reflect)]
 pub enum LightProp {
@@ -191,6 +202,13 @@ pub enum LightProp {
     Saturation,
     /// Value (brightness) channel of the light's color.
     Value,
+}
+
+impl LightProp {
+    /// Every variant. See [`TransformProp::ALL`].
+    pub const ALL: [LightProp; 5] = [
+        Self::Intensity, Self::Range, Self::Hue, Self::Saturation, Self::Value,
+    ];
 }
 
 /// What a [`Drive`] writes to.
@@ -318,6 +336,26 @@ mod tests {
     fn a_non_render_prop_has_no_slot() {
         assert!(EmitterProp::Gravity.slot().is_none());
         assert!(EmitterProp::SpawnSize.slot().is_none());
+    }
+
+    #[test]
+    fn transform_prop_all_has_no_duplicates_and_matches_its_declared_length() {
+        // Mirrors `every_render_prop_has_a_distinct_slot_and_they_are_dense`'s
+        // duplicate-guard reasoning: `ALL` is the editor target picker's
+        // source of truth (`ui/components/drives.rs`), so a copy-paste
+        // duplicate here would silently crowd out a real variant there.
+        let mut seen: Vec<String> = TransformProp::ALL.iter().map(|p| format!("{p:?}")).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), TransformProp::ALL.len());
+    }
+
+    #[test]
+    fn light_prop_all_has_no_duplicates_and_matches_its_declared_length() {
+        let mut seen: Vec<String> = LightProp::ALL.iter().map(|p| format!("{p:?}")).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), LightProp::ALL.len());
     }
 
     fn asset_with(variables: Vec<VariableDecl>, drives: Vec<Drive>) -> ParticlesAsset {

@@ -16,6 +16,7 @@ mod transform;
 mod turbulence;
 pub mod types;
 pub mod utils;
+mod variable;
 mod velocities;
 mod visibility_aabb;
 
@@ -26,7 +27,7 @@ use bevy::prelude::*;
 use bevy_sprinkles::prelude::*;
 
 use crate::state::{ActiveSidebarTab, EditorState, Inspectable, SidebarTab};
-use crate::ui::icons::{ICON_BOX, ICON_SHOWERS};
+use crate::ui::icons::{ICON_BOX, ICON_HASHTAG, ICON_SHOWERS};
 use crate::ui::tokens::{
     BORDER_COLOR, FONT_PATH, TEXT_BODY_COLOR, TEXT_MUTED_COLOR, TEXT_SIZE_LG, TEXT_SIZE_SM,
 };
@@ -60,6 +61,7 @@ pub fn plugin(app: &mut App) {
             particle_flags::plugin,
             collider_properties::plugin,
         ))
+        .add_plugins(variable::plugin)
         .add_plugins(project_properties::plugin)
         .add_plugins(visibility_aabb::plugin)
         .add_systems(
@@ -136,6 +138,7 @@ struct InspectorPanelContent;
 enum InspectorContentKind {
     Emitter,
     Collider,
+    Variable,
     Project,
     Settings,
     EnabledCheckbox,
@@ -246,6 +249,20 @@ fn setup_inspector_panel(
 
                         content
                             .spawn((
+                                InspectorContentKind::Variable,
+                                Node {
+                                    width: percent(100),
+                                    flex_direction: FlexDirection::Column,
+                                    display: Display::None,
+                                    ..default()
+                                },
+                            ))
+                            .with_children(|variable_content| {
+                                spawn_section(variable_content, variable::variable_section());
+                            });
+
+                        content
+                            .spawn((
                                 InspectorContentKind::Project,
                                 Node {
                                     width: percent(100),
@@ -310,6 +327,7 @@ fn toggle_inspector_content(
         let visible = match kind {
             InspectorContentKind::Emitter => inspecting_kind == Some(Inspectable::Emitter),
             InspectorContentKind::Collider => inspecting_kind == Some(Inspectable::Collider),
+            InspectorContentKind::Variable => inspecting_kind == Some(Inspectable::Variable),
             InspectorContentKind::Project => {
                 active_tab.0 == SidebarTab::Project && editor_state.current_project.is_some()
             }
@@ -540,6 +558,11 @@ fn get_outliner_title(
             let collider = asset.colliders.get(inspecting.index as usize);
             let name = collider.map(|c| c.name.clone()).unwrap_or_default();
             (name, ICON_BOX)
+        }
+        Inspectable::Variable => {
+            let variable = asset.variables.get(inspecting.index as usize);
+            let name = variable.map(|v| v.name.clone()).unwrap_or_default();
+            (name, ICON_HASHTAG)
         }
     })
 }

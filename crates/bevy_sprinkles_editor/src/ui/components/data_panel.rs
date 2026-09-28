@@ -391,6 +391,13 @@ fn on_item_menu_change(
             let insert_index = item.index as usize + 1;
 
             match item.kind {
+                // Variables never enter this list (they have their own,
+                // in variables.rs, precisely because inserting at a
+                // non-tail index here would shift positional `VariableId`s
+                // the same way a delete does -- a hazard this generic
+                // Duplicate path does not guard against). Kept exhaustive
+                // only because `Inspectable` is a shared enum.
+                Inspectable::Variable => return,
                 Inspectable::Emitter => {
                     let Some(source) = asset.emitters.get(item.index as usize) else {
                         return;
@@ -431,6 +438,8 @@ fn on_item_menu_change(
             let label = match item.kind {
                 Inspectable::Emitter => "Delete emitter",
                 Inspectable::Collider => "Delete collider",
+                // Unreachable: variables use their own list (variables.rs).
+                Inspectable::Variable => "Delete variable",
             };
             commands.insert_resource(PendingDelete {
                 kind: item.kind,
@@ -513,6 +522,10 @@ fn trigger_respawn(commands: &mut Commands, kind: Inspectable) {
     match kind {
         Inspectable::Emitter => commands.trigger(RespawnEmittersEvent),
         Inspectable::Collider => commands.trigger(RespawnCollidersEvent),
+        // A variable has no world representation of its own to respawn --
+        // it only reshapes drives, which are resolved fresh every frame.
+        // Also unreachable from this list; see the Duplicate arm above.
+        Inspectable::Variable => {}
     }
 }
 
@@ -578,6 +591,10 @@ fn get_item_name(
         Inspectable::Collider => {
             let collider = asset.colliders.get(item.index as usize)?;
             Some(collider.name.clone())
+        }
+        Inspectable::Variable => {
+            let variable = asset.variables.get(item.index as usize)?;
+            Some(variable.name.clone())
         }
     }
 }
@@ -729,6 +746,15 @@ fn on_rename_commit(
                             dirty_state.has_unsaved_changes = true;
                         }
                     }
+                    // Unreachable: variables rename via their own inspector
+                    // field, not this list's double-click flow. Handled
+                    // correctly anyway rather than left a silent no-op.
+                    Inspectable::Variable => {
+                        if let Some(variable) = asset.variables.get_mut(item.index as usize) {
+                            variable.name = new_name.clone();
+                            dirty_state.has_unsaved_changes = true;
+                        }
+                    }
                 }
             }
         }
@@ -792,6 +818,16 @@ fn on_delete_confirmed(
             }
             asset.colliders.remove(index);
             asset.colliders.len()
+        }
+        // Unreachable from this list (see the Duplicate arm above), but
+        // implemented correctly -- and routed through the same renumbering
+        // helper the variables list itself uses -- rather than left dead.
+        Inspectable::Variable => {
+            if index >= asset.variables.len() {
+                return;
+            }
+            crate::ui::components::variables::remove_variable(&mut asset, index);
+            asset.variables.len()
         }
     };
 

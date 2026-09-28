@@ -98,6 +98,10 @@ pub(super) fn get_inspected_data<'a>(
             let collider = asset.colliders.get(inspecting.index as usize)?;
             Some(collider)
         }
+        Inspectable::Variable => {
+            let variable = asset.variables.get(inspecting.index as usize)?;
+            Some(variable)
+        }
     }
 }
 
@@ -116,6 +120,10 @@ pub(super) fn get_inspected_data_mut<'a>(
         Inspectable::Collider => {
             let collider = asset.colliders.get_mut(inspecting.index as usize)?;
             Some(collider)
+        }
+        Inspectable::Variable => {
+            let variable = asset.variables.get_mut(inspecting.index as usize)?;
+            Some(variable)
         }
     }
 }

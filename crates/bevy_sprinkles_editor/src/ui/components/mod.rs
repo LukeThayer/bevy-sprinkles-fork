@@ -9,4 +9,5 @@ pub mod seekbar;
 pub mod sidebar;
 pub mod toasts;
 pub mod topbar;
+pub mod variables;
 pub mod viewport;

@@ -51,6 +51,7 @@ pub struct Inspecting {
 pub enum Inspectable {
     Emitter,
     Collider,
+    Variable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

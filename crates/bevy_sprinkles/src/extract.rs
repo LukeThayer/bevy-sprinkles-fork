@@ -407,12 +407,6 @@ fn resolve_curve_texture(
 /// Deliberately never touches `u.amount` — see the field's constraint in this
 /// module and `EmitterProp::SpawnProbability`'s doc. `amount` is the pool size
 /// AND the per-slot gate, so scaling it strands live particles.
-///
-/// `EmitterProp::Drag` has no corresponding field on `EmitterUniforms`: this
-/// engine's compute shader implements no velocity damping at all (see the
-/// `// TODO: requires implementing damping` in `asset/mod.rs`'s `ParticleFlags`).
-/// There is nothing to route it to, so it is a documented no-op rather than an
-/// invented field — driving it does nothing until damping itself exists.
 pub(crate) fn apply_sim_drives(u: &mut EmitterUniforms, r: &crate::drives::EmitterResolved) {
     use crate::asset::EmitterProp as P;
 
@@ -441,8 +435,6 @@ pub(crate) fn apply_sim_drives(u: &mut EmitterUniforms, r: &crate::drives::Emitt
     if let Some(v) = r.sim.get(&P::Gravity) {
         u.gravity = [u.gravity[0] * v, u.gravity[1] * v, u.gravity[2] * v];
     }
-    // EmitterProp::Drag: no field exists (see doc comment above) — deliberately
-    // not routed.
     if let Some(v) = r.sim.get(&P::TurbulenceStrength) {
         u.turbulence_noise_strength *= v;
     }
@@ -1039,18 +1031,51 @@ mod drive_tests {
     }
 
     #[test]
-    fn a_drag_drive_is_a_documented_noop_no_field_exists_to_route_it_to() {
-        // EmitterUniforms has no damping/drag field at all -- this engine's
-        // compute shader implements no velocity damping (see the `// TODO:
-        // requires implementing damping` in asset/mod.rs). Resolving Drag
-        // must not panic, invent a field, or perturb anything else.
-        let before = EmitterUniforms {
-            lifetime: 2.0,
+    fn a_spawn_size_drive_scales_both_scale_bounds() {
+        let mut u = EmitterUniforms {
+            scale_min: 1.0,
+            scale_max: 2.0,
             ..Default::default()
         };
-        let mut u = before;
-        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::Drag, 0.5)]));
-        assert_eq!(u.lifetime, before.lifetime);
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::SpawnSize, 3.0)]));
+        assert_eq!(u.scale_min, 3.0);
+        assert_eq!(u.scale_max, 6.0);
+    }
+
+    #[test]
+    fn a_spread_drive_scales_spread() {
+        let mut u = EmitterUniforms {
+            spread: 45.0,
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::Spread, 2.0)]));
+        assert_eq!(u.spread, 90.0);
+    }
+
+    #[test]
+    fn an_emission_radius_drive_scales_all_three_radius_fields() {
+        // This property fans out to three fields; a future edit could easily
+        // update two of three and leave the drive silently half-applied.
+        let mut u = EmitterUniforms {
+            emission_sphere_radius: 1.0,
+            emission_ring_radius: 2.0,
+            emission_ring_inner_radius: 4.0,
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::EmissionRadius, 0.5)]));
+        assert_eq!(u.emission_sphere_radius, 0.5);
+        assert_eq!(u.emission_ring_radius, 1.0);
+        assert_eq!(u.emission_ring_inner_radius, 2.0);
+    }
+
+    #[test]
+    fn a_turbulence_strength_drive_scales_turbulence_noise_strength() {
+        let mut u = EmitterUniforms {
+            turbulence_noise_strength: 4.0,
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::TurbulenceStrength, 0.25)]));
+        assert_eq!(u.turbulence_noise_strength, 1.0);
     }
 
     /// `EmitterParams` in `particle_simulate.wgsl` shares this struct's GPU

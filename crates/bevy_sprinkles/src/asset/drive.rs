@@ -75,8 +75,12 @@ pub enum EmitterProp {
     // --- Sim: read every step; reshapes particles already in flight ---
     /// Downward acceleration applied every step.
     Gravity,
-    /// Velocity damping applied every step.
-    Drag,
+    // There is deliberately no `Drag`: this engine implements no velocity
+    // damping anywhere (see the `TODO: requires implementing damping` in
+    // `asset/mod.rs`'s `ParticleFlags`), so a `Drag` target would have no
+    // field to route to. A drive target with no effect is worse than a
+    // missing one — an author wires a curve to it and sees nothing, with
+    // nothing to search for. Re-add alongside damping itself, not before.
     /// Strength of the per-step turbulence displacement.
     TurbulenceStrength,
 
@@ -103,10 +107,10 @@ pub enum EmitterProp {
 
 impl EmitterProp {
     /// Every variant, so tests and editor menus cannot drift from the enum.
-    pub const ALL: [EmitterProp; 18] = [
+    pub const ALL: [EmitterProp; 17] = [
         Self::SpawnProbability, Self::Lifetime, Self::InitialSpeed, Self::SpawnSize,
         Self::Spread, Self::EmissionRadius,
-        Self::Gravity, Self::Drag, Self::TurbulenceStrength,
+        Self::Gravity, Self::TurbulenceStrength,
         Self::Tint, Self::Alpha, Self::SizeMul, Self::EmissiveIntensity,
         Self::ScrollU, Self::ScrollV, Self::FlowStrength, Self::ErosionThreshold,
         Self::FresnelPower,
@@ -119,7 +123,7 @@ impl EmitterProp {
             Self::SpawnProbability | Self::Lifetime | Self::InitialSpeed
             | Self::SpawnSize | Self::Spread | Self::EmissionRadius => Stage::Spawn,
 
-            Self::Gravity | Self::Drag | Self::TurbulenceStrength => Stage::Sim,
+            Self::Gravity | Self::TurbulenceStrength => Stage::Sim,
 
             Self::Tint | Self::Alpha | Self::SizeMul | Self::EmissiveIntensity
             | Self::ScrollU | Self::ScrollV | Self::FlowStrength

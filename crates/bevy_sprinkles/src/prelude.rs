@@ -22,3 +22,5 @@ pub use crate::runtime::{
 };
 
 pub use crate::r#override::{ParticleEmitterOverrides, ParticleOverride};
+
+pub use crate::drives::ParticleVariables;

@@ -158,6 +158,8 @@
 /// Particle system asset definitions, emitter data, and serialization types.
 pub mod asset;
 mod compute;
+/// Effect variables and the drive-resolution spine.
+pub mod drives;
 mod extract;
 /// Particle material extension for GPU-driven particle rendering.
 pub mod material;
@@ -272,6 +274,7 @@ pub use asset::{
     ParticleMesh, ParticlesColliderShape3D, ParticlesDimension, QuadOrientation, RibbonTrailShape,
     SerializableAlphaMode, StandardParticleMaterial, TransformAlign,
 };
+pub use drives::ParticleVariables;
 pub use material::ParticleMaterialExtension;
 pub use runtime::{
     ColliderEntity, EmitterEntity, EmitterRuntime, Finished, ParticleBufferHandle, ParticleData,

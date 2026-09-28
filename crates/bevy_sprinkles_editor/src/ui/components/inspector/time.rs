@@ -1,9 +1,10 @@
 use bevy::prelude::*;
+use bevy_sprinkles::asset::EmitterProp;
 
 use crate::ui::icons::{ICON_SEEDLING, ICON_TIME};
 use crate::ui::widgets::inspector_field::InspectorFieldProps;
 
-use super::InspectorSection;
+use super::{InspectorItem, InspectorSection};
 
 pub fn plugin(_app: &mut App) {}
 
@@ -14,10 +15,12 @@ pub fn time_section() -> (impl Bundle, InspectorSection) {
             "Time",
             vec![
                 vec![
-                    InspectorFieldProps::new("time.lifetime")
-                        .with_icon(ICON_TIME)
-                        .with_suffix("s")
-                        .into(),
+                    InspectorItem::Driven {
+                        field: InspectorFieldProps::new("time.lifetime")
+                            .with_icon(ICON_TIME)
+                            .with_suffix("s"),
+                        prop: EmitterProp::Lifetime,
+                    },
                     InspectorFieldProps::new("time.lifetime_randomness")
                         .percent()
                         .with_icon(ICON_TIME)

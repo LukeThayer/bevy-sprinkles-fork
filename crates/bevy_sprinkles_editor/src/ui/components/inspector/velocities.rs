@@ -14,8 +14,10 @@ use crate::ui::widgets::popover::{
 };
 use crate::ui::widgets::vector_edit::VectorSuffixes;
 
+use bevy_sprinkles::asset::EmitterProp;
+
 use super::utils::name_to_label;
-use super::{DynamicSectionContent, InspectorSection};
+use super::{DynamicSectionContent, InspectorItem, InspectorSection};
 use crate::ui::components::binding::{EmitterWriter, get_inspecting_emitter};
 use crate::ui::icons::{ICON_CLOSE, ICON_MORE};
 
@@ -77,11 +79,11 @@ pub fn velocities_section() -> (impl Bundle, InspectorSection) {
         InspectorSection::new(
             "Velocities",
             vec![
-                vec![
-                    InspectorFieldProps::new("velocities.initial_velocity")
-                        .vector(VectorSuffixes::Range)
-                        .into(),
-                ],
+                vec![InspectorItem::Driven {
+                    field: InspectorFieldProps::new("velocities.initial_velocity")
+                        .vector(VectorSuffixes::Range),
+                    prop: EmitterProp::InitialSpeed,
+                }],
                 vec![
                     InspectorFieldProps::new("velocities.initial_direction")
                         .vector(VectorSuffixes::XYZ)
@@ -94,7 +96,10 @@ pub fn velocities_section() -> (impl Bundle, InspectorSection) {
                 ],
                 vec![
                     InspectorFieldProps::new("velocities.inherit_ratio").into(),
-                    InspectorFieldProps::new("velocities.spread").into(),
+                    InspectorItem::Driven {
+                        field: InspectorFieldProps::new("velocities.spread"),
+                        prop: EmitterProp::Spread,
+                    },
                     InspectorFieldProps::new("velocities.flatness").into(),
                 ],
             ],

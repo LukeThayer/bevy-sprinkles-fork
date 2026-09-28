@@ -1,5 +1,6 @@
 use bevy::picking::prelude::Pickable;
 use bevy::prelude::*;
+use bevy_sprinkles::asset::EmitterProp;
 use bevy_sprinkles::prelude::*;
 
 use crate::state::EditorState;
@@ -63,12 +64,14 @@ pub fn colors_section() -> (impl Bundle, InspectorSection) {
                         .into(),
                 ],
                 vec![
-                    InspectorFieldProps::new("colors.alpha_over_lifetime")
-                        .curve()
-                        .into(),
-                    InspectorFieldProps::new("colors.emission_over_lifetime")
-                        .curve()
-                        .into(),
+                    InspectorItem::Driven {
+                        field: InspectorFieldProps::new("colors.alpha_over_lifetime").curve(),
+                        prop: EmitterProp::Alpha,
+                    },
+                    InspectorItem::Driven {
+                        field: InspectorFieldProps::new("colors.emission_over_lifetime").curve(),
+                        prop: EmitterProp::EmissiveIntensity,
+                    },
                 ],
             ],
         ),

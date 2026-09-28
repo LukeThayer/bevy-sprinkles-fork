@@ -4,6 +4,7 @@ mod collider_properties;
 mod collision;
 mod colors;
 mod draw_pass;
+mod drive_button;
 mod emission;
 mod particle_flags;
 mod project_properties;
@@ -24,6 +25,7 @@ pub use types::{ComboBoxOption, FieldKind, VariantField};
 pub use utils::{name_to_label, path_to_label};
 
 use bevy::prelude::*;
+use bevy_sprinkles::asset::EmitterProp;
 use bevy_sprinkles::prelude::*;
 
 use crate::state::{ActiveSidebarTab, EditorState, Inspectable, SidebarTab};
@@ -64,6 +66,7 @@ pub fn plugin(app: &mut App) {
         .add_plugins(variable::plugin)
         .add_plugins(project_properties::plugin)
         .add_plugins(visibility_aabb::plugin)
+        .add_plugins(drive_button::plugin)
         .add_systems(
             Update,
             (
@@ -424,6 +427,14 @@ pub enum InspectorItem {
         path: String,
         props: VariantEditProps,
     },
+    /// A numeric field paired with the drive affordance for the
+    /// `EmitterProp` it authors -- see `drive_button`'s module doc. Kept as
+    /// its own variant (rather than a builder method on `InspectorFieldProps`)
+    /// so the widgets crate does not need to know about `EmitterProp`.
+    Driven {
+        field: InspectorFieldProps,
+        prop: EmitterProp,
+    },
 }
 
 impl From<InspectorFieldProps> for InspectorItem {
@@ -531,6 +542,15 @@ fn setup_inspector_section_fields(
                                 row.commands()
                                     .spawn_scene(variant_edit(props))
                                     .insert(FieldBinding::emitter(&path, FieldKind::default()))
+                                    .insert(ChildOf(row_target));
+                            }
+                            InspectorItem::Driven { field, prop } => {
+                                spawn_inspector_field(row, field, &asset_server);
+                                let row_target = row.target_entity();
+                                row.commands()
+                                    .spawn_scene(drive_button::drive_button(
+                                        drive_button::DriveButtonProps::new(prop),
+                                    ))
                                     .insert(ChildOf(row_target));
                             }
                         }

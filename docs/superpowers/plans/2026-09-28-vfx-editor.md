@@ -2770,11 +2770,18 @@ git commit -m "feat(fx): gradient remap, so one greyscale mask serves many looks
 ## Task 16: Lit particles — and making the existing `unlit` flag actually work
 
 
-> **Acceptance criterion carried from Task 11's review.** `FxDefs.lit` is currently hardcoded
-> `false` as a literal in `build_extension` (`spawning.rs`), because the brief gave it no driving
-> `FxSettings` field. This task must replace that literal with a real predicate (`!m.unlit`) and
-> must not leave `lit` as a constant. A def that is declared but never pushed makes its feature
-> silently inert with nothing noticing — the defect class this branch has already hit four times.
+> **RULING — this task is INVERTED. Read before doing anything.** The plan's premise here is wrong.
+> It warned that bevy branches the unlit bit outside `apply_pbr_lighting`, so a material calling
+> that unconditionally would ignore `unlit`. True of a sibling project's ToonMaterial; **not true
+> of this shader.** `particle_material.wgsl:1534-1540` already reads
+> `STANDARD_MATERIAL_FLAGS_UNLIT_BIT` at runtime and calls `apply_pbr_lighting` only in the else
+> branch, and `to_standard_material` already forwards `unlit`. **Lit particles already work.**
+> Meanwhile `specialize` pushes `FX_LIT` (`material.rs:206`) and **no `#ifdef FX_LIT` exists in any
+> `.wgsl` file** — a def pushed into the void.
+> So this task REMOVES rather than adds: delete `FxDefs.lit`, its `push`, and the `lit: false` at
+> `spawning.rs:283`; verify and pin the existing runtime behaviour instead. Do NOT add a second
+> mechanism, and do NOT wire `lit` to a predicate — that would push a def nothing reads while
+> implying a gating mechanism that does not exist.
 **Files:** modify `crates/bevy_sprinkles/src/shaders/particle_material.wgsl`, `crates/bevy_sprinkles/src/material.rs`.
 
 **Interfaces:** consumes Task 11's `FxDefs::lit`; `StandardParticleMaterial::unlit` already exists.

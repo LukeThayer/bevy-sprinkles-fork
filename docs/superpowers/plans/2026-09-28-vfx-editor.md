@@ -39,6 +39,9 @@
   `cargo test -p bevy_sprinkles_editor` for editor tasks, and
   `cargo test --workspace` before any phase-closing commit — each through the
   wrapper above.
+- **Never pass `--target-dir`.** Use the default `target/`. A Bevy build tree is ~20 GB, so a
+  private target dir silently duplicates it and makes your test counts incomparable to the
+  recorded baseline. One implementer created an 11 GB `target/dev` this way.
 - **Mutation-verify every guard:** delete the guarded code, confirm the new test fails, restore byte for byte. A test that stays green under deletion of its subject is a defect.
 
 ## Review Focus

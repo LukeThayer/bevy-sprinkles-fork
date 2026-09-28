@@ -1,3 +1,4 @@
+use bevy::color::Hsva;
 use bevy::prelude::*;
 
 use crate::asset::{FxLightKind, LightProp, ParticlesAsset};
@@ -170,6 +171,39 @@ pub fn advance_light_clocks(
     }
 }
 
+/// Applies hue/saturation/value drives to an authored colour.
+///
+/// Hue is a rotation in turns (0..1 maps to 0..360 degrees) so a linear curve
+/// over a 0..1 variable sweeps the wheel once -- the "linear hue shift" case
+/// from the design brief. Saturation and value MULTIPLY, so an undriven
+/// channel is exactly the authored colour rather than a re-derived
+/// approximation of it. A non-finite drive is dropped per channel, because a
+/// NaN here silently blanks a light and reads as "the light broke".
+pub(crate) fn apply_hsv(base: Color, hue: Option<f32>, sat: Option<f32>, val: Option<f32>) -> Color {
+    let hue = hue.filter(|v| v.is_finite());
+    let sat = sat.filter(|v| v.is_finite());
+    let val = val.filter(|v| v.is_finite());
+    // Filtering non-finite drives out BEFORE this check (rather than just
+    // checking the raw Options) matters: a lone NaN drive with the other two
+    // absent must read as "no drives at all" and skip the Color -> Hsva ->
+    // Color round trip entirely, or the round trip's own float noise would
+    // change a colour that every finite input asked to leave untouched.
+    if hue.is_none() && sat.is_none() && val.is_none() {
+        return base;
+    }
+    let mut hsva = Hsva::from(base);
+    if let Some(h) = hue {
+        hsva.hue = (hsva.hue + h * 360.0).rem_euclid(360.0);
+    }
+    if let Some(s) = sat {
+        hsva.saturation = (hsva.saturation * s).clamp(0.0, 1.0);
+    }
+    if let Some(v) = val {
+        hsva.value = (hsva.value * v).max(0.0);
+    }
+    Color::from(hsva)
+}
+
 /// Applies each light's own-clock intensity curve and its ECS-stage drives.
 ///
 /// Intensity and range are recomputed from the authored value every frame
@@ -220,13 +254,26 @@ pub fn sync_effect_lights(
         let intensity = (data.intensity * envelope * intensity_mul).max(0.0);
         let range = (data.range * range_mul).max(0.0);
 
+        let hue = resolved
+            .and_then(|r| r.props.get(&LightProp::Hue))
+            .copied();
+        let sat = resolved
+            .and_then(|r| r.props.get(&LightProp::Saturation))
+            .copied();
+        let val = resolved
+            .and_then(|r| r.props.get(&LightProp::Value))
+            .copied();
+        let color = apply_hsv(data.color, hue, sat, val);
+
         if let Some(mut l) = point {
             l.intensity = intensity;
             l.range = range;
+            l.color = color;
         }
         if let Some(mut l) = spot {
             l.intensity = intensity;
             l.range = range;
+            l.color = color;
         }
     }
 }
@@ -237,8 +284,31 @@ mod tests {
     use crate::asset::{
         CurvePoint, CurveTexture, LightData, ParticlesAsset, ParticlesAuthors, ParticlesDimension,
     };
+    use bevy::color::{Hsva, Srgba};
     use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
+
+    #[test]
+    fn a_hue_drive_rotates_the_authored_colour_without_changing_its_value() {
+        let shifted = apply_hsv(Color::srgb(1.0, 0.0, 0.0), Some(0.5), None, None);
+        let hsva = Hsva::from(shifted);
+        assert!((hsva.hue - 180.0).abs() < 1.0, "hue should be rotated, got {}", hsva.hue);
+        assert!(hsva.value > 0.9, "value must be untouched, got {}", hsva.value);
+    }
+
+    #[test]
+    fn no_hsv_drives_returns_the_colour_unchanged() {
+        let c = Color::srgb(0.25, 0.5, 0.75);
+        let out = apply_hsv(c, None, None, None);
+        assert_eq!(Srgba::from(out).to_f32_array(), Srgba::from(c).to_f32_array());
+    }
+
+    #[test]
+    fn a_non_finite_hsv_drive_is_ignored_rather_than_blanking_the_light() {
+        let c = Color::srgb(0.25, 0.5, 0.75);
+        let out = apply_hsv(c, Some(f32::NAN), None, None);
+        assert_eq!(Srgba::from(out).to_f32_array(), Srgba::from(c).to_f32_array());
+    }
 
     fn app_with(lights: Vec<LightData>) -> (App, Entity) {
         let mut app = App::new();
@@ -594,5 +664,170 @@ mod tests {
 
         assert_eq!(point.intensity, 250.0, "no EffectDrives must mean an identity intensity multiplier");
         assert_eq!(point.range, 12.0, "no EffectDrives must mean an identity range multiplier");
+    }
+
+    /// Task 9's review found the spot branch had no numeric colour assertion
+    /// until it was asked for -- this pins colour on BOTH light kinds so the
+    /// same gap can't reopen for hue/saturation/value.
+    #[test]
+    fn a_hue_drive_rotates_colour_on_both_a_point_and_a_spot_light() {
+        use crate::drives::{EffectDrives, LightResolved, ResolvedDrives};
+
+        let point_light = LightData {
+            kind: FxLightKind::Point,
+            color: Color::srgb(1.0, 0.0, 0.0),
+            intensity_over_life: None,
+            ..Default::default()
+        };
+        let spot_light = LightData {
+            kind: FxLightKind::Spot,
+            color: Color::srgb(1.0, 0.0, 0.0),
+            intensity_over_life: None,
+            ..Default::default()
+        };
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.add_systems(
+            Update,
+            (setup_effect_lights, advance_light_clocks, sync_effect_lights).chain(),
+        );
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut a = ParticlesAsset::new(
+                "t".into(),
+                ParticlesDimension::D3,
+                Default::default(),
+                vec![],
+                vec![],
+                false,
+                ParticlesAuthors::default(),
+            );
+            a.lights = vec![point_light, spot_light];
+            assets.add(a)
+        };
+
+        let mut hue_props = std::collections::HashMap::new();
+        hue_props.insert(LightProp::Hue, 0.5_f32);
+        let drives = EffectDrives(ResolvedDrives {
+            emitters: vec![],
+            lights: vec![
+                LightResolved { props: hue_props.clone() },
+                LightResolved { props: hue_props },
+            ],
+        });
+
+        let effect = app
+            .world_mut()
+            .spawn((Particles3d(handle), Transform::default(), drives))
+            .id();
+
+        app.update();
+        app.update();
+
+        let point = app
+            .world()
+            .iter_entities()
+            .filter(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .find_map(|e| e.get::<PointLight>().cloned())
+            .expect("a point light child must exist");
+        let spot = app
+            .world()
+            .iter_entities()
+            .filter(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .find_map(|e| e.get::<SpotLight>().cloned())
+            .expect("a spot light child must exist");
+
+        let point_hsva = Hsva::from(point.color);
+        let spot_hsva = Hsva::from(spot.color);
+        assert!(
+            (point_hsva.hue - 180.0).abs() < 1.0,
+            "point light's hue must be rotated 180 degrees, got {}",
+            point_hsva.hue
+        );
+        assert!(
+            (spot_hsva.hue - 180.0).abs() < 1.0,
+            "spot light's hue must be rotated 180 degrees, got {}",
+            spot_hsva.hue
+        );
+    }
+
+    /// `sync_effect_lights` must recompute colour from the authored value
+    /// every frame -- never from the light's own current colour. Accumulating
+    /// would drift the hue further every frame; this drives several frames on
+    /// a steady hue drive and asserts the colour holds exactly, not creeping.
+    #[test]
+    fn colour_is_recomputed_from_the_authored_value_each_frame_rather_than_accumulated() {
+        use crate::drives::{EffectDrives, LightResolved, ResolvedDrives};
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.add_systems(
+            Update,
+            (setup_effect_lights, advance_light_clocks, sync_effect_lights).chain(),
+        );
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                100,
+            )));
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut a = ParticlesAsset::new(
+                "t".into(),
+                ParticlesDimension::D3,
+                Default::default(),
+                vec![],
+                vec![],
+                false,
+                ParticlesAuthors::default(),
+            );
+            let light = LightData {
+                color: Color::srgb(1.0, 0.0, 0.0),
+                intensity_over_life: None,
+                ..Default::default()
+            };
+            a.lights = vec![light];
+            assets.add(a)
+        };
+
+        let mut hue_props = std::collections::HashMap::new();
+        hue_props.insert(LightProp::Hue, 0.25_f32);
+        let drives = EffectDrives(ResolvedDrives {
+            emitters: vec![],
+            lights: vec![LightResolved { props: hue_props }],
+        });
+
+        let effect = app
+            .world_mut()
+            .spawn((Particles3d(handle), Transform::default(), drives))
+            .id();
+
+        app.update(); // spawns the child (deferred)
+
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            app.update();
+            let child_color = app
+                .world()
+                .iter_entities()
+                .find(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+                .and_then(|e| e.get::<PointLight>())
+                .expect("light child must exist")
+                .color;
+            samples.push(Srgba::from(child_color).to_f32_array());
+        }
+
+        for pair in samples.windows(2) {
+            assert_eq!(
+                pair[0], pair[1],
+                "a steady hue drive must produce the same colour every frame, not drift: {samples:?}"
+            );
+        }
     }
 }

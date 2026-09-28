@@ -234,6 +234,28 @@ mod tests {
         );
     }
 
+    /// `particle_material.wgsl` has two fragment functions -- the deferred-
+    /// prepass fragment and the forward fragment -- which must stay
+    /// byte-identical wherever a drive or texture read matters: a feature
+    /// living in only one path works in some render configurations (e.g.
+    /// normal-prepass-enabled vs. not) and silently not in others, which is
+    /// a nasty bug to chase with no compiler or naga check to catch it.
+    /// `str::contains` is satisfied by a single occurrence, so it stays
+    /// green even if a future edit deletes one of the two blocks -- asserting
+    /// an exact count of 2 is what actually proves both paths still read it.
+    fn assert_occurs_in_both_fragments(src: &str, needle: &str, defect: &str) {
+        let count = src.matches(needle).count();
+        assert_eq!(
+            count, 2,
+            "expected `{needle}` to appear exactly twice in \
+             particle_material.wgsl (once in the deferred-prepass fragment, \
+             once in the forward fragment) -- {defect}. Found {count} \
+             occurrence(s): 0 means neither fragment reads it, 1 means only \
+             one of the two fragment functions does, anything above 2 means \
+             a third fragment path appeared and also needs covering.",
+        );
+    }
+
     /// `EmitterProp::EmissiveIntensity` (slot 3, `DRIVE_SLOT_EMISSIVE`) is
     /// resolved and folded into the uniform by `fold_render_slots` /
     /// `write_emitter_uniforms`, but nothing forces anything to ever read it
@@ -246,11 +268,10 @@ mod tests {
     #[test]
     fn the_emissive_drive_slot_is_actually_read_by_the_fragment_shader() {
         let src = include_str!("shaders/particle_material.wgsl");
-        assert!(
-            src.contains("drive_slots[DRIVE_SLOT_EMISSIVE]"),
-            "particle_material.wgsl must read \
-             emitter_uniforms.drive_slots[DRIVE_SLOT_EMISSIVE] somewhere in the \
-             fragment shader, or the emissive drive is silently dead",
+        assert_occurs_in_both_fragments(
+            src,
+            "drive_slots[DRIVE_SLOT_EMISSIVE]",
+            "the emissive drive is silently dead in whichever fragment lost it",
         );
     }
 
@@ -265,17 +286,15 @@ mod tests {
     #[test]
     fn the_flow_texture_and_drive_slot_are_actually_read_by_the_fragment_shader() {
         let src = include_str!("shaders/particle_material.wgsl");
-        assert!(
-            src.contains("textureSample(flow_texture, flow_sampler"),
-            "particle_material.wgsl must sample flow_texture through \
-             flow_sampler in the fragment shader, or the flow-map binding is \
-             wired to nothing",
+        assert_occurs_in_both_fragments(
+            src,
+            "textureSample(flow_texture, flow_sampler",
+            "the flow-map binding is wired to nothing in whichever fragment lost it",
         );
-        assert!(
-            src.contains("drive_slots[DRIVE_SLOT_FLOW]"),
-            "particle_material.wgsl must read \
-             emitter_uniforms.drive_slots[DRIVE_SLOT_FLOW] somewhere in the \
-             fragment shader, or the flow drive is silently dead",
+        assert_occurs_in_both_fragments(
+            src,
+            "drive_slots[DRIVE_SLOT_FLOW]",
+            "the flow drive is silently dead in whichever fragment lost it",
         );
     }
 }

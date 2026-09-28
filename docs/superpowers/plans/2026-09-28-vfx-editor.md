@@ -39,6 +39,11 @@
   `cargo test -p bevy_sprinkles_editor` for editor tasks, and
   `cargo test --workspace` before any phase-closing commit — each through the
   wrapper above.
+- **`EmitterProp` has no `Drag` variant** (removed during Task 6, and no longer in the spec).
+  This engine implements no velocity damping — the only trace is a `// TODO: requires implementing
+  damping` in `asset/mod.rs` — so a `Drag` drive had no field to route to. Task 1's text below
+  still lists it and states `ALL` has 18 entries; both are historical. It is 17 variants now. Do
+  not re-add `Drag` without implementing damping first.
 - **Never pass `--target-dir`.** Use the default `target/`. A Bevy build tree is ~20 GB, so a
   private target dir silently duplicates it and makes your test counts incomparable to the
   recorded baseline. One implementer created an 11 GB `target/dev` this way.

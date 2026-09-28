@@ -190,7 +190,7 @@ pub enum EmitterProp {
     SpawnProbability, Lifetime, InitialSpeed, SpawnSize, Spread, EmissionRadius,
     // Sim — read by particle_simulate.wgsl every step.
     // Turning the knob DOES change particles already in flight.
-    Gravity, Drag, TurbulenceStrength,
+    Gravity, TurbulenceStrength,
     // Render — re-read every frame by particle_material.wgsl for all live particles.
     Tint, Alpha, SizeMul, EmissiveIntensity,
     ScrollU, ScrollV, FlowStrength, ErosionThreshold, FresnelPower,
@@ -218,6 +218,22 @@ but cannot ask for a spawn-time tint or a render-time lifetime, neither of which
 the architecture can deliver.
 
 `TransformProp` and `LightProp` are always ECS-stage.
+
+### There is no `Drag` target either, for the same class of reason
+
+The spec originally listed `Drag` as a Sim-stage property. It is absent, because
+**this engine implements no velocity damping at all** — the only trace is a
+`// TODO: requires implementing damping` comment in `asset/mod.rs`. There is no
+field for a drive to route to.
+
+A drive target with nothing behind it is worse than a missing feature: the editor
+paints a picker over every `EmitterProp`, so an author would select `Drag`, author
+a curve for it, and watch nothing happen, with no error and nothing to search for.
+That is the "dead dial" defect class, and the sibling project's notes record
+catching six of them. Documenting the no-op in a doc comment does not help — doc
+comments are read by code readers, not by authors.
+
+Re-add it alongside an implementation of damping, not before.
 
 ### Emission rate needs a new uniform, not a scaled `amount`
 

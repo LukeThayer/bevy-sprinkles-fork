@@ -174,3 +174,139 @@ fn on_scrub_commit(
     let (lo, hi) = (field.min.min(field.max), field.min.max(field.max));
     scrub.set(&field.name, value.clamp(lo, hi));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::asset::AssetPlugin;
+
+    use crate::io::EditorData;
+    use crate::state::{DirtyState, Inspecting};
+    use crate::ui::components::inspector::{InspectedEmitterTracker, update_inspected_emitter_tracker};
+    use crate::ui::widgets::color_picker::CheckerboardMaterial;
+    use crate::ui::widgets::gradient_edit::GradientMaterial;
+    use crate::ui::widgets::text_edit::EditorTextEdit;
+
+    /// A minimal App carrying the REAL commit path
+    /// (`binding::plugin` -- `propagate_bindings` finding a `FieldBinding`
+    /// ancestor, then `commit::handle_text_commit` dirtying on a change),
+    /// not a hand-rolled stand-in for it. `binding`'s `commit`/`sync`/
+    /// `swatch` submodules are private, so `binding::plugin` is the only
+    /// externally reachable entry point -- there is no way to pull in just
+    /// `propagate_bindings` and `handle_text_commit` without dragging in
+    /// the swatch systems' asset types too, which is why
+    /// `CheckerboardMaterial`/`GradientMaterial` are registered here despite
+    /// having nothing to do with variables: `setup_variant_swatch` takes
+    /// `ResMut<Assets<CheckerboardMaterial>>` unconditionally and would
+    /// panic on a missing resource otherwise. `init_asset` alone (not the
+    /// full `UiMaterialPlugin`) is enough -- these systems only read/write
+    /// the `Assets<T>` storage, never the render/shader half.
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.init_asset::<CheckerboardMaterial>();
+        app.init_asset::<GradientMaterial>();
+
+        app.init_resource::<DirtyState>();
+        app.insert_resource(EditorData::default());
+        app.init_resource::<InspectedEmitterTracker>();
+        app.add_systems(Update, update_inspected_emitter_tracker);
+        crate::ui::components::binding::plugin(&mut app);
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(ParticlesAsset::new(
+                "t".into(),
+                ParticlesDimension::D3,
+                Default::default(),
+                vec![EmitterData::default()],
+                vec![],
+                false,
+                ParticlesAuthors::default(),
+            ))
+        };
+
+        app.insert_resource(EditorState {
+            current_project: Some(handle),
+            current_project_path: None,
+            inspecting: Some(Inspecting {
+                kind: Inspectable::Emitter,
+                index: 0,
+            }),
+        });
+
+        app
+    }
+
+    /// The property the whole `ScrubField`/`FieldBinding` split exists for:
+    /// a scrub commit must never reach `commit::handle_text_commit`, because
+    /// that system is what dirties the project. This does not merely check
+    /// that `on_scrub_commit` behaves -- it drives the REAL
+    /// `propagate_bindings` + `handle_text_commit` chain end to end, so a
+    /// future change to either (e.g. `propagate_bindings` starting to widen
+    /// its ancestor search, or `ScrubField` accidentally growing a
+    /// `FieldBinding`) would be caught here, not discovered as a live bug
+    /// report about the editor silently marking sessions dirty.
+    #[test]
+    fn scrubbing_a_preview_value_never_dirties_the_project() {
+        let mut app = test_app();
+
+        let root = app
+            .world_mut()
+            .spawn(ScrubField {
+                name: "temperature".into(),
+                min: 0.0,
+                max: 1.0,
+            })
+            .id();
+        let leaf = app.world_mut().spawn((EditorTextEdit, ChildOf(root))).id();
+
+        // Let `propagate_bindings` process the `Added<EditorTextEdit>` leaf
+        // first -- it will walk up to `root`, find no `FieldBinding` there
+        // (only `ScrubField`), and attach no `BoundTo`.
+        app.update();
+
+        app.world_mut().trigger(TextEditCommitEvent {
+            entity: leaf,
+            text: "0.5".into(),
+        });
+        app.update();
+
+        assert!(
+            !app.world().resource::<DirtyState>().has_unsaved_changes,
+            "a scrub commit must never dirty the project"
+        );
+    }
+
+    /// The other half of the same property: this is not a test that commits
+    /// silently do nothing. An ordinary `FieldBinding`-bearing field (the
+    /// Name field's own shape, `FieldBinding::emitter("name", ..)`) must
+    /// still dirty -- otherwise the first test above would pass for the
+    /// wrong reason (commits broken entirely) rather than the right one
+    /// (scrub fields specifically are excluded from the binding graph).
+    #[test]
+    fn editing_a_bound_field_still_dirties_the_project() {
+        let mut app = test_app();
+
+        let root = app
+            .world_mut()
+            .spawn(FieldBinding::emitter("name", FieldKind::String))
+            .id();
+        let leaf = app.world_mut().spawn((EditorTextEdit, ChildOf(root))).id();
+
+        app.update();
+
+        app.world_mut().trigger(TextEditCommitEvent {
+            entity: leaf,
+            text: "renamed".into(),
+        });
+        app.update();
+
+        assert!(
+            app.world().resource::<DirtyState>().has_unsaved_changes,
+            "an ordinary bound field must still dirty on commit"
+        );
+    }
+}

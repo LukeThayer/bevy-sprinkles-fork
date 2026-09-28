@@ -12,6 +12,8 @@ use bevy::{
     shader::ShaderRef,
 };
 
+use crate::asset::DRIVE_SLOT_COUNT;
+
 const SHADER_ASSET_PATH: &str = "embedded://bevy_sprinkles/shaders/particle_material.wgsl";
 
 /// Number of samples in the baked trail thickness curve LUT.
@@ -42,10 +44,17 @@ pub struct ParticleEmitterUniforms {
     pub transform_align: u32,
     /// Baked trail thickness curve samples.
     pub trail_thickness_curve: [f32; TRAIL_THICKNESS_CURVE_SAMPLES],
-    /// Per-instance color multiplier (ParticleOverride::tint). Identity = (1,1,1,1).
-    pub tint: Vec4,
-    /// Per-instance scale multiplier (ParticleOverride::size_mul). Identity = 1.0.
-    pub size_mul: f32,
+    /// Render-stage drive values, indexed by `EmitterProp::slot()`.
+    ///
+    /// A slot array rather than a named field per property: adding a drivable
+    /// property then changes one integer here and one in `common.wgsl`, not
+    /// the shape of two structs that must match field for field. `NaN` never
+    /// reaches here — `drives::sample` checks finiteness at the boundary.
+    ///
+    /// Sentinel: a slot no drive touched carries the identity for its consumer
+    /// (1.0 for multipliers, which is every current slot), written by
+    /// `write_emitter_uniforms`.
+    pub drive_slots: [f32; DRIVE_SLOT_COUNT],
 }
 
 impl Default for ParticleEmitterUniforms {
@@ -58,8 +67,7 @@ impl Default for ParticleEmitterUniforms {
             trail_size: 1,
             transform_align: 0,
             trail_thickness_curve: [1.0; TRAIL_THICKNESS_CURVE_SAMPLES],
-            tint: Vec4::ONE,
-            size_mul: 1.0,
+            drive_slots: [1.0; DRIVE_SLOT_COUNT],
         }
     }
 }

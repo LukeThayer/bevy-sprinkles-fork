@@ -7,6 +7,9 @@
     TRANSFORM_ALIGN_BILLBOARD_Y_TO_VELOCITY,
     TRANSFORM_ALIGN_BILLBOARD_FIXED_Y,
     TRAIL_THICKNESS_CURVE_SAMPLES,
+    DRIVE_SLOT_TINT,
+    DRIVE_SLOT_ALPHA,
+    DRIVE_SLOT_SIZE_MUL,
 }
 #import bevy_pbr::{
     mesh_functions,
@@ -256,7 +259,7 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     let is_active = (flags & PARTICLE_FLAG_ACTIVE) != 0u;
 
     let particle_position = particle.position.xyz;
-    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.size_mul, is_active);
+    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.drive_slots[DRIVE_SLOT_SIZE_MUL], is_active);
     let is_local = emitter_uniforms.use_local_coords != 0u;
 
     var rotated_position = vertex.position;
@@ -438,7 +441,12 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     }
 
 #ifdef VERTEX_COLORS
-    out.color = vertex.color * particle.color * emitter_uniforms.tint;
+    out.color = vertex.color * particle.color * vec4<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_ALPHA],
+    );
 #endif
 
     return out;
@@ -595,7 +603,7 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     let is_active = (flags & PARTICLE_FLAG_ACTIVE) != 0u;
 
     let particle_position = particle.position.xyz;
-    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.size_mul, is_active);
+    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.drive_slots[DRIVE_SLOT_SIZE_MUL], is_active);
     let is_local = emitter_uniforms.use_local_coords != 0u;
 
     var rotated_position = vertex.position;
@@ -777,7 +785,12 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     }
 
 #ifdef VERTEX_COLORS
-    out.color = vertex.color * particle.color * emitter_uniforms.tint;
+    out.color = vertex.color * particle.color * vec4<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_ALPHA],
+    );
 #endif
 
     return out;
@@ -934,7 +947,7 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     let is_active = (flags & PARTICLE_FLAG_ACTIVE) != 0u;
 
     let particle_position = particle.position.xyz;
-    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.size_mul, is_active);
+    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.drive_slots[DRIVE_SLOT_SIZE_MUL], is_active);
     let is_local = emitter_uniforms.use_local_coords != 0u;
 
     var rotated_position = vertex.position;
@@ -1116,7 +1129,12 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     }
 
 #ifdef VERTEX_COLORS
-    out.color = vertex.color * particle.color * emitter_uniforms.tint;
+    out.color = vertex.color * particle.color * vec4<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_ALPHA],
+    );
 #endif
 
     return out;

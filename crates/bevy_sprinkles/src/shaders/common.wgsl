@@ -22,9 +22,19 @@ struct ParticleEmitterUniforms {
     trail_size: u32,
     transform_align: u32,
     trail_thickness_curve: array<f32, 16>,
-    tint: vec4<f32>,
-    size_mul: f32,
+    drive_slots: array<f32, 9>,
 }
+
+// LAYOUT-LOCKSTEP with DRIVE_SLOT_COUNT in asset/drive.rs.
+const DRIVE_SLOT_TINT: u32 = 0u;
+const DRIVE_SLOT_ALPHA: u32 = 1u;
+const DRIVE_SLOT_SIZE_MUL: u32 = 2u;
+const DRIVE_SLOT_EMISSIVE: u32 = 3u;
+const DRIVE_SLOT_SCROLL_U: u32 = 4u;
+const DRIVE_SLOT_SCROLL_V: u32 = 5u;
+const DRIVE_SLOT_FLOW: u32 = 6u;
+const DRIVE_SLOT_EROSION: u32 = 7u;
+const DRIVE_SLOT_FRESNEL: u32 = 8u;
 
 struct CurveUniform {
     enabled: u32,

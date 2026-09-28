@@ -3,7 +3,8 @@ use bevy::{
 };
 
 use crate::{
-    asset::{DrawPassMaterial, EmitterData, EmitterTrail, ParticlesAsset},
+    asset::{DrawPassMaterial, EmitterData, EmitterTrail, ParticlesAsset, DRIVE_SLOT_COUNT},
+    drives::EffectDrives,
     material::{ParticleEmitterUniforms, ParticleMaterialExtension, TRAIL_THICKNESS_CURVE_SAMPLES},
     mesh::ParticleMeshCache,
     runtime::{
@@ -624,8 +625,7 @@ pub(crate) fn sync_particle_buffers(
 
 pub fn write_emitter_uniforms(
     particle_systems: Query<&Particles3d>,
-    overrides: Query<&crate::r#override::ParticleOverride>,
-    per_emitter: Query<&crate::r#override::ParticleEmitterOverrides>,
+    drives: Query<&EffectDrives>,
     emitter_query: Query<(
         &EmitterEntity,
         &EmitterRuntime,
@@ -648,12 +648,18 @@ pub fn write_emitter_uniforms(
         let trail_size = emitter_data.trail_size();
         let trail_thickness_curve = bake_thickness_curve(&emitter_data.trail);
 
-        let ovr = crate::r#override::effective_override(
-            &emitter_data.name,
-            overrides.get(emitter.parent_system).ok(),
-            per_emitter.get(emitter.parent_system).ok(),
-        );
-        let (tint, size_mul) = crate::r#override::emitter_multipliers(ovr);
+        let drive_slots = drives
+            .get(emitter.parent_system)
+            .ok()
+            .and_then(|d| d.0.emitters.get(runtime.emitter_index))
+            .map(|e| {
+                let mut slots = [1.0f32; DRIVE_SLOT_COUNT];
+                for (i, v) in e.render.iter().enumerate() {
+                    if let Some(v) = v { slots[i] = *v; }
+                }
+                slots
+            })
+            .unwrap_or([1.0; DRIVE_SLOT_COUNT]);
 
         let uniforms = ParticleEmitterUniforms {
             emitter_transform: global_transform.to_matrix(),
@@ -663,8 +669,7 @@ pub fn write_emitter_uniforms(
             trail_size,
             transform_align: transform_align_to_u32(emitter_data.draw_pass.transform_align),
             trail_thickness_curve,
-            tint,
-            size_mul,
+            drive_slots,
         };
 
         if let Some(mut buffer) = buffers.get_mut(&buffer_handle.emitter_uniforms_buffer) {

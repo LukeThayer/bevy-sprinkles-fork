@@ -39,6 +39,12 @@ pub(crate) struct OverrideBakedTextures {
 }
 
 /// Resolves the render-time multipliers, falling back to identity per field.
+///
+/// Unused between Task 5 (which moved `write_emitter_uniforms` onto
+/// `EffectDrives`, its only non-test caller) and Task 8 (which deletes this
+/// module along with the rest of `ParticleOverride`). Kept and allowed rather
+/// than deleted early so this task's diff stays reviewable on its own.
+#[allow(dead_code)]
 pub fn emitter_multipliers(o: Option<&ParticleOverride>) -> (Vec4, f32) {
     let tint = o
         .and_then(|o| o.tint)

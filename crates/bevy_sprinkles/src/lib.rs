@@ -246,6 +246,7 @@ impl Plugin for SprinklesPlugin {
                 update_particle_time,
                 check_particle_system_finished.after(update_particle_time),
                 cleanup_particle_entities,
+                crate::drives::evaluate_drives,
             ),
         );
 

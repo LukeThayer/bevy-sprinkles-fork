@@ -6,6 +6,7 @@ use crate::asset::{
     Drive, DriveOp, DriveTarget, EmitterProp, LightProp, ParticlesAsset, Stage, TransformProp,
     VariableDecl, DRIVE_SLOT_COUNT,
 };
+use crate::runtime::Particles3d;
 
 /// The host game's per-instance knob values for one effect entity.
 ///
@@ -208,6 +209,63 @@ pub fn resolve_drives(values: &[f32], asset: &ParticlesAsset) -> ResolvedDrives 
     out
 }
 
+/// This frame's resolved drives for one effect instance.
+///
+/// Recomputed from scratch every frame rather than mutated incrementally:
+/// derived state cannot leak or go stale, and a drive added, muted or reordered
+/// in the editor takes effect on the next frame with no invalidation step.
+#[derive(Component, Clone, Debug, Default)]
+pub struct EffectDrives(pub ResolvedDrives);
+
+/// Set once on an entity whose `ParticleVariables` names something the effect
+/// does not declare, so the warning is emitted once instead of every frame.
+#[derive(Component)]
+pub struct UnknownVariablesWarned;
+
+/// Resolves every effect instance's variables and drives for this frame.
+///
+/// Runs in `Update` before the render-uniform write in `PostUpdate`, so a
+/// value set by host code this frame reaches the GPU the same frame.
+pub fn evaluate_drives(
+    mut commands: Commands,
+    assets: Res<Assets<ParticlesAsset>>,
+    mut q: Query<(
+        Entity,
+        &Particles3d,
+        Option<&ParticleVariables>,
+        Option<&mut EffectDrives>,
+        Has<UnknownVariablesWarned>,
+    )>,
+) {
+    for (entity, particles, vars, resolved, warned) in q.iter_mut() {
+        let Some(asset) = assets.get(&particles.0) else { continue };
+
+        let empty = ParticleVariables::default();
+        let vars = vars.unwrap_or(&empty);
+
+        if !warned {
+            let unknown = vars.unknown_names(&asset.variables);
+            if !unknown.is_empty() {
+                warn!(
+                    "effect {:?}: ParticleVariables names {:?}, which this effect does not declare; \
+                     using declared defaults. Declared: {:?}",
+                    asset.name,
+                    unknown,
+                    asset.variables.iter().map(|v| &v.name).collect::<Vec<_>>(),
+                );
+                commands.entity(entity).insert(UnknownVariablesWarned);
+            }
+        }
+
+        let values = vars.resolve_values(&asset.variables);
+        let next = resolve_drives(&values, asset);
+        match resolved {
+            Some(mut slot) => slot.0 = next,
+            None => { commands.entity(entity).insert(EffectDrives(next)); }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +329,14 @@ mod tests {
     /// arithmetic rather than on curve interpolation.
     fn flat(v: f64) -> CurveTexture {
         CurveTexture::new(vec![CurvePoint::new(0.0, v), CurvePoint::new(1.0, v)])
+    }
+
+    /// The identity curve (`sample(t) == t`), for tests that must observe the
+    /// resolved *value* of a variable rather than just its presence -- `flat`
+    /// is deliberately insensitive to `t` and cannot distinguish two instances
+    /// whose only difference is which value they feed in.
+    fn ramp() -> CurveTexture {
+        CurveTexture::new(vec![CurvePoint::new(0.0, 0.0), CurvePoint::new(1.0, 1.0)])
     }
 
     fn asset_with_drives(drives: Vec<Drive>) -> ParticlesAsset {
@@ -409,5 +475,60 @@ mod tests {
         let r = resolve_drives(&[1.0], &a);
         assert_eq!(r.emitters[1].transform.get(&TransformProp::ScaleY), Some(&3.0));
         assert!(r.emitters[0].transform.is_empty(), "the other emitter must be untouched");
+    }
+
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.add_systems(Update, evaluate_drives);
+        app
+    }
+
+    #[test]
+    fn two_entities_sharing_an_asset_resolve_independently() {
+        // Review Focus 4: the per-instance guarantee. The bare entity must sit
+        // at declared defaults, NOT at its neighbour's value.
+        let mut app = test_app();
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(asset_with_drives(vec![d(
+                EmitterProp::SizeMul, ramp(), Range { min: 0.0, max: 10.0 }, DriveOp::Replace,
+            )]))
+        };
+
+        let mut hot = ParticleVariables::default();
+        hot.set("v", 1.0);
+        let hot_e = app.world_mut().spawn((Particles3d(handle.clone()), hot)).id();
+        // No ParticleVariables at all -- must fall back to default (0.0).
+        let bare_e = app.world_mut().spawn(Particles3d(handle.clone())).id();
+
+        app.update();
+
+        let slot = EmitterProp::SizeMul.slot().unwrap();
+        let hot_v = app.world().entity(hot_e).get::<EffectDrives>().unwrap().0.emitters[0].render[slot];
+        let bare_v = app.world().entity(bare_e).get::<EffectDrives>().unwrap().0.emitters[0].render[slot];
+        assert_eq!(hot_v, Some(10.0));
+        assert_eq!(bare_v, Some(0.0), "a bare instance must use declared defaults");
+    }
+
+    #[test]
+    fn an_unknown_variable_name_warns_only_once_per_entity() {
+        // Review Focus 2: a typo must not emit a warning every frame forever.
+        let mut app = test_app();
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(asset_with_drives(vec![]))
+        };
+        let mut vars = ParticleVariables::default();
+        vars.set("nope", 1.0);
+        let e = app.world_mut().spawn((Particles3d(handle), vars)).id();
+
+        app.update();
+        app.update();
+        app.update();
+
+        let warned = app.world().entity(e).get::<UnknownVariablesWarned>();
+        assert!(warned.is_some(), "the entity must be marked as already warned");
     }
 }

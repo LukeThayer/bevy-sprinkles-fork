@@ -20,7 +20,25 @@
 - **Existing `.ron` effects must keep loading.** Every new asset field is `#[serde(default)]`.
 - **Variable curves are CPU-sampled scalars; lifetime curves stay GPU-baked textures.** Never bake a variable curve into a texture — it yields one value per instance per frame, not a per-particle ramp.
 - **No `unwrap()`/`expect()` on asset-derived data.** A hand-authored `.ron` is untrusted input; it fails to load with a message, it does not panic the editor.
-- **Test command:** `cargo test -p bevy_sprinkles` for runtime tasks, `cargo test -p bevy_sprinkles_editor` for editor tasks, `cargo test --workspace` before any phase-closing commit.
+- **This machine is NixOS and there is NO `cargo` on `PATH`.** This repo has no
+  flake of its own, so every cargo command goes through the *orgonic* dev shell,
+  which carries the Rust toolchain, `pkg-config` and the Linux runtime libs a
+  Bevy build needs:
+
+  ```bash
+  cd /home/luke/src/orgonic && nix develop . --command bash -c \
+    'cd /home/luke/src/bevy-sprinkles-fork && <cargo command>'
+  ```
+
+  **Every `cargo ...` written anywhere in this plan means that wrapped form.** A
+  bare `cargo` fails with `command not found`, which reads as a broken task
+  rather than a missing toolchain. Ignore the dev shell's banner warning about a
+  "second ~40 GB target tree" — it warns about building *orgonic* bare; this plan
+  builds in the fork's own directory, where a `target/` is expected and gitignored.
+- **Test command:** `cargo test -p bevy_sprinkles` for runtime tasks,
+  `cargo test -p bevy_sprinkles_editor` for editor tasks, and
+  `cargo test --workspace` before any phase-closing commit — each through the
+  wrapper above.
 - **Mutation-verify every guard:** delete the guarded code, confirm the new test fails, restore byte for byte. A test that stays green under deletion of its subject is a defect.
 
 ## Review Focus
@@ -2613,7 +2631,7 @@ git commit -m "feat(fx): erosion dissolve with an emissive rim"
 
 ## Task 14: Fresnel rim and soft particles
 
-**Files:** modify `crates/bevy_sprinkles/src/shaders/particle_material.wgsl`, and `crates/bevy_sprinkles/src/material.rs` if the depth prepass texture is not already bound.
+**Files:** modify `crates/bevy_sprinkles/src/shaders/particle_material.wgsl`, and `crates/bevy_sprinkles/src/material.rs` if the depth prepass texture is not already bound. Also modify `crates/bevy_sprinkles_editor/src/viewport.rs` to add `DepthPrepass` (ruling R5).
 
 **Interfaces:** consumes Task 11's `FX_FRESNEL`, `FX_SOFT`, `DRIVE_SLOT_FRESNEL`.
 
@@ -2658,7 +2676,7 @@ For a camera-facing billboard the normal faces the camera everywhere, so fresnel
 
 Use bevy 0.19's actual prepass helpers — `bevy_pbr::prepass_utils::prepass_depth` and the view's depth-to-view-z conversion. **Verify the exact function names against the vendored bevy source before writing them**; guessing a WGSL import produces a shader compile error at runtime, not at build time.
 
-Soft particles require the depth prepass to be enabled on the camera. If it is not, `prepass_depth` returns garbage and particles flicker. Add a one-line note to the crate docs, and have the editor's camera enable `DepthPrepass` unconditionally (Task 21).
+Soft particles require the depth prepass to be enabled on the camera. If it is not, `prepass_depth` returns garbage and particles flicker. Add a one-line note to the crate docs, and enable `DepthPrepass` on the editor's viewport camera **in this task** (`crates/bevy_sprinkles_editor/src/viewport.rs`) — moved here from Task 21 by pre-flight ruling R5, because this feature's own verification step cannot pass without it.
 
 - [ ] **Step 3: Verify visually**
 
@@ -3179,7 +3197,7 @@ application order and Replace discards what came before it."
 
 ## Task 21: Lights in the outliner and inspector
 
-**Files:** create `crates/bevy_sprinkles_editor/src/ui/components/inspector/light.rs`; modify `state.rs`, `sidebar.rs`; modify the editor camera setup to add `DepthPrepass`.
+**Files:** create `crates/bevy_sprinkles_editor/src/ui/components/inspector/light.rs`; modify `state.rs`, `sidebar.rs`(the `DepthPrepass` camera change moved to Task 14 by ruling R5).
 
 **Interfaces:** consumes Task 9's `LightData`; Task 14's soft particles need the prepass.
 
@@ -3189,9 +3207,9 @@ application order and Replace discards what came before it."
 
 Fields: name, enabled, kind (Point/Spot), transform, colour (via the existing `color_picker`), intensity, range, shadows, the `EmitterTime` block (mirror `inspector/time.rs`), and `intensity_over_life` via `curve_edit`. Each numeric field gets Task 19's drive button with `DriveTarget::Light`.
 
-- [ ] **Step 2: Enable the depth prepass on the editor camera**
+- [ ] **Step 2: Confirm the depth prepass is already enabled**
 
-Soft particles read the depth prepass; without it `prepass_depth` returns garbage and particles flicker. Add `DepthPrepass` to the viewport camera unconditionally, and note in the crate docs that consumers enabling `soft_fade` must do the same.
+Task 14 added `DepthPrepass` to the viewport camera (ruling R5). Confirm it is still there; do not add it twice. If it is missing, Task 14 regressed and that is a finding, not a fix to make here.
 
 - [ ] **Step 3: Write the failing test**
 
@@ -3220,9 +3238,8 @@ Add a light, drive its intensity from a variable through a curve, scrub, and wat
 ```bash
 git add crates/bevy_sprinkles_editor/src/ui/components/inspector/light.rs \
         crates/bevy_sprinkles_editor/src/state.rs \
-        crates/bevy_sprinkles_editor/src/ui/components/sidebar.rs \
-        crates/bevy_sprinkles_editor/src/viewport.rs
-git commit -m "feat(editor): author effect-owned lights; camera gets a depth prepass
+        crates/bevy_sprinkles_editor/src/ui/components/sidebar.rs
+git commit -m "feat(editor): author effect-owned lights
 
 Light indices are positional like variable ids, so a delete renumbers
 the drives above it rather than writing a file that fails its own load."

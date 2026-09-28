@@ -1,15 +1,26 @@
 mod curve;
+/// Variable-to-property wiring.
+pub mod drive;
 mod gradient;
+/// Effect-owned scene lights.
+pub mod light;
 mod particle_material;
 pub(crate) mod serde_helpers;
+/// Effect-declared variables the host drives per instance.
+pub mod variables;
 /// Asset format versioning, validation, and migration.
 pub mod versions;
 
 pub use curve::{Curve, CurveEasing, CurveMode, CurvePoint, CurveTexture};
+pub use drive::{
+    DRIVE_SLOT_COUNT, Drive, DriveOp, DriveTarget, EmitterProp, LightProp, Stage, TransformProp,
+};
 pub use gradient::{Gradient, GradientInterpolation, GradientStop, SolidOrGradientColor};
+pub use light::{FxLightKind, LightData};
 pub use particle_material::{
     DrawPassMaterial, SerializableAlphaMode, SerializableFace, StandardParticleMaterial,
 };
+pub use variables::{VariableDecl, VariableId};
 
 use bevy::{
     asset::{AssetLoader, LoadContext, io::Reader},
@@ -122,7 +133,7 @@ impl DrawOrder {
 }
 
 /// Timing and lifecycle configuration for an emitter.
-#[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
 #[serde(default)]
 pub struct EmitterTime {
     /// The amount of time each particle will exist, in seconds.
@@ -1413,6 +1424,15 @@ pub struct ParticlesAsset {
     /// Optional colliders that particles can interact with.
     #[serde(default)]
     pub colliders: Vec<ColliderData>,
+    /// Knobs this effect exposes to the host game. See [`VariableDecl`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<VariableDecl>,
+    /// Wiring from variables to properties. See [`Drive`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drives: Vec<Drive>,
+    /// Lights this effect owns. See [`LightData`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lights: Vec<LightData>,
     /// Whether to despawn the particle system entity when all one-shot emitters finish.
     ///
     /// Defaults to `false`.
@@ -1444,6 +1464,9 @@ impl ParticlesAsset {
             initial_transform,
             emitters,
             colliders,
+            variables: Vec::new(),
+            drives: Vec::new(),
+            lights: Vec::new(),
             despawn_on_finish,
             authors,
             sprinkles_editor: SprinklesEditorData::default(),

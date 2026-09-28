@@ -4,7 +4,7 @@ use bevy::{
 
 use crate::{
     asset::{DrawPassMaterial, EmitterData, EmitterTrail, ParticlesAsset, DRIVE_SLOT_COUNT},
-    drives::EffectDrives,
+    drives::{EffectDrives, EmitterResolved},
     material::{ParticleEmitterUniforms, ParticleMaterialExtension, TRAIL_THICKNESS_CURVE_SAMPLES},
     mesh::ParticleMeshCache,
     runtime::{
@@ -623,6 +623,29 @@ pub(crate) fn sync_particle_buffers(
     }
 }
 
+/// Folds one emitter's resolved render-stage drives into the flat slot array
+/// the GPU uniform carries.
+///
+/// This is the one place `Option<f32>` collapses to a plain `f32`: `None` --
+/// no drive touched this slot, or there is no resolved state at all yet (the
+/// entity has no `EffectDrives`, or this emitter has none) -- becomes the
+/// identity `1.0`, the multiplier that leaves the emitter's authored value
+/// unchanged. `Some(v)` becomes `v`, even when `v` is `0.0` -- a resolved zero
+/// must reach the GPU as zero, not silently fall back to identity.
+/// `resolve_drives`/`EffectDrives` keep the `None`/`Some(1.0)` distinction
+/// intact all the way up to this boundary.
+fn fold_render_slots(resolved: Option<&EmitterResolved>) -> [f32; DRIVE_SLOT_COUNT] {
+    let mut slots = [1.0f32; DRIVE_SLOT_COUNT];
+    if let Some(e) = resolved {
+        for (i, v) in e.render.iter().enumerate() {
+            if let Some(v) = v {
+                slots[i] = *v;
+            }
+        }
+    }
+    slots
+}
+
 pub fn write_emitter_uniforms(
     particle_systems: Query<&Particles3d>,
     drives: Query<&EffectDrives>,
@@ -648,18 +671,12 @@ pub fn write_emitter_uniforms(
         let trail_size = emitter_data.trail_size();
         let trail_thickness_curve = bake_thickness_curve(&emitter_data.trail);
 
-        let drive_slots = drives
-            .get(emitter.parent_system)
-            .ok()
-            .and_then(|d| d.0.emitters.get(runtime.emitter_index))
-            .map(|e| {
-                let mut slots = [1.0f32; DRIVE_SLOT_COUNT];
-                for (i, v) in e.render.iter().enumerate() {
-                    if let Some(v) = v { slots[i] = *v; }
-                }
-                slots
-            })
-            .unwrap_or([1.0; DRIVE_SLOT_COUNT]);
+        let drive_slots = fold_render_slots(
+            drives
+                .get(emitter.parent_system)
+                .ok()
+                .and_then(|d| d.0.emitters.get(runtime.emitter_index)),
+        );
 
         let uniforms = ParticleEmitterUniforms {
             emitter_transform: global_transform.to_matrix(),
@@ -788,5 +805,46 @@ pub fn apply_emissive_override(
                 material.base.emissive = effective_emissive;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_resolved_state_yields_identity_everywhere() {
+        // No `EffectDrives` on the entity, or the entity's emitter index has
+        // no `EmitterResolved` -- `write_emitter_uniforms` passes `None` here
+        // in both cases.
+        assert_eq!(fold_render_slots(None), [1.0; DRIVE_SLOT_COUNT]);
+    }
+
+    #[test]
+    fn an_untouched_slot_is_identity() {
+        let resolved = EmitterResolved::default(); // render: [None; DRIVE_SLOT_COUNT]
+        assert_eq!(fold_render_slots(Some(&resolved)), [1.0; DRIVE_SLOT_COUNT]);
+    }
+
+    #[test]
+    fn a_resolved_zero_reaches_the_slot_as_zero_not_identity() {
+        // The case that catches a lazy `unwrap_or(1.0)` written as
+        // `filter(|v| *v != 0.0)`: a drive that genuinely computed 0.0 must
+        // not be mistaken for "untouched" and folded back to identity.
+        let mut resolved = EmitterResolved::default();
+        resolved.render[0] = Some(0.0);
+        let slots = fold_render_slots(Some(&resolved));
+        assert_eq!(slots[0], 0.0);
+        for (i, s) in slots.iter().enumerate().skip(1) {
+            assert_eq!(*s, 1.0, "slot {i} must stay untouched");
+        }
+    }
+
+    #[test]
+    fn a_resolved_non_default_value_passes_through() {
+        let mut resolved = EmitterResolved::default();
+        resolved.render[2] = Some(4.0);
+        let slots = fold_render_slots(Some(&resolved));
+        assert_eq!(slots[2], 4.0);
     }
 }

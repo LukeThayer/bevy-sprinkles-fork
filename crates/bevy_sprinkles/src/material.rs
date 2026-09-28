@@ -130,3 +130,29 @@ impl MaterialExtension for ParticleMaterialExtension {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The WGSL array length is a literal — nothing links it to Rust's
+    /// `DRIVE_SLOT_COUNT`. Because `drive_slots` is the struct's LAST field, a
+    /// Rust-side bump without a WGSL-side one would compile clean, test clean,
+    /// and then silently never read the new slot. This test is the only thing
+    /// standing between that change and a bug with no error message.
+    #[test]
+    fn the_wgsl_drive_slots_array_matches_the_rust_constant() {
+        let src = include_str!("shaders/common.wgsl");
+        let decl = src
+            .lines()
+            .find(|l| l.contains("drive_slots"))
+            .expect("common.wgsl must declare drive_slots");
+        let want = format!("array<f32, {DRIVE_SLOT_COUNT}>");
+        assert!(
+            decl.contains(&want),
+            "common.wgsl declares `{}` but DRIVE_SLOT_COUNT is {DRIVE_SLOT_COUNT}; \
+             these share one GPU buffer and must match",
+            decl.trim(),
+        );
+    }
+}

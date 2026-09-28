@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::asset::{FxLightKind, LightProp, ParticlesAsset};
 use crate::drives::EffectDrives;
-use crate::runtime::{compute_phase, Particles3d};
+use crate::runtime::{compute_phase, ParticleSystemRuntime, Particles3d};
 
 /// Links an effect-owned light entity back to the effect that declared it.
 #[derive(Component)]
@@ -36,6 +36,14 @@ pub struct LightRuntime {
     /// [`EmitterTime::total_duration`](crate::asset::EmitterTime::total_duration).
     pub system_time: f32,
     /// Simulation time from the previous frame.
+    ///
+    /// Currently write-only: [`advance_light_clocks`] updates it every frame
+    /// but nothing yet reads it back (there is no `prev_system_phase`
+    /// equivalent for lights, unlike [`EmitterRuntime::prev_system_phase`](
+    /// crate::runtime::EmitterRuntime::prev_system_phase)). Kept because it
+    /// is in the ruling's named minimum field set and is the natural place
+    /// to detect a phase wrap within a single frame, should a future task
+    /// need that (e.g. a one-shot "just crossed the end of its curve" event).
     pub prev_system_time: f32,
     /// Current emission cycle index (increments each time the lifetime wraps).
     pub cycle: u32,
@@ -119,17 +127,30 @@ pub fn setup_effect_lights(
 /// Must run before [`sync_effect_lights`], which reads `system_time` to
 /// sample `intensity_over_life`: reversing the order would make every
 /// light's envelope sample last frame's phase, one frame stale forever.
+///
+/// Honors [`ParticleSystemRuntime::paused`] the same way
+/// `update_particle_time` (`spawning.rs:105`) does for an emitter: while
+/// paused, the clock simply does not advance this frame. `sync_effect_lights`
+/// keeps running regardless -- with a frozen `system_time` it recomputes the
+/// same phase and therefore the same intensity every frame, so the light
+/// holds steady rather than going dark. `bevy_sprinkles_editor`'s pause
+/// button (`playback_controls.rs`) sets exactly this flag, so without this
+/// guard, pausing the preview would freeze particle motion while leaving any
+/// effect light still flashing through its curve underneath it.
 pub fn advance_light_clocks(
     time: Res<Time>,
     assets: Res<Assets<ParticlesAsset>>,
-    systems: Query<&Particles3d>,
+    systems: Query<(&Particles3d, Option<&ParticleSystemRuntime>)>,
     mut lights: Query<(&LightEntity, &mut LightRuntime)>,
 ) {
     let delta = time.delta_secs();
     for (link, mut runtime) in lights.iter_mut() {
-        let Ok(particles) = systems.get(link.parent_system) else {
+        let Ok((particles, system_runtime)) = systems.get(link.parent_system) else {
             continue;
         };
+        if system_runtime.is_some_and(|r| r.paused) {
+            continue;
+        }
         let Some(asset) = assets.get(&particles.0) else {
             continue;
         };
@@ -387,5 +408,191 @@ mod tests {
             second > first,
             "the ramp curve is increasing, so a later phase must read a higher intensity: {first} -> {second}"
         );
+    }
+
+    /// A live gap the review round flagged: `bevy_sprinkles_editor`'s pause
+    /// button sets `ParticleSystemRuntime::paused`
+    /// (`playback_controls.rs:98,143`, read at `viewport.rs:382,635,770,827`),
+    /// so this is not hypothetical -- without the guard, pausing the preview
+    /// freezes particle motion while the light keeps flashing through its
+    /// curve underneath it.
+    #[test]
+    fn a_paused_system_freezes_its_lights_clock_and_resumes_when_unpaused() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.add_systems(
+            Update,
+            (setup_effect_lights, advance_light_clocks, sync_effect_lights).chain(),
+        );
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                100,
+            )));
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut a = ParticlesAsset::new(
+                "t".into(),
+                ParticlesDimension::D3,
+                Default::default(),
+                vec![],
+                vec![],
+                false,
+                ParticlesAuthors::default(),
+            );
+            let light = LightData {
+                intensity: 1000.0,
+                intensity_over_life: Some(CurveTexture::new(vec![
+                    CurvePoint::new(0.0, 0.0),
+                    CurvePoint::new(1.0, 1.0),
+                ])),
+                // Long enough that a handful of 0.1s frames never wraps the
+                // cycle, which would otherwise confound "unchanged" with
+                // "wrapped back to the same phase by coincidence".
+                time: crate::asset::EmitterTime {
+                    lifetime: 10.0,
+                    delay: 0.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            a.lights = vec![light];
+            assets.add(a)
+        };
+        let effect = app
+            .world_mut()
+            .spawn((
+                Particles3d(handle),
+                Transform::default(),
+                ParticleSystemRuntime::default(), // paused: false
+            ))
+            .id();
+
+        app.update(); // spawns the child (deferred)
+        app.update(); // child exists; clock advances 0.0 -> 0.1
+
+        let child = app
+            .world()
+            .iter_entities()
+            .find(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .expect("light child must exist by frame 2")
+            .id();
+
+        let before_pause = app.world().get::<PointLight>(child).unwrap().intensity;
+        assert!(
+            before_pause > 0.0,
+            "sanity: the clock must have moved off phase 0 before pausing"
+        );
+
+        app.world_mut()
+            .get_mut::<ParticleSystemRuntime>(effect)
+            .unwrap()
+            .paused = true;
+
+        app.update();
+        app.update();
+        app.update();
+
+        let while_paused = app.world().get::<PointLight>(child).unwrap().intensity;
+        assert_eq!(
+            before_pause, while_paused,
+            "a paused system's light clock must not advance"
+        );
+
+        app.world_mut()
+            .get_mut::<ParticleSystemRuntime>(effect)
+            .unwrap()
+            .paused = false;
+
+        app.update();
+
+        let after_resume = app.world().get::<PointLight>(child).unwrap().intensity;
+        assert!(
+            after_resume > while_paused,
+            "unpausing must let the clock advance again: {while_paused} -> {after_resume}"
+        );
+    }
+
+    #[test]
+    fn a_spot_light_gets_the_same_computed_intensity_as_a_point_light_would() {
+        // The point/spot branches in setup_effect_lights and sync_effect_lights
+        // are parallel code paths; nothing before this test proved the spot
+        // branch actually computes a value rather than, say, leaving
+        // SpotLight's `default()` intensity untouched.
+        let light = LightData {
+            kind: FxLightKind::Spot,
+            intensity: 500.0,
+            intensity_over_life: None,
+            ..Default::default()
+        };
+        let (app, effect) = app_with(vec![light]);
+
+        let spot = app
+            .world()
+            .iter_entities()
+            .find(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .expect("spot light child must exist");
+
+        assert!(
+            spot.get::<PointLight>().is_none(),
+            "a Spot-kind light must not also carry a PointLight"
+        );
+        let spot_light = spot
+            .get::<SpotLight>()
+            .expect("a Spot-kind light must carry a SpotLight");
+        assert_eq!(
+            spot_light.intensity, 500.0,
+            "with no curve and no drives, a spot's intensity must equal the authored value"
+        );
+    }
+
+    #[test]
+    fn no_curve_leaves_the_envelope_at_one_so_intensity_is_the_authored_value() {
+        let light = LightData {
+            intensity: 777.0,
+            intensity_over_life: None,
+            ..Default::default()
+        };
+        let (app, effect) = app_with(vec![light]);
+
+        let child = app
+            .world()
+            .iter_entities()
+            .find(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .expect("light child must exist");
+
+        assert_eq!(
+            child.get::<PointLight>().unwrap().intensity,
+            777.0,
+            "with intensity_over_life: None, the envelope must default to 1.0, \
+             not zero the light out"
+        );
+    }
+
+    #[test]
+    fn no_effect_drives_component_leaves_the_drive_multipliers_at_one() {
+        // A fallback that defaulted a missing EffectDrives to 0.0 instead of
+        // 1.0 would make every undriven light invisible -- app_with never
+        // attaches EffectDrives at all, so this is the case that would have
+        // caught it.
+        let light = LightData {
+            intensity: 250.0,
+            range: 12.0,
+            intensity_over_life: None,
+            ..Default::default()
+        };
+        let (app, effect) = app_with(vec![light]);
+
+        let child = app
+            .world()
+            .iter_entities()
+            .find(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .expect("light child must exist");
+        let point = child.get::<PointLight>().unwrap();
+
+        assert_eq!(point.intensity, 250.0, "no EffectDrives must mean an identity intensity multiplier");
+        assert_eq!(point.range, 12.0, "no EffectDrives must mean an identity range multiplier");
     }
 }

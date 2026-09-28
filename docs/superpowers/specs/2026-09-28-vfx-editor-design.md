@@ -187,7 +187,7 @@ pub enum Stage { Spawn, Sim, Render }
 pub enum EmitterProp {
     // Spawn — read by particle_simulate.wgsl only when a particle is born.
     // Turning the knob does NOT change particles already in flight.
-    Rate, Lifetime, InitialSpeed, SpawnSize, Spread, EmissionRadius,
+    SpawnProbability, Lifetime, InitialSpeed, SpawnSize, Spread, EmissionRadius,
     // Sim — read by particle_simulate.wgsl every step.
     // Turning the knob DOES change particles already in flight.
     Gravity, Drag, TurbulenceStrength,
@@ -218,6 +218,25 @@ but cannot ask for a spawn-time tint or a render-time lifetime, neither of which
 the architecture can deliver.
 
 `TransformProp` and `LightProp` are always ECS-stage.
+
+### Emission rate needs a new uniform, not a scaled `amount`
+
+"Temperature drives emission" is a motivating case, but it cannot be built the
+obvious way. `EmitterUniforms::amount` is simultaneously the fixed particle-pool
+size **and** the per-slot simulation gate — the compute shader skips a slot when
+`idx >= amount` — so scaling it at runtime strands already-live particles in the
+truncated slots, where they freeze and never despawn. `apply_spawn_override`
+carries a doc comment saying exactly this and deliberately never touches
+`amount`: "Runtime density control therefore isn't a spawn-scalar knob."
+
+So drivable emission rate requires a **new** `spawn_probability: f32` uniform
+(0..1) that gates spawning per slot, leaving `amount` fixed and live particles
+undisturbed. `EmitterProp::SpawnProbability` targets that uniform; there is no
+`Rate` target, because a target named `Rate` would invite exactly the
+`amount`-scaling implementation the engine forbids.
+
+This is the one place in this spec where a pillar needs new shader work rather
+than new routing.
 
 ### Several drives on one target
 

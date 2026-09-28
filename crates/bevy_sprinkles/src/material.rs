@@ -369,6 +369,24 @@ mod tests {
         );
     }
 
+    /// `ParticleMaterialExtension::gradient_texture` is baked and bound
+    /// (`build_extension` in spawning.rs, through the same
+    /// `GradientTextureCache` the emitter colour-gradient path already uses,
+    /// `#[texture(107)]`/`#[sampler(108)]` above), but nothing in Rust forces
+    /// the shader to ever sample it. Gradient remap has no prepass-ordering
+    /// constraint like soft particles, so it follows the established
+    /// both-fragments shape (deferred-prepass and forward) exactly like
+    /// scroll/flow/erosion/fresnel, and gets the same exactly-2 guard.
+    #[test]
+    fn the_gradient_texture_is_actually_read_by_the_fragment_shader() {
+        let src = include_str!("shaders/particle_material.wgsl");
+        assert_occurs_in_both_fragments(
+            src,
+            "textureSample(gradient_texture, gradient_sampler",
+            "the gradient-remap binding is wired to nothing in whichever fragment lost it",
+        );
+    }
+
     #[test]
     fn soft_particle_fade_is_read_only_by_the_forward_fragment() {
         let src = include_str!("shaders/particle_material.wgsl");

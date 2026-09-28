@@ -18,6 +18,7 @@ use crate::{
         ParticleMaterialHandle, ParticleMeshHandle, ParticleSystemRuntime, Particles3d,
         ParticlesCollider3D, SimulationStep, SubEmitterBufferHandle, TrailHistoryEntry,
     },
+    textures::GradientTextureCache,
 };
 
 const MAX_FRAME_DELTA: f32 = 0.1;
@@ -218,17 +219,20 @@ fn transform_align_to_u32(align: Option<crate::asset::TransformAlign>) -> u32 {
 /// textures, and the shader-def flags that pick which `#ifdef` blocks the
 /// fragment compiles.
 ///
-/// Gradient baking (an [`FxSettings::gradient_remap`] into a sampleable
-/// texture) is not wired here -- it needs a `GradientTextureCache` this
-/// function has no access to, and `FX_GRADIENT` has no reader in
-/// `particle_material.wgsl` yet. `gradient_texture` stays `None` until the
-/// task that adds that reader also threads the cache through.
+/// `fx.gradient_remap`, when set, is baked into a sampleable texture through
+/// `gradient_cache` -- the exact same [`GradientTextureCache`] (and thus the
+/// exact same cache-key-keyed `get_or_create`) that an emitter's own
+/// colour-over-lifetime gradient bakes through in `extract.rs`. Two emitters
+/// whose `gradient_remap` gradients are equal (`Gradient::cache_key`) share
+/// one baked handle rather than each paying for their own texture.
 fn build_extension(
     sorted_particles: Handle<ShaderBuffer>,
     emitter_uniforms: Handle<ShaderBuffer>,
     fx: &FxSettings,
     asset_server: &AssetServer,
     assets_folders: &[String],
+    gradient_cache: &mut GradientTextureCache,
+    images: &mut Assets<Image>,
 ) -> ParticleMaterialExtension {
     let flow_texture = fx
         .flow_texture
@@ -238,6 +242,10 @@ fn build_extension(
         .erosion_texture
         .as_ref()
         .map(|t| t.load(asset_server, assets_folders));
+    let gradient_texture = fx
+        .gradient_remap
+        .as_ref()
+        .map(|gradient| gradient_cache.get_or_create(gradient, images));
 
     ParticleMaterialExtension {
         sorted_particles,
@@ -245,7 +253,7 @@ fn build_extension(
         fx: FxUniform::from(fx),
         flow_texture,
         erosion_texture,
-        gradient_texture: None,
+        gradient_texture,
         defs: FxDefs {
             scroll: fx.scroll_enabled(),
             flow: fx.flow_enabled(),
@@ -265,6 +273,8 @@ fn create_particle_material_from_config(
     emitter_uniforms_buffer: Handle<ShaderBuffer>,
     asset_server: &AssetServer,
     assets_folders: &[String],
+    gradient_cache: &mut GradientTextureCache,
+    images: &mut Assets<Image>,
 ) -> ParticleMaterial {
     let (base, fx_settings) = match config {
         DrawPassMaterial::Standard(mat) => (
@@ -284,6 +294,8 @@ fn create_particle_material_from_config(
             fx_settings,
             asset_server,
             assets_folders,
+            gradient_cache,
+            images,
         ),
     }
 }
@@ -308,6 +320,8 @@ pub fn setup_particle_systems(
     mut mesh_cache: ResMut<ParticleMeshCache>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut materials: ResMut<Assets<ParticleMaterial>>,
+    mut gradient_cache: ResMut<GradientTextureCache>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     for (system_entity, particle_system, is_editor) in query.iter() {
         let Some(asset) = assets.get(particle_system) else {
@@ -382,6 +396,8 @@ pub fn setup_particle_systems(
                 emitter_uniforms_buffer_handle.clone(),
                 &asset_server,
                 assets_folders,
+                &mut gradient_cache,
+                &mut images,
             ));
 
             let mut runtime = EmitterRuntime::new(emitter_index, emitter.time.fixed_seed);
@@ -586,6 +602,8 @@ pub(crate) fn sync_particle_buffers(
     mut meshes: ResMut<Assets<Mesh>>,
     mut mesh_cache: ResMut<ParticleMeshCache>,
     mut materials: ResMut<Assets<ParticleMaterial>>,
+    mut gradient_cache: ResMut<GradientTextureCache>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     for (
         emitter,
@@ -666,6 +684,8 @@ pub(crate) fn sync_particle_buffers(
             new_uniforms_buf,
             &asset_server,
             assets_folders,
+            &mut gradient_cache,
+            &mut images,
         ));
         material3d.0 = new_material.clone();
         material_handle.0 = new_material;
@@ -764,6 +784,8 @@ pub fn sync_particle_material(
     assets: Res<Assets<ParticlesAsset>>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<ParticleMaterial>>,
+    mut gradient_cache: ResMut<GradientTextureCache>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     for (emitter, runtime, mut current_config, mut material_handle, mut material3d) in
         emitter_query.iter_mut()
@@ -804,6 +826,8 @@ pub fn sync_particle_material(
                 emitter_uniforms_handle,
                 &asset_server,
                 assets_folders,
+                &mut gradient_cache,
+                &mut images,
             ));
 
             material3d.0 = new_material_handle.clone();

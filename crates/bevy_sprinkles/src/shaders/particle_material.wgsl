@@ -71,6 +71,8 @@ const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var flow_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var erosion_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var erosion_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var gradient_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var gradient_sampler: sampler;
 #endif
 #else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<storage, read> sorted_particles: array<Particle>;
@@ -80,6 +82,8 @@ const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var flow_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var erosion_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var erosion_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var gradient_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var gradient_sampler: sampler;
 #endif
 
 // computes a shortest-arc rotation matrix that aligns the Y axis to a direction
@@ -1280,6 +1284,23 @@ fn fragment(
 #endif
 
     var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
+#ifdef FX_GRADIENT
+    // Treat the base texture as a MASK and colour it through an authored
+    // gradient, rather than using its own colour. This is why one greyscale
+    // smoke texture can serve a dozen effects, and it is the colour authoring
+    // surface -- which is why the Tint drive slot stays a scalar multiplier
+    // and does not also try to author colour. Placed right after the base
+    // color sample (before FX_EROSION's rim mix and FX_FRESNEL's rgb
+    // multiply) so both later stages operate on the remapped colour, the
+    // same "immediately after the sample" placement FX_EROSION documents for
+    // itself below.
+    let gradient_mask = pbr_input.material.base_color.r;
+    let gradient_remapped = textureSample(gradient_texture, gradient_sampler, vec2<f32>(gradient_mask, 0.5));
+    pbr_input.material.base_color = vec4<f32>(
+        gradient_remapped.rgb,
+        gradient_remapped.a * pbr_input.material.base_color.a,
+    );
+#endif
 #ifdef FX_EROSION
     // The signature stylized burn-away: sample noise, discard below a moving
     // threshold, and emit a bright rim in the band just above it. Driving the
@@ -1395,6 +1416,23 @@ fn fragment(
 #endif
 
     var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
+#ifdef FX_GRADIENT
+    // Treat the base texture as a MASK and colour it through an authored
+    // gradient, rather than using its own colour. This is why one greyscale
+    // smoke texture can serve a dozen effects, and it is the colour authoring
+    // surface -- which is why the Tint drive slot stays a scalar multiplier
+    // and does not also try to author colour. Placed right after the base
+    // color sample (before FX_EROSION's rim mix and FX_FRESNEL's rgb
+    // multiply) so both later stages operate on the remapped colour, the
+    // same "immediately after the sample" placement FX_EROSION documents for
+    // itself below.
+    let gradient_mask = pbr_input.material.base_color.r;
+    let gradient_remapped = textureSample(gradient_texture, gradient_sampler, vec2<f32>(gradient_mask, 0.5));
+    pbr_input.material.base_color = vec4<f32>(
+        gradient_remapped.rgb,
+        gradient_remapped.a * pbr_input.material.base_color.a,
+    );
+#endif
 #ifdef FX_EROSION
     // The signature stylized burn-away: sample noise, discard below a moving
     // threshold, and emit a bright rim in the band just above it. Driving the

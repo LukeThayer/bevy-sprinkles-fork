@@ -297,4 +297,33 @@ mod tests {
             "the flow drive is silently dead in whichever fragment lost it",
         );
     }
+
+    /// `ParticleMaterialExtension::erosion_texture` is loaded and bound
+    /// (`build_extension` in spawning.rs, `#[texture(105)]`/`#[sampler(106)]`
+    /// above), but nothing in Rust forces the shader to ever sample it,
+    /// discard on `DRIVE_SLOT_EROSION`, or paint the rim color back out. A
+    /// texture binding the shader declares but never samples -- or a discard
+    /// that lives in only one of the two fragments -- is the same
+    /// dead-dial/dead-slot defect class the flow and emissive tests above
+    /// guard. This greps the shader source directly rather than trusting a
+    /// runtime effect.
+    #[test]
+    fn the_erosion_texture_and_drive_slot_are_actually_read_by_the_fragment_shader() {
+        let src = include_str!("shaders/particle_material.wgsl");
+        assert_occurs_in_both_fragments(
+            src,
+            "textureSample(erosion_texture, erosion_sampler",
+            "the erosion-noise binding is wired to nothing in whichever fragment lost it",
+        );
+        assert_occurs_in_both_fragments(
+            src,
+            "drive_slots[DRIVE_SLOT_EROSION]",
+            "the erosion drive is silently dead in whichever fragment lost it",
+        );
+        assert_occurs_in_both_fragments(
+            src,
+            "fx.erosion_edge_color.a",
+            "the erosion rim color is silently dead in whichever fragment lost it",
+        );
+    }
 }

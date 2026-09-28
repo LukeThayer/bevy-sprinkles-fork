@@ -15,6 +15,7 @@
     DRIVE_SLOT_SCROLL_U,
     DRIVE_SLOT_SCROLL_V,
     DRIVE_SLOT_FLOW,
+    DRIVE_SLOT_EROSION,
 }
 #import bevy_pbr::{
     mesh_functions,
@@ -55,6 +56,8 @@ const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> fx: FxUniform;
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var flow_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var flow_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var erosion_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var erosion_sampler: sampler;
 #endif
 #else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<storage, read> sorted_particles: array<Particle>;
@@ -62,6 +65,8 @@ const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> fx: FxUniform;
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var flow_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var flow_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var erosion_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var erosion_sampler: sampler;
 #endif
 
 // computes a shortest-arc rotation matrix that aligns the Y axis to a direction
@@ -1262,6 +1267,35 @@ fn fragment(
 #endif
 
     var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
+#ifdef FX_EROSION
+    // The signature stylized burn-away: sample noise, discard below a moving
+    // threshold, and emit a bright rim in the band just above it. Driving the
+    // threshold from a variable is how an effect dissolves on command. Sampled
+    // at frag_in.uv (post scroll/flow) so the dissolve pattern travels with
+    // the churned surface rather than sitting still on top of it. Placed
+    // right after the base color sample and before every later stage
+    // (emissive scaling, the particle-color multiply, lighting, and -- in the
+    // forward fragment -- alpha_discard), so a discarded fragment pays for
+    // none of that.
+    let erosion_noise = textureSample(erosion_texture, erosion_sampler, frag_in.uv).r;
+    let erosion_threshold = clamp(
+        fx.erosion_soft.x * emitter_uniforms.drive_slots[DRIVE_SLOT_EROSION],
+        0.0, 1.0,
+    );
+    if (erosion_noise < erosion_threshold) {
+        discard;
+    }
+    let erosion_edge = fx.erosion_soft.y;
+    if (erosion_edge > 0.0) {
+        // 1 at the cut, falling to 0 `edge` above it.
+        let erosion_rim = 1.0 - clamp((erosion_noise - erosion_threshold) / erosion_edge, 0.0, 1.0);
+        pbr_input.material.base_color = mix(
+            pbr_input.material.base_color,
+            fx.erosion_edge_color,
+            erosion_rim * fx.erosion_edge_color.a,
+        );
+    }
+#endif
     // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
     // effect's emissive contribution is unchanged. Scaling rgb only leaves
     // the exposure-weight alpha channel (read in pbr_functions.wgsl) alone.
@@ -1327,6 +1361,35 @@ fn fragment(
 #endif
 
     var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
+#ifdef FX_EROSION
+    // The signature stylized burn-away: sample noise, discard below a moving
+    // threshold, and emit a bright rim in the band just above it. Driving the
+    // threshold from a variable is how an effect dissolves on command. Sampled
+    // at frag_in.uv (post scroll/flow) so the dissolve pattern travels with
+    // the churned surface rather than sitting still on top of it. Placed
+    // right after the base color sample and before every later stage
+    // (emissive scaling, the particle-color multiply, lighting, and -- in the
+    // forward fragment -- alpha_discard), so a discarded fragment pays for
+    // none of that.
+    let erosion_noise = textureSample(erosion_texture, erosion_sampler, frag_in.uv).r;
+    let erosion_threshold = clamp(
+        fx.erosion_soft.x * emitter_uniforms.drive_slots[DRIVE_SLOT_EROSION],
+        0.0, 1.0,
+    );
+    if (erosion_noise < erosion_threshold) {
+        discard;
+    }
+    let erosion_edge = fx.erosion_soft.y;
+    if (erosion_edge > 0.0) {
+        // 1 at the cut, falling to 0 `edge` above it.
+        let erosion_rim = 1.0 - clamp((erosion_noise - erosion_threshold) / erosion_edge, 0.0, 1.0);
+        pbr_input.material.base_color = mix(
+            pbr_input.material.base_color,
+            fx.erosion_edge_color,
+            erosion_rim * fx.erosion_edge_color.a,
+        );
+    }
+#endif
     // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
     // effect's emissive contribution is unchanged. Scaling rgb only leaves
     // the exposure-weight alpha channel (read in pbr_functions.wgsl) alone.

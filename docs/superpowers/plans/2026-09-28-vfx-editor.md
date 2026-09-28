@@ -47,6 +47,12 @@
 - **Never pass `--target-dir`.** Use the default `target/`. A Bevy build tree is ~20 GB, so a
   private target dir silently duplicates it and makes your test counts incomparable to the
   recorded baseline. One implementer created an 11 GB `target/dev` this way.
+- **Every Phase 3 shader feature needs a source-grep test that COUNTS occurrences.** Nothing in
+  `cargo test` or `cargo build` runs naga, so a WGSL block that is wrong — or silently absent —
+  compiles and tests clean, and only surfaces when a human opens the editor. `particle_material.wgsl`
+  has **two** fragment functions (deferred-prepass and forward) and every feature block must appear
+  in both; a `.contains()` assertion is satisfied by either one alone and would stay green if a
+  later edit deleted one. Assert the occurrence COUNT is 2, not merely non-zero.
 - **Mutation-verify every guard:** delete the guarded code, confirm the new test fails, restore byte for byte. A test that stays green under deletion of its subject is a defect.
 
 ## Review Focus

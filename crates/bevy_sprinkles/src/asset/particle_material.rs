@@ -2,6 +2,7 @@ use bevy::{material::AlphaMode, prelude::*, render::render_resource::Face};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
+use super::fx::FxSettings;
 use super::serde_helpers::{is_false, is_true, is_zero_f32};
 use crate::textures::preset::TextureRef;
 
@@ -441,6 +442,14 @@ pub struct StandardParticleMaterial {
     /// Defaults to `0.0`.
     #[serde(default, skip_serializing_if = "is_zero_f32")]
     pub depth_bias: f32,
+
+    /// Stylized-FX settings. See [`FxSettings`]; defaults to entirely inert.
+    #[serde(default, skip_serializing_if = "is_default_fx")]
+    pub fx: FxSettings,
+}
+
+fn is_default_fx(f: &FxSettings) -> bool {
+    *f == FxSettings::default()
 }
 
 impl Default for StandardParticleMaterial {
@@ -475,6 +484,7 @@ impl Default for StandardParticleMaterial {
             unlit: false,
             fog_enabled: true,
             depth_bias: 0.0,
+            fx: FxSettings::default(),
         }
     }
 }
@@ -558,6 +568,7 @@ impl StandardParticleMaterial {
             unlit: material.unlit,
             fog_enabled: material.fog_enabled,
             depth_bias: material.depth_bias,
+            fx: FxSettings::default(),
         }
     }
 
@@ -605,6 +616,7 @@ impl StandardParticleMaterial {
         self.unlit.hash(&mut hasher);
         self.fog_enabled.hash(&mut hasher);
         hash_f32(&mut hasher, self.depth_bias);
+        self.fx.cache_key().hash(&mut hasher);
         hasher.finish()
     }
 }

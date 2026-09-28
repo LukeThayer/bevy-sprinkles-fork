@@ -1,6 +1,9 @@
 mod curve;
 /// Variable-to-property wiring.
 pub mod drive;
+/// Stylized-FX material settings (scroll, flow, erosion, fresnel, soft fade,
+/// gradient remap) and their GPU uniform.
+pub mod fx;
 mod gradient;
 /// Effect-owned scene lights.
 pub mod light;
@@ -15,6 +18,7 @@ pub use curve::{Curve, CurveEasing, CurveMode, CurvePoint, CurveTexture};
 pub use drive::{
     DRIVE_SLOT_COUNT, Drive, DriveOp, DriveTarget, EmitterProp, LightProp, Stage, TransformProp,
 };
+pub use fx::{FxSettings, FxUniform};
 pub use gradient::{Gradient, GradientInterpolation, GradientStop, SolidOrGradientColor};
 pub use light::{FxLightKind, LightData};
 pub use particle_material::{

@@ -1,6 +1,7 @@
 #import bevy_sprinkles::common::{
     Particle,
     ParticleEmitterUniforms,
+    FxUniform,
     PARTICLE_FLAG_ACTIVE,
     TRANSFORM_ALIGN_BILLBOARD,
     TRANSFORM_ALIGN_Y_TO_VELOCITY,
@@ -10,10 +11,13 @@
     DRIVE_SLOT_TINT,
     DRIVE_SLOT_ALPHA,
     DRIVE_SLOT_SIZE_MUL,
+    DRIVE_SLOT_EMISSIVE,
+    DRIVE_SLOT_SCROLL_U,
+    DRIVE_SLOT_SCROLL_V,
 }
 #import bevy_pbr::{
     mesh_functions,
-    mesh_view_bindings::view,
+    mesh_view_bindings::{view, globals},
     view_transformations::position_world_to_clip,
 }
 
@@ -47,10 +51,12 @@ const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
 #else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<storage, read> sorted_particles: array<Particle>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> emitter_uniforms: ParticleEmitterUniforms;
+@group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> fx: FxUniform;
 #endif
 #else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<storage, read> sorted_particles: array<Particle>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> emitter_uniforms: ParticleEmitterUniforms;
+@group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> fx: FxUniform;
 #endif
 
 // computes a shortest-arc rotation matrix that aligns the Y axis to a direction
@@ -1229,7 +1235,26 @@ fn fragment(
         discard;
     }
 
-    var pbr_input = pbr_input_from_standard_material(in, is_front);
+    var frag_in = in;
+#ifdef FX_SCROLL
+    // drive_slots let a host variable modulate the authored rate at runtime;
+    // an untouched slot carries 1.0, so an undriven effect scrolls exactly as
+    // authored.
+    let scroll_rate = fx.scroll_tiling.xy * vec2<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_U],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_V],
+    );
+    frag_in.uv = in.uv * fx.scroll_tiling.zw + scroll_rate * globals.time;
+#endif
+
+    var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
+    // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
+    // effect's emissive contribution is unchanged. Scaling rgb only leaves
+    // the exposure-weight alpha channel (read in pbr_functions.wgsl) alone.
+    pbr_input.material.emissive = vec4<f32>(
+        pbr_input.material.emissive.rgb * emitter_uniforms.drive_slots[DRIVE_SLOT_EMISSIVE],
+        pbr_input.material.emissive.a,
+    );
     pbr_input.material.base_color = pbr_input.material.base_color * particle_color;
     let out = deferred_output(in, pbr_input);
 
@@ -1266,7 +1291,26 @@ fn fragment(
         discard;
     }
 
-    var pbr_input = pbr_input_from_standard_material(in, is_front);
+    var frag_in = in;
+#ifdef FX_SCROLL
+    // drive_slots let a host variable modulate the authored rate at runtime;
+    // an untouched slot carries 1.0, so an undriven effect scrolls exactly as
+    // authored.
+    let scroll_rate = fx.scroll_tiling.xy * vec2<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_U],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_V],
+    );
+    frag_in.uv = in.uv * fx.scroll_tiling.zw + scroll_rate * globals.time;
+#endif
+
+    var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
+    // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
+    // effect's emissive contribution is unchanged. Scaling rgb only leaves
+    // the exposure-weight alpha channel (read in pbr_functions.wgsl) alone.
+    pbr_input.material.emissive = vec4<f32>(
+        pbr_input.material.emissive.rgb * emitter_uniforms.drive_slots[DRIVE_SLOT_EMISSIVE],
+        pbr_input.material.emissive.a,
+    );
     pbr_input.material.base_color = pbr_input.material.base_color * particle_color;
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
 

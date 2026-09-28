@@ -12,7 +12,7 @@ use bevy::{
     shader::ShaderRef,
 };
 
-use crate::asset::DRIVE_SLOT_COUNT;
+use crate::asset::{DRIVE_SLOT_COUNT, FxUniform};
 
 const SHADER_ASSET_PATH: &str = "embedded://bevy_sprinkles/shaders/particle_material.wgsl";
 
@@ -76,8 +76,10 @@ impl Default for ParticleEmitterUniforms {
 ///
 /// This extension provides the sorted particle buffer and per-emitter uniforms
 /// to the vertex shader so it can read per-particle state (position, color,
-/// scale, etc.) and transform each instanced mesh accordingly.
+/// scale, etc.) and transform each instanced mesh accordingly. It also carries
+/// the stylized-FX uniform and its textures (see [`crate::asset::FxSettings`]).
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+#[bind_group_data(FxDefs)]
 pub struct ParticleMaterialExtension {
     /// Handle to the sorted particle data buffer, read by the vertex shader.
     #[storage(100, read_only)]
@@ -85,6 +87,62 @@ pub struct ParticleMaterialExtension {
     /// Handle to the per-emitter uniforms buffer (transform, flags, etc.).
     #[storage(101, read_only)]
     pub emitter_uniforms: Handle<ShaderBuffer>,
+    /// Stylized-FX parameters. See [`FxUniform`].
+    #[uniform(102)]
+    pub fx: FxUniform,
+    /// Flow-texture handle, sampled to offset the base UV. Only read by the
+    /// shader when `FX_FLOW` is compiled in.
+    #[texture(103)]
+    #[sampler(104)]
+    pub flow_texture: Option<Handle<Image>>,
+    /// Erosion-noise texture handle. Only read when `FX_EROSION` is compiled in.
+    #[texture(105)]
+    #[sampler(106)]
+    pub erosion_texture: Option<Handle<Image>>,
+    /// Baked gradient-remap texture handle. Only read when `FX_GRADIENT` is
+    /// compiled in.
+    #[texture(107)]
+    #[sampler(108)]
+    pub gradient_texture: Option<Handle<Image>>,
+    /// Which FX shader-def blocks this material's fragment compiles in. Not a
+    /// GPU binding -- consumed only by `bind_group_data`/`specialize` to pick
+    /// the pipeline variant.
+    #[reflect(ignore)]
+    pub defs: FxDefs,
+}
+
+/// Which FX blocks a [`ParticleMaterialExtension`] wants its shader to
+/// compile in. Each `true` flag pushes exactly one shader def in `specialize`
+/// below; a feature whose flag is never set costs nothing at draw time
+/// because the corresponding `#ifdef` block never compiles at all.
+///
+/// This is [`ParticleMaterialExtension`]'s [`AsBindGroup::Data`] (via
+/// `#[bind_group_data(FxDefs)]`), so pipeline specialization keys on it: each
+/// distinct combination of flags compiles once and is cached, rather than
+/// recompiling per material instance.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+pub struct FxDefs {
+    /// Pushes `FX_SCROLL`.
+    pub scroll: bool,
+    /// Pushes `FX_FLOW`.
+    pub flow: bool,
+    /// Pushes `FX_EROSION`.
+    pub erosion: bool,
+    /// Pushes `FX_FRESNEL`.
+    pub fresnel: bool,
+    /// Pushes `FX_SOFT`.
+    pub soft: bool,
+    /// Pushes `FX_GRADIENT`.
+    pub gradient: bool,
+    /// Pushes `FX_LIT`. No [`crate::asset::FxSettings`] field drives this
+    /// yet -- reserved for a later Phase 3 task, always `false` for now.
+    pub lit: bool,
+}
+
+impl From<&ParticleMaterialExtension> for FxDefs {
+    fn from(ext: &ParticleMaterialExtension) -> Self {
+        ext.defs
+    }
 }
 
 impl MaterialExtension for ParticleMaterialExtension {
@@ -127,6 +185,26 @@ impl MaterialExtension for ParticleMaterialExtension {
         // disable backface culling so trail tubes render both sides
         descriptor.primitive.cull_mode = None;
 
+        // Each flag pushes exactly one shader def, in both stages that share
+        // this shader source. An effect using none of them compiles the same
+        // lean fragment it did before FX existed.
+        let defs = &key.bind_group_data;
+        let mut push = |on: bool, name: &str| {
+            if on {
+                descriptor.vertex.shader_defs.push(name.into());
+                if let Some(f) = descriptor.fragment.as_mut() {
+                    f.shader_defs.push(name.into());
+                }
+            }
+        };
+        push(defs.scroll, "FX_SCROLL");
+        push(defs.flow, "FX_FLOW");
+        push(defs.erosion, "FX_EROSION");
+        push(defs.fresnel, "FX_FRESNEL");
+        push(defs.soft, "FX_SOFT");
+        push(defs.gradient, "FX_GRADIENT");
+        push(defs.lit, "FX_LIT");
+
         Ok(())
     }
 }
@@ -153,6 +231,26 @@ mod tests {
             "common.wgsl declares `{}` but DRIVE_SLOT_COUNT is {DRIVE_SLOT_COUNT}; \
              these share one GPU buffer and must match",
             decl.trim(),
+        );
+    }
+
+    /// `EmitterProp::EmissiveIntensity` (slot 3, `DRIVE_SLOT_EMISSIVE`) is
+    /// resolved and folded into the uniform by `fold_render_slots` /
+    /// `write_emitter_uniforms`, but nothing forces anything to ever read it
+    /// back out again. Slots 0-2 were wired when the slot array itself was
+    /// introduced and slots 4-8 belong to later FX features; slot 3 fell
+    /// through the gap between them. That is the same dead-dial defect that
+    /// got `EmitterProp::Drag` deleted -- a slot written but never read is
+    /// invisible to every other test in this suite, so this one greps the
+    /// shader source directly rather than trusting a runtime effect.
+    #[test]
+    fn the_emissive_drive_slot_is_actually_read_by_the_fragment_shader() {
+        let src = include_str!("shaders/particle_material.wgsl");
+        assert!(
+            src.contains("drive_slots[DRIVE_SLOT_EMISSIVE]"),
+            "particle_material.wgsl must read \
+             emitter_uniforms.drive_slots[DRIVE_SLOT_EMISSIVE] somewhere in the \
+             fragment shader, or the emissive drive is silently dead",
         );
     }
 }

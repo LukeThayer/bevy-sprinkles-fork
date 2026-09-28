@@ -3,9 +3,14 @@ use bevy::{
 };
 
 use crate::{
-    asset::{DrawPassMaterial, EmitterData, EmitterTrail, ParticlesAsset, DRIVE_SLOT_COUNT},
+    asset::{
+        DrawPassMaterial, EmitterData, EmitterTrail, FxSettings, FxUniform, ParticlesAsset,
+        DRIVE_SLOT_COUNT,
+    },
     drives::{EffectDrives, EmitterResolved},
-    material::{ParticleEmitterUniforms, ParticleMaterialExtension, TRAIL_THICKNESS_CURVE_SAMPLES},
+    material::{
+        FxDefs, ParticleEmitterUniforms, ParticleMaterialExtension, TRAIL_THICKNESS_CURVE_SAMPLES,
+    },
     mesh::ParticleMeshCache,
     runtime::{
         ColliderEntity, CurrentMaterialConfig, CurrentMeshConfig, EditorMode, EmitterEntity,
@@ -208,6 +213,52 @@ fn transform_align_to_u32(align: Option<crate::asset::TransformAlign>) -> u32 {
     }
 }
 
+/// Builds the [`ParticleMaterialExtension`] from a buffer pair plus an
+/// authored [`FxSettings`]: the clamped GPU uniform, the loaded feature
+/// textures, and the shader-def flags that pick which `#ifdef` blocks the
+/// fragment compiles.
+///
+/// Gradient baking (an [`FxSettings::gradient_remap`] into a sampleable
+/// texture) is not wired here -- it needs a `GradientTextureCache` this
+/// function has no access to, and `FX_GRADIENT` has no reader in
+/// `particle_material.wgsl` yet. `gradient_texture` stays `None` until the
+/// task that adds that reader also threads the cache through.
+fn build_extension(
+    sorted_particles: Handle<ShaderBuffer>,
+    emitter_uniforms: Handle<ShaderBuffer>,
+    fx: &FxSettings,
+    asset_server: &AssetServer,
+    assets_folders: &[String],
+) -> ParticleMaterialExtension {
+    let flow_texture = fx
+        .flow_texture
+        .as_ref()
+        .map(|t| t.load(asset_server, assets_folders));
+    let erosion_texture = fx
+        .erosion_texture
+        .as_ref()
+        .map(|t| t.load(asset_server, assets_folders));
+
+    ParticleMaterialExtension {
+        sorted_particles,
+        emitter_uniforms,
+        fx: FxUniform::from(fx),
+        flow_texture,
+        erosion_texture,
+        gradient_texture: None,
+        defs: FxDefs {
+            scroll: fx.scroll_enabled(),
+            flow: fx.flow_enabled(),
+            erosion: fx.erosion_enabled(),
+            fresnel: fx.fresnel_enabled(),
+            soft: fx.soft_enabled(),
+            gradient: fx.gradient_enabled(),
+            // No FxSettings field drives FX_LIT yet; see FxDefs::lit's doc.
+            lit: false,
+        },
+    }
+}
+
 fn create_particle_material_from_config(
     config: &DrawPassMaterial,
     sorted_particles_buffer: Handle<ShaderBuffer>,
@@ -215,8 +266,11 @@ fn create_particle_material_from_config(
     asset_server: &AssetServer,
     assets_folders: &[String],
 ) -> ParticleMaterial {
-    let base = match config {
-        DrawPassMaterial::Standard(mat) => mat.to_standard_material(asset_server, assets_folders),
+    let (base, fx_settings) = match config {
+        DrawPassMaterial::Standard(mat) => (
+            mat.to_standard_material(asset_server, assets_folders),
+            &mat.fx,
+        ),
         DrawPassMaterial::CustomShader { .. } => {
             todo!("custom shader support not yet implemented")
         }
@@ -224,10 +278,13 @@ fn create_particle_material_from_config(
 
     ExtendedMaterial {
         base,
-        extension: ParticleMaterialExtension {
-            sorted_particles: sorted_particles_buffer,
-            emitter_uniforms: emitter_uniforms_buffer,
-        },
+        extension: build_extension(
+            sorted_particles_buffer,
+            emitter_uniforms_buffer,
+            fx_settings,
+            asset_server,
+            assets_folders,
+        ),
     }
 }
 

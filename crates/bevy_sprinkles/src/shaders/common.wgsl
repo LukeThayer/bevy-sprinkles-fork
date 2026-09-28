@@ -36,6 +36,18 @@ const DRIVE_SLOT_FLOW: u32 = 6u;
 const DRIVE_SLOT_EROSION: u32 = 7u;
 const DRIVE_SLOT_FRESNEL: u32 = 8u;
 
+// LAYOUT-LOCKSTEP: fields (order+types) must match FxUniform in
+// asset/fx.rs — same GPU buffer.
+struct FxUniform {
+    // xy = scroll rate, zw = tiling.
+    scroll_tiling: vec4<f32>,
+    // x = flow strength, yz = flow scroll, w = fresnel power.
+    flow_fresnel: vec4<f32>,
+    // x = erosion threshold, y = erosion edge, z = fresnel boost, w = soft fade.
+    erosion_soft: vec4<f32>,
+    erosion_edge_color: vec4<f32>,
+}
+
 struct CurveUniform {
     enabled: u32,
     min_x: f32,

@@ -1,0 +1,267 @@
+use bevy::prelude::*;
+use bevy::render::render_resource::ShaderType;
+use serde::{Deserialize, Serialize};
+
+use crate::TextureRef;
+
+/// The stylized-FX half of a particle material: everything that makes a
+/// scrolled, eroded, rim-lit sheet read as volumetric rather than as a sprite.
+///
+/// Every field defaults to inert. That is load-bearing: this struct is added to
+/// an existing serialized type, so any default that changed a pixel would
+/// silently restyle every effect already authored.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Reflect)]
+#[serde(default)]
+pub struct FxSettings {
+    /// UV scroll rate, in UV units per second.
+    pub scroll: Vec2,
+    /// UV tiling multiplier.
+    pub tiling: Vec2,
+    /// A texture whose RG channels offset the base UV -- the difference
+    /// between a texture that CHURNS and one that merely slides. Scroll alone
+    /// is the clearest tell of cheap VFX.
+    pub flow_texture: Option<TextureRef>,
+    /// How strongly the flow texture's offset perturbs the base UV. `0`
+    /// disables flow regardless of whether a texture is set.
+    pub flow_strength: f32,
+    /// UV scroll rate applied to the flow texture's own sample, in UV units
+    /// per second -- independent of `scroll`, so the flow pattern can churn
+    /// at a different rate than the base texture slides.
+    pub flow_scroll: Vec2,
+    /// Dissolve noise. Fragments below `erosion_threshold` are discarded, with
+    /// `erosion_edge` of emissive rim before the cut.
+    pub erosion_texture: Option<TextureRef>,
+    /// Noise value below which a fragment is discarded. `0` disables erosion
+    /// regardless of whether a texture is set.
+    pub erosion_threshold: f32,
+    /// Width, in noise units, of the emissive rim painted just above the
+    /// erosion cut.
+    pub erosion_edge: f32,
+    /// Color of the erosion rim.
+    pub erosion_edge_color: [f32; 4],
+    /// Rim brightening exponent. `0` disables.
+    pub fresnel_power: f32,
+    /// Rim brightening intensity multiplier.
+    pub fresnel_boost: f32,
+    /// Depth-fade distance in world units. `0` disables. Removes the hard
+    /// intersection line where a quad clips the floor.
+    pub soft_fade: f32,
+    /// Sample the base texture's red channel as a mask and colour it through
+    /// this gradient, instead of using the texture's own colour.
+    pub gradient_remap: Option<super::Gradient>,
+}
+
+impl Default for FxSettings {
+    fn default() -> Self {
+        Self {
+            scroll: Vec2::ZERO,
+            tiling: Vec2::ONE,
+            flow_texture: None,
+            flow_strength: 0.0,
+            flow_scroll: Vec2::ZERO,
+            erosion_texture: None,
+            erosion_threshold: 0.0,
+            erosion_edge: 0.0,
+            erosion_edge_color: [1.0, 0.5, 0.1, 1.0],
+            fresnel_power: 0.0,
+            fresnel_boost: 0.0,
+            soft_fade: 0.0,
+            gradient_remap: None,
+        }
+    }
+}
+
+impl FxSettings {
+    /// Whether UV scroll/tiling differs from the inert default.
+    pub fn scroll_enabled(&self) -> bool {
+        self.scroll != Vec2::ZERO || self.tiling != Vec2::ONE
+    }
+    /// Whether the flow-texture UV offset is active.
+    pub fn flow_enabled(&self) -> bool {
+        self.flow_texture.is_some() && self.flow_strength != 0.0
+    }
+    /// Whether erosion discard/rim is active.
+    pub fn erosion_enabled(&self) -> bool {
+        self.erosion_texture.is_some() && (self.erosion_threshold > 0.0 || self.erosion_edge > 0.0)
+    }
+    /// Whether fresnel rim brightening is active.
+    pub fn fresnel_enabled(&self) -> bool {
+        self.fresnel_power > 0.0
+    }
+    /// Whether depth soft-fade is active.
+    pub fn soft_enabled(&self) -> bool {
+        self.soft_fade > 0.0
+    }
+    /// Whether the gradient remap is active.
+    pub fn gradient_enabled(&self) -> bool {
+        self.gradient_remap.is_some()
+    }
+
+    /// True when any feature is on. Used only by tests and the editor summary;
+    /// the shader defs are decided per feature.
+    pub fn enabled(&self) -> bool {
+        self.scroll_enabled()
+            || self.flow_enabled()
+            || self.erosion_enabled()
+            || self.fresnel_enabled()
+            || self.soft_enabled()
+            || self.gradient_enabled()
+    }
+
+    /// Computes a hash key for material caching, in the style of
+    /// [`super::StandardParticleMaterial::cache_key`] -- folded into that
+    /// method so an FX-only edit (e.g. dragging the scroll rate in the
+    /// editor) is recognised as a material change and rebuilds the GPU
+    /// material, rather than silently leaving the old `FxUniform` bound.
+    pub fn cache_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let hash_f32 = |h: &mut std::collections::hash_map::DefaultHasher, v: f32| {
+            v.to_bits().hash(h);
+        };
+        let hash_vec2 = |h: &mut std::collections::hash_map::DefaultHasher, v: Vec2| {
+            v.x.to_bits().hash(h);
+            v.y.to_bits().hash(h);
+        };
+
+        hash_vec2(&mut hasher, self.scroll);
+        hash_vec2(&mut hasher, self.tiling);
+        self.flow_texture.hash(&mut hasher);
+        hash_f32(&mut hasher, self.flow_strength);
+        hash_vec2(&mut hasher, self.flow_scroll);
+        self.erosion_texture.hash(&mut hasher);
+        hash_f32(&mut hasher, self.erosion_threshold);
+        hash_f32(&mut hasher, self.erosion_edge);
+        for v in self.erosion_edge_color {
+            hash_f32(&mut hasher, v);
+        }
+        hash_f32(&mut hasher, self.fresnel_power);
+        hash_f32(&mut hasher, self.fresnel_boost);
+        hash_f32(&mut hasher, self.soft_fade);
+        match &self.gradient_remap {
+            Some(g) => {
+                1u8.hash(&mut hasher);
+                g.cache_key().hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+        hasher.finish()
+    }
+}
+
+fn finite(v: f32, fallback: f32) -> f32 {
+    if v.is_finite() { v } else { fallback }
+}
+fn finite2(v: Vec2, fallback: Vec2) -> Vec2 {
+    Vec2::new(finite(v.x, fallback.x), finite(v.y, fallback.y))
+}
+
+/// GPU-side FX parameters. Packed in vec4s so the WGSL struct needs no padding
+/// fields that could drift out of lockstep.
+#[derive(Clone, Copy, Default, ShaderType, Reflect, Debug)]
+pub struct FxUniform {
+    /// xy = scroll rate, zw = tiling.
+    pub scroll_tiling: Vec4,
+    /// x = flow strength, yz = flow scroll, w = fresnel power.
+    pub flow_fresnel: Vec4,
+    /// x = erosion threshold, y = erosion edge, z = fresnel boost, w = soft fade.
+    pub erosion_soft: Vec4,
+    /// Erosion rim color.
+    pub erosion_edge_color: Vec4,
+}
+
+impl From<&FxSettings> for FxUniform {
+    /// Clamps every authored value to something finite. Authored `.ron` is
+    /// untrusted input, and a NaN reaching the fragment shader can blank the
+    /// draw -- which an author reads as "my effect vanished".
+    fn from(f: &FxSettings) -> Self {
+        let scroll = finite2(f.scroll, Vec2::ZERO);
+        let tiling = finite2(f.tiling, Vec2::ONE);
+        let flow_scroll = finite2(f.flow_scroll, Vec2::ZERO);
+        Self {
+            scroll_tiling: Vec4::new(scroll.x, scroll.y, tiling.x, tiling.y),
+            flow_fresnel: Vec4::new(
+                finite(f.flow_strength, 0.0),
+                flow_scroll.x,
+                flow_scroll.y,
+                finite(f.fresnel_power, 0.0),
+            ),
+            erosion_soft: Vec4::new(
+                finite(f.erosion_threshold, 0.0).clamp(0.0, 1.0),
+                finite(f.erosion_edge, 0.0).clamp(0.0, 1.0),
+                finite(f.fresnel_boost, 0.0),
+                finite(f.soft_fade, 0.0).max(0.0),
+            ),
+            erosion_edge_color: Vec4::from_array(
+                f.erosion_edge_color.map(|v| finite(v, 1.0)),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_fx_is_entirely_off() {
+        // A default must cost nothing and change nothing, or every existing
+        // effect silently changes appearance when this field appears.
+        let fx = FxSettings::default();
+        assert_eq!(fx.scroll, Vec2::ZERO);
+        assert_eq!(fx.tiling, Vec2::ONE);
+        assert!(!fx.enabled());
+    }
+
+    #[test]
+    fn any_nonzero_scroll_enables_the_feature() {
+        let fx = FxSettings {
+            scroll: Vec2::new(0.0, 0.2),
+            ..Default::default()
+        };
+        assert!(fx.enabled());
+    }
+
+    #[test]
+    fn a_non_finite_authored_value_is_clamped_away_on_conversion() {
+        let fx = FxSettings {
+            scroll: Vec2::new(f32::NAN, 1.0),
+            ..Default::default()
+        };
+        let u = FxUniform::from(&fx);
+        assert!(u.scroll_tiling.x.is_finite(), "a NaN must never reach the GPU");
+    }
+
+    #[test]
+    fn a_non_finite_erosion_edge_color_is_clamped_away_on_conversion() {
+        let fx = FxSettings {
+            erosion_edge_color: [f32::NAN, f32::INFINITY, -f32::INFINITY, 1.0],
+            ..Default::default()
+        };
+        let u = FxUniform::from(&fx);
+        assert!(
+            u.erosion_edge_color.to_array().iter().all(|v| v.is_finite()),
+            "a NaN or infinity must never reach the GPU"
+        );
+    }
+
+    #[test]
+    fn two_settings_that_differ_only_by_scroll_hash_differently() {
+        let a = FxSettings::default();
+        let b = FxSettings {
+            scroll: Vec2::new(0.0, 0.5),
+            ..Default::default()
+        };
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn identical_settings_hash_identically() {
+        let a = FxSettings {
+            scroll: Vec2::new(0.3, -0.1),
+            ..Default::default()
+        };
+        let b = a.clone();
+        assert_eq!(a.cache_key(), b.cache_key());
+    }
+}

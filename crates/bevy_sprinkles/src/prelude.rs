@@ -22,3 +22,5 @@ pub use crate::runtime::{
 };
 
 pub use crate::drives::ParticleVariables;
+
+pub use crate::lights::{EffectLightsSpawned, LightEntity, LightRuntime};

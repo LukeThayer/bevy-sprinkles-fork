@@ -161,6 +161,8 @@ mod compute;
 /// Effect variables and the drive-resolution spine.
 pub mod drives;
 mod extract;
+/// Effect-owned scene lights, driven by their own clock and by drives.
+pub mod lights;
 /// Particle material extension for GPU-driven particle rendering.
 pub mod material;
 mod mesh;
@@ -185,6 +187,7 @@ const SHADER_COMMON: Handle<Shader> = uuid_handle!("10b6a301-2396-4ce0-906a-b3e3
 use asset::{ParticlesAsset, ParticlesAssetLoader};
 use compute::ParticleComputePlugin;
 use extract::{extract_colliders, extract_particle_systems};
+use lights::{advance_light_clocks, setup_effect_lights, sync_effect_lights};
 use mesh::ParticleMeshCache;
 use runtime::check_particle_system_finished;
 use sort::ParticleSortPlugin;
@@ -242,6 +245,11 @@ impl Plugin for SprinklesPlugin {
                 cleanup_particle_entities,
                 crate::drives::evaluate_drives,
                 crate::drives::apply_transform_drives.after(crate::drives::evaluate_drives),
+                setup_effect_lights,
+                advance_light_clocks.after(setup_effect_lights),
+                sync_effect_lights
+                    .after(advance_light_clocks)
+                    .after(crate::drives::evaluate_drives),
             ),
         );
 
@@ -271,6 +279,7 @@ pub use asset::{
     SerializableAlphaMode, StandardParticleMaterial, TransformAlign,
 };
 pub use drives::ParticleVariables;
+pub use lights::{EffectLightsSpawned, LightEntity, LightRuntime};
 pub use material::ParticleMaterialExtension;
 pub use runtime::{
     ColliderEntity, EmitterEntity, EmitterRuntime, Finished, ParticleBufferHandle, ParticleData,

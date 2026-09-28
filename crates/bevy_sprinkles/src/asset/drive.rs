@@ -199,9 +199,11 @@ pub enum DriveTarget {
         /// The property of that emitter being driven.
         prop: EmitterProp,
     },
-    /// The effect entity's own `Transform`.
+    /// An emitter entity's own `Transform`, addressed by its index into
+    /// `ParticlesAsset::emitters`. Driving scale here is how per-axis scale
+    /// is achieved — per-particle scale is a single scalar by design.
     Transform {
-        /// Index, reserved for a future multi-transform target; `0` today.
+        /// Index of the emitter whose `Transform` is driven.
         index: u8,
         /// The transform channel being driven.
         prop: TransformProp,
@@ -267,7 +269,7 @@ pub fn validate_drives(a: &ParticlesAsset) -> Result<(), String> {
         }
         let (kind, index, len) = match &d.target {
             DriveTarget::Emitter { index, .. } => ("emitter", *index, a.emitters.len()),
-            DriveTarget::Transform { index, .. } => ("emitter", *index, a.emitters.len()),
+            DriveTarget::Transform { index, .. } => ("emitter transform", *index, a.emitters.len()),
             DriveTarget::Light { index, .. } => ("light", *index, a.lights.len()),
         };
         if index as usize >= len {
@@ -282,6 +284,7 @@ pub fn validate_drives(a: &ParticlesAsset) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asset::{ParticlesAsset, ParticlesDimension, ParticlesAuthors, EmitterData, VariableDecl};
 
     #[test]
     fn spawn_props_and_sim_props_do_not_share_a_stage() {
@@ -312,8 +315,6 @@ mod tests {
         assert!(EmitterProp::Gravity.slot().is_none());
         assert!(EmitterProp::SpawnSize.slot().is_none());
     }
-
-    use crate::asset::{ParticlesAsset, ParticlesDimension, ParticlesAuthors, EmitterData, VariableDecl};
 
     fn asset_with(variables: Vec<VariableDecl>, drives: Vec<Drive>) -> ParticlesAsset {
         let mut a = ParticlesAsset::new(
@@ -384,6 +385,35 @@ mod tests {
     fn a_valid_asset_passes() {
         let a = asset_with(one_var(), vec![drive_on(0, DriveTarget::Emitter {
             index: 0, prop: EmitterProp::Tint,
+        })]);
+        assert!(validate_drives(&a).is_ok());
+    }
+
+    #[test]
+    fn an_empty_variable_name_is_rejected() {
+        let a = asset_with(
+            vec![VariableDecl { name: "   ".into(), ..Default::default() }],
+            vec![],
+        );
+        let err = validate_drives(&a).unwrap_err();
+        assert!(err.contains("empty"), "message must say what is wrong: {err}");
+    }
+
+    #[test]
+    fn a_drive_naming_an_out_of_range_emitter_transform_is_rejected() {
+        let a = asset_with(one_var(), vec![drive_on(0, DriveTarget::Transform {
+            index: 7, prop: TransformProp::ScaleY,
+        })]);
+        let err = validate_drives(&a).unwrap_err();
+        assert!(err.contains("transform"), "must distinguish a Transform drive: {err}");
+    }
+
+    #[test]
+    fn a_transform_drive_on_a_declared_emitter_passes() {
+        // Pins the ruling above: Transform is indexed by EMITTER, so index 0
+        // against a one-emitter asset is valid, not a reserved-must-be-zero slot.
+        let a = asset_with(one_var(), vec![drive_on(0, DriveTarget::Transform {
+            index: 0, prop: TransformProp::ScaleY,
         })]);
         assert!(validate_drives(&a).is_ok());
     }

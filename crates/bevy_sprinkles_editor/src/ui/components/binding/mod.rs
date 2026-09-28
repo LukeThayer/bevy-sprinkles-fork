@@ -102,6 +102,10 @@ pub(super) fn get_inspected_data<'a>(
             let variable = asset.variables.get(inspecting.index as usize)?;
             Some(variable)
         }
+        Inspectable::Light => {
+            let light = asset.lights.get(inspecting.index as usize)?;
+            Some(light)
+        }
     }
 }
 
@@ -124,6 +128,10 @@ pub(super) fn get_inspected_data_mut<'a>(
         Inspectable::Variable => {
             let variable = asset.variables.get_mut(inspecting.index as usize)?;
             Some(variable)
+        }
+        Inspectable::Light => {
+            let light = asset.lights.get_mut(inspecting.index as usize)?;
+            Some(light)
         }
     }
 }

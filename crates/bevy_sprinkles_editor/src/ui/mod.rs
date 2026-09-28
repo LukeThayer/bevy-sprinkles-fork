@@ -45,6 +45,7 @@ impl Plugin for EditorUiPlugin {
             .add_plugins(components::data_panel::plugin)
             .add_plugins(components::inspector::plugin)
             .add_plugins(components::variables::plugin)
+            .add_plugins(components::lights::plugin)
             .add_plugins(components::drives::plugin)
             .add_plugins(components::seekbar::plugin)
             .add_plugins(components::playback_controls::plugin)

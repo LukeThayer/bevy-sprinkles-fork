@@ -36,9 +36,24 @@
 //! resolved from `InspectedEmitterTracker::current_index` wherever it is
 //! needed (label sync, popover open, row rebuild, add-click), never cached
 //! on the button itself.
+//!
+//! **Task 21 widened this to `LightProp`.** A button now stores a
+//! [`DrivableProp`] (`Emitter(EmitterProp)` or `Light(LightProp)`) instead of
+//! a bare `EmitterProp`; [`current_target`] resolves the right half against
+//! the right tracker (`InspectedEmitterTracker` or `InspectedLightTracker`)
+//! depending on which variant it holds. `LightProp` has no `Stage` (every
+//! light drive is ECS-stage, per `asset::drive`'s doc), so the popover header
+//! spells that out as fixed text rather than calling `stage_label`, which
+//! stays `EmitterProp`-only. Only two `LightProp` variants get a button at
+//! all -- `Intensity` and `Range`, the two that have an authored field on
+//! `LightData` to hang one off; `Hue`/`Saturation`/`Value` have none (they
+//! are drive-only targets, exactly like `EmitterProp::SpawnProbability`) and
+//! stay reachable only through `drives.rs`'s target picker.
 
 use bevy::prelude::*;
-use bevy_sprinkles::asset::{Drive, DriveOp, DriveTarget, EmitterProp, Stage, VariableDecl, VariableId};
+use bevy_sprinkles::asset::{
+    Drive, DriveOp, DriveTarget, EmitterProp, LightProp, Stage, VariableDecl, VariableId,
+};
 use bevy_sprinkles::prelude::*;
 
 use crate::state::{DirtyState, EditorState};
@@ -60,7 +75,7 @@ use crate::ui::widgets::popover::{
 use crate::ui::widgets::text_edit::{TextEditCommitEvent, TextEditProps, text_edit};
 use crate::ui::widgets::utils::find_ancestor;
 
-use super::InspectedEmitterTracker;
+use super::{InspectedEmitterTracker, InspectedLightTracker};
 
 // --- Pure data operations -----------------------------------------------
 
@@ -112,13 +127,32 @@ fn format_f32(v: f32) -> String {
 
 // --- Public widget API ---------------------------------------------------
 
+/// Which family of numeric field a [`drive_button`] hangs off. See the
+/// module doc's Task 21 paragraph.
+#[derive(Clone, Copy)]
+enum DrivableProp {
+    Emitter(EmitterProp),
+    Light(LightProp),
+}
+
 pub struct DriveButtonProps {
-    prop: EmitterProp,
+    prop: DrivableProp,
 }
 
 impl DriveButtonProps {
     pub fn new(prop: EmitterProp) -> Self {
-        Self { prop }
+        Self {
+            prop: DrivableProp::Emitter(prop),
+        }
+    }
+
+    /// A drive button beside a light's own numeric field
+    /// (`LightData::intensity`/`range`), targeting `DriveTarget::Light`
+    /// instead of `DriveTarget::Emitter`.
+    pub fn new_light(prop: LightProp) -> Self {
+        Self {
+            prop: DrivableProp::Light(prop),
+        }
     }
 }
 
@@ -153,22 +187,23 @@ pub fn plugin(app: &mut App) {
                 sync_drive_button_label,
                 rebuild_drive_rows,
             )
-                .after(super::update_inspected_emitter_tracker),
+                .after(super::update_inspected_emitter_tracker)
+                .after(super::update_inspected_light_tracker),
         );
 }
 
 // --- Components -----------------------------------------------------------
 
 #[derive(Component, Clone, Copy)]
-struct DriveButtonProp(EmitterProp);
+struct DriveButtonProp(DrivableProp);
 
 impl Default for DriveButtonProp {
     fn default() -> Self {
         // `template_value` needs `Default` for its scene-reflection
         // scaffolding; this placeholder is never the value actually stored
-        // -- `drive_button()` always threads the real `EmitterProp` through
-        // the template's own argument at spawn time.
-        Self(EmitterProp::SpawnProbability)
+        // -- `drive_button()` always threads the real prop through the
+        // template's own argument at spawn time.
+        Self(DrivableProp::Emitter(EmitterProp::SpawnProbability))
     }
 }
 
@@ -221,10 +256,33 @@ pub(crate) struct DriveOutputField {
 #[derive(Component)]
 struct DriveAddButton(Entity);
 
-fn current_target(prop: EmitterProp, tracker: &InspectedEmitterTracker) -> Option<DriveTarget> {
-    tracker
-        .current_index
-        .map(|index| DriveTarget::Emitter { index, prop })
+fn current_target(
+    prop: DrivableProp,
+    emitter_tracker: &InspectedEmitterTracker,
+    light_tracker: &InspectedLightTracker,
+) -> Option<DriveTarget> {
+    match prop {
+        DrivableProp::Emitter(prop) => emitter_tracker
+            .current_index
+            .map(|index| DriveTarget::Emitter { index, prop }),
+        DrivableProp::Light(prop) => light_tracker
+            .current_index
+            .map(|index| DriveTarget::Light { index, prop }),
+    }
+}
+
+/// "Does this change what is already in the air" in words, for this
+/// button's popover header. `Emitter` reuses [`stage_label`] (the only
+/// family with a real `Stage`); `Light` targets are always ECS-stage, per
+/// `asset::drive`'s own doc on `DriveTarget::Light`, so they get fixed text
+/// instead of a fabricated `Stage` value. Mirrors `drives.rs`'s
+/// `target_stage_text` wording exactly, so the same target reads the same
+/// way whether it is opened from a field's own button or from the flat list.
+fn drivable_stage_text(prop: DrivableProp) -> &'static str {
+    match prop {
+        DrivableProp::Emitter(prop) => stage_label(prop),
+        DrivableProp::Light(_) => "ECS: applied to the light every frame",
+    }
 }
 
 // --- Trigger button ---------------------------------------------------
@@ -248,19 +306,22 @@ fn sync_drive_button_label(
     editor_state: Res<EditorState>,
     assets: Res<Assets<ParticlesAsset>>,
     tracker: Res<InspectedEmitterTracker>,
+    light_tracker: Res<InspectedLightTracker>,
     props: Query<&DriveButtonProp>,
     triggers: Query<(&DriveButtonTrigger, &Children)>,
     mut texts: Query<&mut Text>,
     new_triggers: Query<Entity, Added<DriveButtonTrigger>>,
 ) {
-    let should_sync =
-        assets.is_changed() || tracker.is_changed() || !new_triggers.is_empty();
+    let should_sync = assets.is_changed()
+        || tracker.is_changed()
+        || light_tracker.is_changed()
+        || !new_triggers.is_empty();
     if !should_sync {
         return;
     }
 
-    let count_for = |prop: EmitterProp| -> usize {
-        let Some(target) = current_target(prop, &tracker) else {
+    let count_for = |prop: DrivableProp| -> usize {
+        let Some(target) = current_target(prop, &tracker, &light_tracker) else {
             return 0;
         };
         let Some(handle) = &editor_state.current_project else {
@@ -300,6 +361,7 @@ fn handle_drive_trigger_click(
     trigger: On<ButtonClickEvent>,
     mut commands: Commands,
     tracker: Res<InspectedEmitterTracker>,
+    light_tracker: Res<InspectedLightTracker>,
     triggers: Query<&DriveButtonTrigger>,
     props: Query<&DriveButtonProp>,
     mut trackers: Query<&mut PopoverTracker>,
@@ -327,10 +389,11 @@ fn handle_drive_trigger_click(
         return;
     };
 
-    // Nothing to drive without a currently inspected emitter -- the button
-    // exists on a section that is shared across every emitter (see the
-    // module doc), so this can legitimately be transient between selections.
-    if tracker.current_index.is_none() {
+    // Nothing to drive without a currently inspected emitter/light -- the
+    // button exists on a section that is shared across every emitter (or
+    // light) the author selects (see the module doc), so this can
+    // legitimately be transient between selections.
+    if current_target(prop.0, &tracker, &light_tracker).is_none() {
         return;
     }
 
@@ -353,7 +416,7 @@ fn handle_drive_trigger_click(
 
     commands
         .spawn_scene(popover_header(PopoverHeaderProps::new(
-            stage_label(prop.0),
+            drivable_stage_text(prop.0),
             popover_entity,
         )))
         .insert(ChildOf(popover_entity));
@@ -383,14 +446,17 @@ fn rebuild_drive_rows(
     editor_state: Res<EditorState>,
     assets: Res<Assets<ParticlesAsset>>,
     tracker: Res<InspectedEmitterTracker>,
+    light_tracker: Res<InspectedLightTracker>,
     dirty_state: Res<DirtyState>,
     props: Query<&DriveButtonProp>,
     containers: Query<(Entity, &DriveRowsContainer)>,
     new_containers: Query<Entity, Added<DriveRowsContainer>>,
     children_query: Query<&Children>,
 ) {
-    let should_rebuild =
-        !new_containers.is_empty() || dirty_state.is_changed() || tracker.is_changed();
+    let should_rebuild = !new_containers.is_empty()
+        || dirty_state.is_changed()
+        || tracker.is_changed()
+        || light_tracker.is_changed();
     if !should_rebuild {
         return;
     }
@@ -413,7 +479,7 @@ fn rebuild_drive_rows(
             }
         }
 
-        let Some(target) = current_target(prop.0, &tracker) else {
+        let Some(target) = current_target(prop.0, &tracker, &light_tracker) else {
             continue;
         };
         let rows = drives_on(asset, &target);
@@ -736,6 +802,7 @@ fn handle_drive_add_click(
     buttons: Query<&DriveAddButton>,
     props: Query<&DriveButtonProp>,
     tracker: Res<InspectedEmitterTracker>,
+    light_tracker: Res<InspectedLightTracker>,
     editor_state: Res<EditorState>,
     mut assets: ResMut<Assets<ParticlesAsset>>,
     mut dirty_state: ResMut<DirtyState>,
@@ -746,7 +813,7 @@ fn handle_drive_add_click(
     let Ok(prop) = props.get(add_button.0) else {
         return;
     };
-    let Some(target) = current_target(prop.0, &tracker) else {
+    let Some(target) = current_target(prop.0, &tracker, &light_tracker) else {
         return;
     };
     let Some(handle) = &editor_state.current_project else {

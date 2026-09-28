@@ -10,10 +10,10 @@ use crate::viewport::{
     AabbGeneration, CameraSettings, ViewportInputState, despawn_preview_on_project_change,
     draw_collider_gizmos, handle_generate_aabb_request, handle_playback_play_event,
     handle_playback_reset_event, handle_playback_seek_event, handle_respawn_colliders,
-    handle_respawn_emitters, orbit_camera, respawn_preview_on_emitter_change,
-    setup_aabb_gizmo_config, setup_camera, setup_floor, spawn_preview_particle_system,
-    sync_inspected_emitter_aabb, sync_playback_state, sync_viewport_settings, tick_aabb_generation,
-    zoom_camera,
+    handle_respawn_emitters, handle_respawn_lights, orbit_camera,
+    respawn_preview_on_emitter_change, setup_aabb_gizmo_config, setup_camera, setup_floor,
+    spawn_preview_particle_system, sync_inspected_emitter_aabb, sync_playback_state,
+    sync_viewport_settings, tick_aabb_generation, zoom_camera,
 };
 
 #[derive(Resource, Default)]
@@ -47,6 +47,7 @@ impl Plugin for SprinklesEditorPlugin {
             .add_observer(respawn_preview_on_emitter_change)
             .add_observer(handle_respawn_emitters)
             .add_observer(handle_respawn_colliders)
+            .add_observer(handle_respawn_lights)
             .add_observer(handle_playback_play_event)
             .add_observer(handle_playback_reset_event)
             .add_observer(handle_playback_seek_event)

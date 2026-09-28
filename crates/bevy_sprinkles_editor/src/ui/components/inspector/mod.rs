@@ -9,6 +9,7 @@ mod draw_pass;
 // components, `stage_label`) rather than reimplementing them.
 pub(crate) mod drive_button;
 mod emission;
+mod light;
 mod particle_flags;
 mod project_properties;
 mod scale;
@@ -32,7 +33,7 @@ use bevy_sprinkles::asset::EmitterProp;
 use bevy_sprinkles::prelude::*;
 
 use crate::state::{ActiveSidebarTab, EditorState, Inspectable, SidebarTab};
-use crate::ui::icons::{ICON_BOX, ICON_HASHTAG, ICON_SHOWERS};
+use crate::ui::icons::{ICON_BOX, ICON_HASHTAG, ICON_INFORMATION, ICON_SHOWERS};
 use crate::ui::tokens::{
     BORDER_COLOR, FONT_PATH, TEXT_BODY_COLOR, TEXT_MUTED_COLOR, TEXT_SIZE_LG, TEXT_SIZE_SM,
 };
@@ -49,6 +50,7 @@ use super::binding::FieldBinding;
 pub fn plugin(app: &mut App) {
     app.init_resource::<InspectedEmitterTracker>()
         .init_resource::<InspectedColliderTracker>()
+        .init_resource::<InspectedLightTracker>()
         .add_plugins((
             super::binding::plugin,
             time::plugin,
@@ -67,6 +69,7 @@ pub fn plugin(app: &mut App) {
             collider_properties::plugin,
         ))
         .add_plugins(variable::plugin)
+        .add_plugins(light::plugin)
         .add_plugins(project_properties::plugin)
         .add_plugins(visibility_aabb::plugin)
         .add_plugins(drive_button::plugin)
@@ -76,6 +79,7 @@ pub fn plugin(app: &mut App) {
                 (
                     update_inspected_emitter_tracker,
                     update_inspected_collider_tracker,
+                    update_inspected_light_tracker,
                 ),
                 (
                     cleanup_dynamic_sections,
@@ -85,7 +89,8 @@ pub fn plugin(app: &mut App) {
                     toggle_inspector_content,
                 )
                     .after(update_inspected_emitter_tracker)
-                    .after(update_inspected_collider_tracker),
+                    .after(update_inspected_collider_tracker)
+                    .after(update_inspected_light_tracker),
             ),
         );
 }
@@ -97,6 +102,11 @@ pub struct InspectedEmitterTracker {
 
 #[derive(Resource, Default)]
 pub struct InspectedColliderTracker {
+    pub current_index: Option<u8>,
+}
+
+#[derive(Resource, Default)]
+pub struct InspectedLightTracker {
     pub current_index: Option<u8>,
 }
 
@@ -134,6 +144,23 @@ pub(super) fn update_inspected_collider_tracker(
     }
 }
 
+pub(super) fn update_inspected_light_tracker(
+    editor_state: Res<EditorState>,
+    mut tracker: ResMut<InspectedLightTracker>,
+) {
+    let new_index = editor_state
+        .inspecting
+        .as_ref()
+        .filter(|i| i.kind == Inspectable::Light)
+        .map(|i| i.index);
+
+    if tracker.current_index != new_index {
+        tracker.current_index = new_index;
+    } else if editor_state.is_changed() {
+        tracker.set_changed();
+    }
+}
+
 #[derive(Component, Default, Clone)]
 pub struct EditorInspectorPanel;
 
@@ -145,6 +172,7 @@ enum InspectorContentKind {
     Emitter,
     Collider,
     Variable,
+    Light,
     Project,
     Settings,
     EnabledCheckbox,
@@ -269,6 +297,23 @@ fn setup_inspector_panel(
 
                         content
                             .spawn((
+                                InspectorContentKind::Light,
+                                Node {
+                                    width: percent(100),
+                                    flex_direction: FlexDirection::Column,
+                                    display: Display::None,
+                                    ..default()
+                                },
+                            ))
+                            .with_children(|light_content| {
+                                spawn_section(light_content, light::light_section());
+                                spawn_section(light_content, light::light_transform_section());
+                                spawn_section(light_content, light::light_time_section());
+                                spawn_section(light_content, light::light_color_section());
+                            });
+
+                        content
+                            .spawn((
                                 InspectorContentKind::Project,
                                 Node {
                                     width: percent(100),
@@ -334,6 +379,7 @@ fn toggle_inspector_content(
             InspectorContentKind::Emitter => inspecting_kind == Some(Inspectable::Emitter),
             InspectorContentKind::Collider => inspecting_kind == Some(Inspectable::Collider),
             InspectorContentKind::Variable => inspecting_kind == Some(Inspectable::Variable),
+            InspectorContentKind::Light => inspecting_kind == Some(Inspectable::Light),
             InspectorContentKind::Project => {
                 active_tab.0 == SidebarTab::Project && editor_state.current_project.is_some()
             }
@@ -587,6 +633,13 @@ fn get_outliner_title(
             let name = variable.map(|v| v.name.clone()).unwrap_or_default();
             (name, ICON_HASHTAG)
         }
+        Inspectable::Light => {
+            let light = asset.lights.get(inspecting.index as usize);
+            let name = light.map(|l| l.name.clone()).unwrap_or_default();
+            // No dedicated light-bulb icon asset exists yet; the info glyph
+            // is a placeholder rather than a claim this is the right icon.
+            (name, ICON_INFORMATION)
+        }
     })
 }
 
@@ -628,9 +681,11 @@ fn cleanup_dynamic_sections(
     mut commands: Commands,
     emitter_tracker: Res<InspectedEmitterTracker>,
     collider_tracker: Res<InspectedColliderTracker>,
+    light_tracker: Res<InspectedLightTracker>,
     existing: Query<Entity, With<DynamicSectionContent>>,
 ) {
-    if !emitter_tracker.is_changed() && !collider_tracker.is_changed() {
+    if !emitter_tracker.is_changed() && !collider_tracker.is_changed() && !light_tracker.is_changed()
+    {
         return;
     }
 

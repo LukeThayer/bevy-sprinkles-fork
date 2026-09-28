@@ -14,7 +14,7 @@ use crate::ui::widgets::gradient_edit::GradientEditCommitEvent;
 use crate::ui::widgets::text_edit::TextEditCommitEvent;
 use crate::ui::widgets::texture_edit::TextureEditCommitEvent;
 use crate::ui::widgets::variant_edit::{VariantComboBox, VariantEditConfig};
-use crate::viewport::{RespawnCollidersEvent, RespawnEmittersEvent};
+use crate::viewport::{RespawnCollidersEvent, RespawnEmittersEvent, RespawnLightsEvent};
 
 use super::{
     BindingTarget, BoundTo, FieldBinding, FieldValue, get_inspected_data_mut,
@@ -78,15 +78,17 @@ impl CommitContext<'_, '_> {
             }
         }
         if requires_respawn_binding(binding) {
-            let is_collider = self
-                .editor_state
-                .inspecting
-                .as_ref()
-                .is_some_and(|i| i.kind == Inspectable::Collider);
-            if is_collider {
-                self.commands.trigger(RespawnCollidersEvent);
-            } else {
-                self.commands.trigger(RespawnEmittersEvent);
+            // Exhaustive on the inspected kind (Task 21 added `Light`
+            // alongside its own respawn event) rather than the old
+            // Collider/else boolean -- a future `Inspectable` variant is a
+            // compile error here until it says which respawn event it
+            // needs, instead of silently falling into `RespawnEmittersEvent`.
+            match self.editor_state.inspecting.as_ref().map(|i| i.kind) {
+                Some(Inspectable::Collider) => self.commands.trigger(RespawnCollidersEvent),
+                Some(Inspectable::Light) => self.commands.trigger(RespawnLightsEvent),
+                Some(Inspectable::Emitter) | Some(Inspectable::Variable) | None => {
+                    self.commands.trigger(RespawnEmittersEvent);
+                }
             }
         }
     }
@@ -131,6 +133,15 @@ const RESPAWN_FIELD_PATHS: &[&str] = &[
     "initial_transform.scale",
     "trail.enabled",
     "trail.thickness_curve",
+    // Task 21 (lights): `setup_effect_lights` (bevy_sprinkles::lights) reads
+    // `kind`, `transform` and `shadows` only once, at spawn -- unlike
+    // intensity/range/color/intensity_over_life, which `sync_effect_lights`
+    // re-reads from the asset every frame and so need no respawn at all.
+    "kind",
+    "transform.translation",
+    "transform.rotation",
+    "transform.scale",
+    "shadows",
 ];
 
 fn requires_respawn(path: &str) -> bool {

@@ -342,6 +342,43 @@ pub fn handle_respawn_colliders(
     }
 }
 
+/// Task 21: the light equivalent of [`RespawnEmittersEvent`]/
+/// [`RespawnCollidersEvent`]. Structural light changes (add, delete, a
+/// `kind` swap between `Point`/`Spot`, or any field `setup_effect_lights`
+/// (`bevy_sprinkles::lights`) only reads once at spawn -- `enabled`,
+/// `transform`, `shadows`) need a full respawn: that system is idempotent
+/// via `EffectLightsSpawned`, so it never revisits an effect it has already
+/// spawned lights for. Intensity, range, color and `intensity_over_life` do
+/// NOT need this -- they are re-read from the live asset every frame by
+/// `sync_effect_lights`.
+#[derive(Event)]
+pub struct RespawnLightsEvent;
+
+pub fn handle_respawn_lights(
+    _trigger: On<RespawnLightsEvent>,
+    mut commands: Commands,
+    preview_systems: Query<Entity, With<EditorParticlePreview>>,
+    light_entities: Query<(Entity, &LightEntity)>,
+) {
+    for system_entity in &preview_systems {
+        for (light_entity, light) in &light_entities {
+            if light.parent_system == system_entity {
+                commands.entity(light_entity).despawn();
+            }
+        }
+        // Unlike the emitter/collider handlers above, this does NOT remove
+        // `ParticleSystemRuntime`/`Transform` -- those belong to particle
+        // spawning, not lights, and removing them here would stop and
+        // reset particle playback as a side effect of a purely light-shaped
+        // edit. `setup_effect_lights` is gated on `EffectLightsSpawned`
+        // alone, so clearing just that marker is enough to make it revisit
+        // this effect and respawn every enabled light fresh from the asset.
+        commands
+            .entity(system_entity)
+            .remove::<EffectLightsSpawned>();
+    }
+}
+
 pub fn respawn_preview_on_emitter_change(
     _trigger: On<PlaybackResetEvent>,
     mut commands: Commands,

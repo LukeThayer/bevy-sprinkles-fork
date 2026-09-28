@@ -18,7 +18,7 @@ use crate::ui::widgets::text_edit::{
     EditorTextEdit, TextEditCommitEvent, TextEditProps, text_edit,
 };
 use crate::ui::widgets::utils::find_ancestor;
-use crate::viewport::{RespawnCollidersEvent, RespawnEmittersEvent};
+use crate::viewport::{RespawnCollidersEvent, RespawnEmittersEvent, RespawnLightsEvent};
 
 const DOUBLE_CLICK_THRESHOLD: f32 = 0.3;
 
@@ -398,6 +398,11 @@ fn on_item_menu_change(
                 // Duplicate path does not guard against). Kept exhaustive
                 // only because `Inspectable` is a shared enum.
                 Inspectable::Variable => return,
+                // Same hazard, same reason: lights never enter this list
+                // either (they have their own, in lights.rs) -- inserting a
+                // light at a non-tail index would shift positional
+                // `DriveTarget::Light` indices the same way a delete does.
+                Inspectable::Light => return,
                 Inspectable::Emitter => {
                     let Some(source) = asset.emitters.get(item.index as usize) else {
                         return;
@@ -440,6 +445,8 @@ fn on_item_menu_change(
                 Inspectable::Collider => "Delete collider",
                 // Unreachable: variables use their own list (variables.rs).
                 Inspectable::Variable => "Delete variable",
+                // Unreachable: lights use their own list (lights.rs).
+                Inspectable::Light => "Delete light",
             };
             commands.insert_resource(PendingDelete {
                 kind: item.kind,
@@ -526,6 +533,11 @@ fn trigger_respawn(commands: &mut Commands, kind: Inspectable) {
         // it only reshapes drives, which are resolved fresh every frame.
         // Also unreachable from this list; see the Duplicate arm above.
         Inspectable::Variable => {}
+        // Unreachable from this list (see the Duplicate arm above), but
+        // implemented correctly anyway: `lights.rs`'s own add/delete flow
+        // triggers this event itself, so a light DOES need a real respawn
+        // (unlike a variable) if this arm is ever reached some other way.
+        Inspectable::Light => commands.trigger(RespawnLightsEvent),
     }
 }
 
@@ -595,6 +607,10 @@ fn get_item_name(
         Inspectable::Variable => {
             let variable = asset.variables.get(item.index as usize)?;
             Some(variable.name.clone())
+        }
+        Inspectable::Light => {
+            let light = asset.lights.get(item.index as usize)?;
+            Some(light.name.clone())
         }
     }
 }
@@ -755,6 +771,15 @@ fn on_rename_commit(
                             dirty_state.has_unsaved_changes = true;
                         }
                     }
+                    // Unreachable: lights rename via their own inspector
+                    // Name field (`inspector::light`), not this list's
+                    // double-click flow. Handled correctly anyway.
+                    Inspectable::Light => {
+                        if let Some(light) = asset.lights.get_mut(item.index as usize) {
+                            light.name = new_name.clone();
+                            dirty_state.has_unsaved_changes = true;
+                        }
+                    }
                 }
             }
         }
@@ -828,6 +853,16 @@ fn on_delete_confirmed(
             }
             crate::ui::components::variables::remove_variable(&mut asset, index);
             asset.variables.len()
+        }
+        // Same reasoning as the `Variable` arm above, routed through
+        // `lights.rs`'s own renumbering helper: unreachable from this list,
+        // implemented correctly anyway.
+        Inspectable::Light => {
+            if index >= asset.lights.len() {
+                return;
+            }
+            crate::ui::components::lights::remove_light(&mut asset, index);
+            asset.lights.len()
         }
     };
 

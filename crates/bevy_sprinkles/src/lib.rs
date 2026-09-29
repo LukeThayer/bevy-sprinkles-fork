@@ -176,6 +176,8 @@ pub mod lights;
 /// Particle material extension for GPU-driven particle rendering.
 pub mod material;
 mod mesh;
+#[cfg(test)]
+mod perf_counts;
 /// Convenience re-exports for common particle system types.
 pub mod prelude;
 /// Runtime components and state for active particle systems.

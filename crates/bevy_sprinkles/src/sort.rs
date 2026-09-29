@@ -94,7 +94,7 @@ pub fn init_particle_sort_pipeline(
     });
 }
 
-struct SortDispatch {
+pub(crate) struct SortDispatch {
     emitter_index: usize,
     dynamic_offset: u32,
     workgroups: u32,
@@ -103,9 +103,9 @@ struct SortDispatch {
 #[derive(Resource, Default)]
 pub struct ParticleSortBindGroups {
     bind_groups: Vec<BindGroup>,
-    init_dispatches: Vec<SortDispatch>,
-    sort_levels: Vec<Vec<SortDispatch>>,
-    copy_dispatches: Vec<SortDispatch>,
+    pub(crate) init_dispatches: Vec<SortDispatch>,
+    pub(crate) sort_levels: Vec<Vec<SortDispatch>>,
+    pub(crate) copy_dispatches: Vec<SortDispatch>,
 }
 
 /// Builds the dispatch plan for one frame's worth of emitters, and nothing
@@ -122,7 +122,7 @@ pub struct ParticleSortBindGroups {
 /// `emitters` must already be filtered to those whose three storage buffers
 /// resolved, in the same order as the caller's buffer list, because
 /// `SortDispatch::emitter_index` indexes into that list.
-fn plan_sort_dispatches(
+pub(crate) fn plan_sort_dispatches(
     emitters: &[&ExtractedEmitterData],
     dynamic_uniform: &mut DynamicUniformBuffer<SortParams>,
 ) -> ParticleSortBindGroups {

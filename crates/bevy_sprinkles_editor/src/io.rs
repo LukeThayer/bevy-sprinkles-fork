@@ -52,11 +52,24 @@ fn default_vsync() -> bool {
 }
 
 fn default_tonemapping() -> Option<EditorTonemapping> {
-    Some(EditorTonemapping::TonyMcMapface)
+    // No display transform by default, so the viewport shows what a renderer
+    // WITHOUT one shows: an emissive above 1.0 clips per channel and stays
+    // saturated, rather than being rolled off and desaturated toward white by
+    // a filmic shoulder. Bevy's own default is `TonyMcMapface`
+    // (`bevy_core_pipeline-0.19.0/src/tonemapping/mod.rs:119-158`), which made
+    // this editor preview every effect through a curve the host game may not
+    // have -- authoring against a shoulder and shipping into a clip is how an
+    // emissive that read as soft white here arrived as blown-out orange there.
+    // A host that DOES tonemap can turn it back on; the honest default is the
+    // one that adds nothing.
+    None
 }
 
 fn default_bloom() -> Option<EditorBloom> {
-    Some(EditorBloom::Natural)
+    // Off for the same reason as `default_tonemapping`: bloom spreads a bright
+    // core into a halo the host may never draw, so an effect tuned to look
+    // right with it is over-bright without it.
+    None
 }
 
 fn default_anti_aliasing() -> Option<EditorSmaaPreset> {
@@ -222,4 +235,53 @@ pub fn save_editor_data(data: &EditorData) {
                 .expect("failed to write editor data");
         })
         .detach();
+}
+
+#[cfg(test)]
+mod default_viewport_tests {
+    use super::*;
+
+    /// The viewport must add no display transform of its own.
+    ///
+    /// This is an authoring-honesty guarantee, not a preference: an effect is
+    /// tuned by eye in this viewport and then rendered by a host that may apply
+    /// no tonemapping and no bloom at all. Under a filmic shoulder a bright
+    /// emissive rolls off and desaturates toward white; under none it clips per
+    /// channel and stays saturated. Authoring against the former and shipping
+    /// into the latter is how the same asset reads as soft white here and
+    /// blown-out orange there -- a real report, and the reason these defaults
+    /// moved off bevy's own.
+    ///
+    /// A host that genuinely tonemaps can switch both back on; the default is
+    /// the one that shows the author their own values rather than a curve's
+    /// opinion of them.
+    #[test]
+    fn the_viewport_adds_no_tonemapping_or_bloom_by_default() {
+        assert!(
+            default_tonemapping().is_none(),
+            "a default display transform makes every preview a lie for a host without one"
+        );
+        assert!(
+            default_bloom().is_none(),
+            "default bloom makes an over-bright effect look correct while authoring"
+        );
+    }
+
+    /// An explicit setting in `editor.ron` must still win, or a user who wants
+    /// a filmic preview silently loses it on the next launch.
+    #[test]
+    fn an_explicitly_authored_setting_still_overrides_the_default() {
+        let ron = r#"(
+            show_fps: true,
+            vsync: true,
+            tonemapping: Some(TonyMcMapface),
+            bloom: Some(Natural),
+        )"#;
+        let parsed: EditorSettings = ron::from_str(ron).expect("settings parse");
+        assert!(
+            matches!(parsed.tonemapping, Some(EditorTonemapping::TonyMcMapface)),
+            "serde(default) must only fill an ABSENT field, never replace an authored one"
+        );
+        assert!(matches!(parsed.bloom, Some(EditorBloom::Natural)));
+    }
 }

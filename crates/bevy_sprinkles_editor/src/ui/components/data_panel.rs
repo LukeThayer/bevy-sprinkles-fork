@@ -1,6 +1,7 @@
 use bevy::input_focus::{FocusCause, InputFocus};
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy_sprinkles::asset::DriveTarget;
 use bevy_sprinkles::prelude::*;
 
 use crate::state::{DirtyState, EditorState, Inspectable, Inspecting};
@@ -24,6 +25,62 @@ use crate::ui::widgets::utils::find_ancestor;
 use crate::viewport::{RespawnCollidersEvent, RespawnEmittersEvent, RespawnLightsEvent};
 
 const DOUBLE_CLICK_THRESHOLD: f32 = 0.3;
+
+/// Removes the emitter at `index`, keeping the file loadable.
+///
+/// The emitters list is positionally addressed by drives in TWO variants, not
+/// one: `DriveTarget::Emitter { index }` and `DriveTarget::Transform { index }`
+/// both index into `ParticlesAsset::emitters` (a `Transform` drive targets the
+/// emitter ENTITY's `Transform`, so its index is an emitter index -- see its
+/// doc in `asset::drive`). Removing an entry therefore shifts both. Two things
+/// follow, both required: a drive that named exactly this emitter is dropped
+/// (it would otherwise address whatever slid into the slot), and every
+/// surviving emitter- or transform-targeted drive above it is renumbered.
+///
+/// Skipping either leaves an asset `validate_drives` rejects on the very next
+/// load -- and a drive naming the LAST emitter is left frankly out of range, so
+/// the file the editor just wrote is one the editor cannot reopen. This is the
+/// same property `variables::remove_variable` and `lights::remove_light` exist
+/// to hold; the emitters list predates both and was not brought along.
+pub fn remove_emitter(asset: &mut ParticlesAsset, index: usize) {
+    if index >= asset.emitters.len() {
+        return;
+    }
+    asset.emitters.remove(index);
+    asset.drives.retain(|d| match &d.target {
+        DriveTarget::Emitter { index: i, .. } | DriveTarget::Transform { index: i, .. } => {
+            *i as usize != index
+        }
+        DriveTarget::Light { .. } => true,
+    });
+    for drive in asset.drives.iter_mut() {
+        if let DriveTarget::Emitter { index: i, .. } | DriveTarget::Transform { index: i, .. } =
+            &mut drive.target
+        {
+            if *i as usize > index {
+                *i -= 1;
+            }
+        }
+    }
+}
+
+/// Copies the emitter at `index` onto the END of the list, returning the new
+/// emitter's index, or `None` if `index` names no emitter.
+///
+/// Appending rather than inserting beside the source is the whole point: see
+/// the `"Duplicate"` arm of `on_item_menu_change` for why an insert silently
+/// rewires every drive above the insertion point while leaving the file
+/// perfectly loadable. `base` is the source's name with any trailing number
+/// stripped, so the copy is named the same way `on_add_emitter` names a fresh
+/// one.
+pub fn duplicate_emitter(asset: &mut ParticlesAsset, index: usize, base: &str) -> Option<usize> {
+    let source = asset.emitters.get(index)?;
+    let mut new_item = source.clone();
+    let existing: Vec<&str> = asset.emitters.iter().map(|e| e.name.as_str()).collect();
+    new_item.name = next_unique_name(base, &existing);
+    asset.emitters.push(new_item);
+    Some(asset.emitters.len() - 1)
+}
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<LastLoadedProject>()
@@ -446,32 +503,38 @@ fn on_item_menu_change(
             };
 
             let (base, _) = strip_trailing_number(&item_name);
-            let insert_index = item.index as usize + 1;
 
-            match item.kind {
-                // Variables never enter this list (they have their own,
-                // in variables.rs, precisely because inserting at a
-                // non-tail index here would shift positional `VariableId`s
-                // the same way a delete does -- a hazard this generic
-                // Duplicate path does not guard against). Kept exhaustive
-                // only because `Inspectable` is a shared enum.
+            // WHERE the copy lands differs by kind, and that is a correctness
+            // rule rather than a layout preference. An emitter is addressed
+            // positionally by `DriveTarget::Emitter` and
+            // `DriveTarget::Transform`, so inserting a copy directly after its
+            // source shifts every emitter above it and silently re-points
+            // every drive above it at a DIFFERENT emitter. Nothing goes out of
+            // range, so the file still loads and `validate_drives` stays
+            // happy -- the author's only symptom is the wrong emitter reacting
+            // to a variable, with nothing to search for. Appending shifts
+            // nothing, which is exactly why `on_add_emitter` and
+            // `on_add_mesh_fx` append; Duplicate now matches them.
+            //
+            // A collider carries no positional reference anywhere in the asset
+            // (no `DriveTarget` names one), so its copy may still land beside
+            // its source, where an author expects it.
+            let new_index = match item.kind {
+                // Variables never enter this list -- they have their own, in
+                // variables.rs. Kept exhaustive only because `Inspectable` is
+                // a shared enum.
                 Inspectable::Variable => return,
-                // Same hazard, same reason: lights never enter this list
-                // either (they have their own, in lights.rs) -- inserting a
-                // light at a non-tail index would shift positional
-                // `DriveTarget::Light` indices the same way a delete does.
+                // Same: lights have their own list, in lights.rs.
                 Inspectable::Light => return,
                 Inspectable::Emitter => {
-                    let Some(source) = asset.emitters.get(item.index as usize) else {
+                    let Some(new_index) = duplicate_emitter(&mut asset, item.index as usize, base)
+                    else {
                         return;
                     };
-                    let mut new_item = source.clone();
-                    let existing: Vec<&str> =
-                        asset.emitters.iter().map(|e| e.name.as_str()).collect();
-                    new_item.name = next_unique_name(base, &existing);
-                    asset.emitters.insert(insert_index, new_item);
+                    new_index
                 }
                 Inspectable::Collider => {
+                    let insert_index = item.index as usize + 1;
                     let Some(source) = asset.colliders.get(item.index as usize) else {
                         return;
                     };
@@ -480,11 +543,12 @@ fn on_item_menu_change(
                         asset.colliders.iter().map(|c| c.name.as_str()).collect();
                     new_item.name = next_unique_name(base, &existing);
                     asset.colliders.insert(insert_index, new_item);
+                    insert_index
                 }
-            }
+            };
 
             dirty_state.has_unsaved_changes = true;
-            adjust_inspecting_after_insert(&mut editor_state.inspecting, item.kind, insert_index);
+            adjust_inspecting_after_insert(&mut editor_state.inspecting, item.kind, new_index);
             trigger_respawn(&mut commands, item.kind);
             last_project.handle = None;
         }
@@ -892,7 +956,7 @@ fn on_delete_confirmed(
             if index >= asset.emitters.len() {
                 return;
             }
-            asset.emitters.remove(index);
+            remove_emitter(&mut asset, index);
             asset.emitters.len()
         }
         Inspectable::Collider => {
@@ -1013,5 +1077,290 @@ fn update_items(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_sprinkles::asset::drive::validate_drives;
+    use bevy_sprinkles::asset::{
+        Drive, DriveOp, EmitterProp, TransformProp, VariableDecl, VariableId,
+    };
+
+    fn asset_with(emitters: usize, drives: Vec<Drive>) -> ParticlesAsset {
+        let mut a = ParticlesAsset::new(
+            "t".into(),
+            ParticlesDimension::D3,
+            Default::default(),
+            vec![EmitterData::default(); emitters],
+            vec![],
+            false,
+            ParticlesAuthors::default(),
+        );
+        // A drive always names a variable too; declaring one keeps
+        // `validate_drives` focused on the emitter-index question these tests
+        // pin, rather than failing on an unrelated undeclared-variable error.
+        a.variables = vec![VariableDecl {
+            name: "v".into(),
+            ..Default::default()
+        }];
+        a.drives = drives;
+        a
+    }
+
+    fn drive_on(target: DriveTarget) -> Drive {
+        Drive {
+            variable: VariableId(0),
+            target,
+            curve: CurveTexture::default(),
+            output: ParticleRange { min: 0.0, max: 1.0 },
+            op: DriveOp::Multiply,
+            muted: false,
+        }
+    }
+
+    fn emitter_drive(index: u8) -> Drive {
+        drive_on(DriveTarget::Emitter {
+            index,
+            prop: EmitterProp::Tint,
+        })
+    }
+
+    fn transform_drive(index: u8) -> Drive {
+        drive_on(DriveTarget::Transform {
+            index,
+            prop: TransformProp::ScaleY,
+        })
+    }
+
+    #[test]
+    fn deleting_an_emitter_removes_the_drives_that_targeted_it() {
+        let mut asset = asset_with(1, vec![emitter_drive(0)]);
+        remove_emitter(&mut asset, 0);
+        assert!(asset.drives.is_empty());
+    }
+
+    #[test]
+    fn deleting_an_emitter_also_removes_the_transform_drives_that_targeted_it() {
+        // `DriveTarget::Transform`'s index is an EMITTER index, so the delete
+        // must reach both variants. Dropping only `Emitter` would leave this
+        // drive addressing a different emitter -- or, at the tail, nothing.
+        let mut asset = asset_with(1, vec![transform_drive(0)]);
+        remove_emitter(&mut asset, 0);
+        assert!(asset.drives.is_empty());
+    }
+
+    #[test]
+    fn deleting_an_emitter_renumbers_both_drive_variants_above_it() {
+        let mut asset = asset_with(3, vec![emitter_drive(2), transform_drive(2)]);
+        remove_emitter(&mut asset, 1);
+        assert!(matches!(
+            asset.drives[0].target,
+            DriveTarget::Emitter { index: 1, .. }
+        ));
+        assert!(matches!(
+            asset.drives[1].target,
+            DriveTarget::Transform { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_drive_on_an_emitter_below_the_deleted_one_is_left_untouched() {
+        let mut asset = asset_with(3, vec![emitter_drive(0), emitter_drive(2)]);
+        remove_emitter(&mut asset, 1);
+        assert!(matches!(
+            asset.drives[0].target,
+            DriveTarget::Emitter { index: 0, .. }
+        ));
+        assert!(matches!(
+            asset.drives[1].target,
+            DriveTarget::Emitter { index: 1, .. }
+        ));
+    }
+
+    /// The direct pin on the property this helper exists to protect: the
+    /// editor must never write a file that fails its own load validation.
+    /// Runs the delete through the REAL `validate_drives`, mirroring the
+    /// equivalents in `variables.rs` and `lights.rs`.
+    ///
+    /// The tail drive is the sharp case: before this helper existed, deleting
+    /// emitter 1 of two left `Emitter { index: 1 }` naming an emitter that no
+    /// longer exists, and `validate_drives` rejects that at load -- so the
+    /// editor wrote a file it could not reopen.
+    #[test]
+    fn a_delete_that_strands_a_tail_drive_still_leaves_the_asset_loadable() {
+        let mut asset = asset_with(2, vec![emitter_drive(1), transform_drive(1)]);
+        remove_emitter(&mut asset, 1);
+        assert!(validate_drives(&asset).is_ok(), "{:?}", validate_drives(&asset));
+    }
+
+    #[test]
+    fn a_delete_that_renumbers_still_leaves_the_asset_loadable() {
+        let mut asset = asset_with(3, vec![emitter_drive(2), transform_drive(2)]);
+        remove_emitter(&mut asset, 1);
+        assert!(validate_drives(&asset).is_ok());
+    }
+
+    #[test]
+    fn deleting_an_out_of_range_emitter_is_a_no_op() {
+        let mut asset = asset_with(1, vec![emitter_drive(0)]);
+        remove_emitter(&mut asset, 5);
+        assert_eq!(asset.emitters.len(), 1);
+        assert_eq!(asset.drives.len(), 1);
+    }
+
+    #[test]
+    fn a_light_drive_survives_an_emitter_delete_untouched() {
+        use bevy_sprinkles::asset::{LightData, LightProp};
+        let mut asset = asset_with(2, vec![]);
+        asset.lights = vec![LightData::default(); 2];
+        asset.drives = vec![drive_on(DriveTarget::Light {
+            index: 1,
+            prop: LightProp::Intensity,
+        })];
+        remove_emitter(&mut asset, 0);
+        assert!(matches!(
+            asset.drives[0].target,
+            DriveTarget::Light { index: 1, .. }
+        ));
+    }
+
+    /// I1: duplicating an emitter must not move any existing emitter, because
+    /// every drive addresses emitters positionally and an insert would
+    /// silently re-point the ones above it -- with the file still loading
+    /// clean, so nothing surfaces the rewire.
+    #[test]
+    fn duplicating_an_emitter_appends_and_leaves_every_drive_index_untouched() {
+        let mut asset = asset_with(3, vec![emitter_drive(1), transform_drive(2)]);
+        asset.emitters[0].name = "Emitter".into();
+        let new_index = duplicate_emitter(&mut asset, 0, "Emitter").expect("emitter 0 exists");
+
+        assert_eq!(new_index, 3, "the copy must land at the END of the list");
+        assert_eq!(asset.emitters.len(), 4);
+        assert!(matches!(
+            asset.drives[0].target,
+            DriveTarget::Emitter { index: 1, .. }
+        ));
+        assert!(matches!(
+            asset.drives[1].target,
+            DriveTarget::Transform { index: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn duplicating_an_emitter_gives_the_copy_a_unique_name() {
+        let mut asset = asset_with(1, vec![]);
+        asset.emitters[0].name = "Emitter".into();
+        duplicate_emitter(&mut asset, 0, "Emitter").expect("emitter 0 exists");
+        assert_ne!(asset.emitters[0].name, asset.emitters[1].name);
+    }
+
+    #[test]
+    fn duplicating_an_out_of_range_emitter_changes_nothing() {
+        let mut asset = asset_with(1, vec![]);
+        assert!(duplicate_emitter(&mut asset, 9, "Emitter").is_none());
+        assert_eq!(asset.emitters.len(), 1);
+    }
+
+    // --- The two call sites, through the real observers ------------------
+    //
+    // The helper tests above prove the helpers are correct; these prove the
+    // menu actually reaches them. Mutation-verified: restoring the bare
+    // `asset.emitters.remove(index)` / `asset.emitters.insert(..)` this fix
+    // wave replaced turns each of these red while every helper test above
+    // stays green -- which is exactly the gap that let C2 ship.
+
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::asset::AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.init_resource::<DirtyState>();
+        app.init_resource::<LastLoadedProject>();
+        app
+    }
+
+    fn open(app: &mut App, asset: ParticlesAsset) -> Handle<ParticlesAsset> {
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<ParticlesAsset>>()
+            .add(asset);
+        app.insert_resource(EditorState {
+            current_project: Some(handle.clone()),
+            current_project_path: None,
+            inspecting: None,
+        });
+        handle
+    }
+
+    #[test]
+    fn confirming_an_emitter_delete_writes_a_file_the_loader_still_accepts() {
+        let mut app = test_app();
+        app.add_observer(on_delete_confirmed);
+
+        let asset = asset_with(2, vec![emitter_drive(1), transform_drive(1)]);
+        let handle = open(&mut app, asset);
+        app.insert_resource(PendingDelete {
+            kind: Inspectable::Emitter,
+            index: 1,
+        });
+
+        let dialog = app.world_mut().spawn_empty().id();
+        app.world_mut().trigger(DialogActionEvent { entity: dialog });
+
+        let assets = app.world().resource::<Assets<ParticlesAsset>>();
+        let asset = assets.get(&handle).unwrap();
+        assert_eq!(asset.emitters.len(), 1);
+        assert!(
+            validate_drives(asset).is_ok(),
+            "the delete path must not leave a drive the loader rejects: {:?}",
+            validate_drives(asset)
+        );
+    }
+
+    #[test]
+    fn duplicating_through_the_menu_appends_and_leaves_the_drives_pointing_where_they_did() {
+        let mut app = test_app();
+        app.add_observer(on_item_menu_change);
+
+        let mut asset = asset_with(2, vec![emitter_drive(1)]);
+        asset.emitters[0].name = "Emitter".into();
+        asset.emitters[1].name = "Sparks".into();
+        let handle = open(&mut app, asset);
+
+        // `on_item_menu_change` reaches the item through the menu's parent and
+        // requires the item to have `Children`, so the item carries a button
+        // child the way a real row does.
+        let item = app
+            .world_mut()
+            .spawn(InspectableItem {
+                kind: Inspectable::Emitter,
+                index: 0,
+            })
+            .id();
+        let button = app.world_mut().spawn((ItemButton, Node::default())).id();
+        app.world_mut().entity_mut(item).add_child(button);
+        let menu = app.world_mut().spawn((ItemMenu, ChildOf(item))).id();
+
+        app.world_mut().trigger(ComboBoxChangeEvent {
+            entity: menu,
+            selected: 0,
+            label: "Duplicate".to_string(),
+            value: None,
+        });
+
+        let assets = app.world().resource::<Assets<ParticlesAsset>>();
+        let asset = assets.get(&handle).unwrap();
+        assert_eq!(asset.emitters.len(), 3, "the copy must exist");
+        assert_eq!(
+            asset.emitters[1].name, "Sparks",
+            "an insert would have pushed Sparks up to index 2"
+        );
+        assert!(
+            matches!(asset.drives[0].target, DriveTarget::Emitter { index: 1, .. }),
+            "the drive must still address Sparks, not the copy: {:?}",
+            asset.drives[0].target
+        );
     }
 }

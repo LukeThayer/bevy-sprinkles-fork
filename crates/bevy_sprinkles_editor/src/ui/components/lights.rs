@@ -16,10 +16,13 @@
 //! way it already carries one for `Variable`.
 //!
 //! An add always appends (`asset.lights.push`), which is positionally safe
-//! and needs no renumbering -- unlike a hypothetical duplicate-at-arbitrary-
-//! index, which this module deliberately does not offer (see Task 18's own
-//! note in `data_panel.rs` about why a generic Duplicate path is never safe
-//! for a positionally-addressed list).
+//! and needs no renumbering -- unlike a duplicate-at-arbitrary-index, which
+//! this module deliberately does not offer. `data_panel.rs` reached the same
+//! rule for emitters the hard way: its Duplicate inserted the copy beside its
+//! source until the final fix wave, silently re-pointing every drive above
+//! the insertion at a DIFFERENT emitter while leaving the file perfectly
+//! loadable, so nothing surfaced the rewire. Appending is now the rule for
+//! every positionally addressed list here.
 
 use bevy::prelude::*;
 use bevy_sprinkles::asset::{DriveTarget, LightData};

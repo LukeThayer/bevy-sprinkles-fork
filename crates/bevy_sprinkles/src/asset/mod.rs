@@ -1483,7 +1483,7 @@ impl ParticlesAsset {
 /// The design originally had a separate `MeshEffectData` object -- a non-particle
 /// mesh with its own transform, material and timing, for cones, rings, beams and
 /// shockwaves. It was cut during brainstorming: an emitter shaped like this
-/// (`particles_amount: 1`, `one_shot: true`, zero velocity and spread,
+/// (`particles_amount: 1`, `one_shot: true`, zero velocity/spread/gravity,
 /// `use_local_coords: true`, `transform_align: None`) already IS one, and it
 /// arrives with lifetime curves, gradients, timing, sub-emitters and the entire
 /// existing inspector already working. A separate object type would have
@@ -1491,8 +1491,14 @@ impl ParticlesAsset {
 /// bursts of N expanding rings *harder* rather than easier.
 ///
 /// This function is the convenience that cut bought: one call (one editor click)
-/// instead of five hand-set fields. It configures no new runtime behaviour --
+/// instead of six hand-set fields. It configures no new runtime behaviour --
 /// nothing here exists outside `EmitterData`'s ordinary fields.
+///
+/// Zeroing `accelerations.gravity` is required, not optional polish:
+/// `EmitterAccelerations::default()` is `(0.0, -9.8, 0.0)`, applied every
+/// simulation step regardless of `use_local_coords` or velocity (gravity is
+/// an acceleration, not a velocity, so a zero initial velocity does not
+/// cancel it). Leaving it at the default would make the "pinned" mesh fall.
 pub fn mesh_fx_emitter() -> EmitterData {
     EmitterData {
         name: "Mesh FX".to_string(),
@@ -1503,6 +1509,13 @@ pub fn mesh_fx_emitter() -> EmitterData {
         draw_pass: EmitterDrawPass {
             use_local_coords: true,
             transform_align: None,
+            // A hollow cone, not a solid one: `cap_top` is inert either way
+            // since `top_radius: 0.0` already collapses the top to a point,
+            // but `cap_bottom` is a deliberate choice, not an oversight --
+            // the base sits at the emitter's own origin, which is normally
+            // hidden behind or inside whatever the effect is attached to, so
+            // a closing cap there would spend triangles on a face nothing
+            // ever sees.
             mesh: ParticleMesh::Cylinder {
                 top_radius: 0.0,
                 bottom_radius: 1.0,
@@ -1522,6 +1535,9 @@ pub fn mesh_fx_emitter() -> EmitterData {
             initial_velocity: Range::new(0.0, 0.0),
             spread: 0.0,
             ..Default::default()
+        },
+        accelerations: EmitterAccelerations {
+            gravity: Vec3::ZERO,
         },
         ..Default::default()
     }
@@ -1576,5 +1592,14 @@ mod mesh_fx_tests {
         // Not load-bearing behaviour, but a name of "Emitter" would make it
         // indistinguishable from a plain `Add Emitter` in the outliner list.
         assert_eq!(mesh_fx_emitter().name, "Mesh FX");
+    }
+
+    #[test]
+    fn the_mesh_fx_preset_has_no_gravity_so_the_pinned_mesh_does_not_fall() {
+        // `EmitterAccelerations::default()` is `(0.0, -9.8, 0.0)`, applied every
+        // simulation step regardless of `use_local_coords` or velocity -- a
+        // zero initial velocity does not cancel an acceleration. Without this,
+        // a "pinned" mesh visibly falls over its lifetime.
+        assert_eq!(mesh_fx_emitter().accelerations.gravity, Vec3::ZERO);
     }
 }

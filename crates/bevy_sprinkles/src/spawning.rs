@@ -1,5 +1,6 @@
 use bevy::{
-    light::NotShadowCaster, pbr::ExtendedMaterial, prelude::*, render::storage::ShaderBuffer,
+    camera::visibility::NoFrustumCulling, light::NotShadowCaster, pbr::ExtendedMaterial,
+    prelude::*, render::storage::ShaderBuffer,
 };
 
 use crate::{
@@ -485,6 +486,32 @@ pub fn setup_particle_systems(
                 ParticleMaterialHandle(material_handle),
                 emitter.initial_transform.to_transform(),
                 Visibility::default(),
+                // Unconditional, not an opt-in: nothing in this crate ever
+                // puts a particle-aware AABB on an emitter (see
+                // `emitter_is_simulated`'s doc comment in `extract.rs`, which
+                // reached this same conclusion for the same reason). Without
+                // `NoFrustumCulling`, bevy culls the emitter against the
+                // `Mesh3d`-derived AABB, but `build_particle_mesh` (`mesh.rs`)
+                // stacks every particle's geometry at *identical*
+                // origin-local positions -- each particle's real position
+                // only exists in the vertex shader, read out of the sorted
+                // particle buffer, so the AABB bounds the emitter's origin
+                // quad, not the particle cloud. A wide `EmissionScaleX/Y/Z`
+                // or a fast `InitialSpeed` sprays particles far outside that
+                // box, and the whole effect vanishes the instant the origin
+                // itself leaves the frustum while its particles still fill
+                // the screen. The asset's `EmitterDrawPass::visibility_aabb`
+                // is authored with the particle cloud in mind, but nothing
+                // here ever applies it -- it is read only by the editor's
+                // inspector and gizmo -- so there is no correct box to cull
+                // against today. This is a *different* gate from
+                // `InheritedVisibility`/`emitter_is_simulated`: that one
+                // means "the author hid this, stop simulating it"; this one
+                // means "there is no honest box to frustum-cull against, so
+                // don't". A visible emitter must never be frustum-culled; a
+                // hidden one must still be skipped by `emitter_is_simulated`
+                // -- the two must keep working independently of each other.
+                NoFrustumCulling,
             ));
 
             if !shadow_caster {
@@ -910,6 +937,67 @@ pub fn sync_particle_material(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the real `setup_particle_systems`, not a hand-built stand-in --
+    /// the point of this test is to pin what that system actually attaches
+    /// to a spawned emitter entity, not a fixture that only claims to match
+    /// it. Every resource here is `Assets<T>`/cache storage, so nothing
+    /// needs a render device to run headlessly.
+    fn app_with_particle_setup() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.init_asset::<Mesh>();
+        app.init_asset::<ShaderBuffer>();
+        app.init_asset::<ParticleMaterial>();
+        app.init_asset::<Image>();
+        app.init_resource::<ParticleMeshCache>();
+        app.init_resource::<GradientTextureCache>();
+        app.add_systems(Update, setup_particle_systems);
+        app
+    }
+
+    /// The bug this pins: nothing in this crate inserts `NoFrustumCulling`
+    /// or a particle-aware `Aabb` on an emitter, so bevy culls it against
+    /// the mesh-derived AABB -- which bounds the emitter's *origin quad*,
+    /// not the particle cloud (see the doc comment on the `NoFrustumCulling`
+    /// insert in `setup_particle_systems`). Mutating that insert away must
+    /// fail this test.
+    #[test]
+    fn a_spawned_emitter_carries_no_frustum_culling() {
+        let mut app = app_with_particle_setup();
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let a = ParticlesAsset::new(
+                "t".into(),
+                crate::asset::ParticlesDimension::D3,
+                Default::default(),
+                vec![EmitterData::default()],
+                vec![],
+                false,
+                crate::asset::ParticlesAuthors::default(),
+            );
+            assets.add(a)
+        };
+        app.world_mut().spawn(Particles3d(handle));
+
+        app.update();
+
+        let emitter = app
+            .world_mut()
+            .query::<(Entity, &EmitterEntity)>()
+            .iter(app.world())
+            .next()
+            .map(|(e, _)| e)
+            .expect("setup_particle_systems must spawn an emitter child");
+
+        assert!(
+            app.world().get::<NoFrustumCulling>(emitter).is_some(),
+            "a spawned emitter must never be frustum-culled -- there is no \
+             box today that bounds its actual particle cloud"
+        );
+    }
 
     #[test]
     fn no_resolved_state_yields_identity_everywhere() {

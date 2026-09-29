@@ -632,6 +632,55 @@ fn build_base_uniforms(
     }
 }
 
+/// Whether a hidden emitter's simulation is worth paying for this frame.
+///
+/// Extraction is the gate in front of *all* of an emitter's per-frame GPU
+/// cost: one uniform buffer plus one bind group per simulation step
+/// (`prepare_particle_compute_bind_groups`, `compute.rs`), a compute dispatch
+/// per step (`run_particle_compute_node`), a sort bind group and its
+/// init/sort/copy dispatches (`sort.rs`). All of that is per *emitter*, not
+/// per particle, so a level carrying many effects pays it many times over
+/// whether or not anyone is looking at them. Dropping an emitter here drops
+/// the lot.
+///
+/// **The trade this makes.** A skipped emitter does not simulate, so its
+/// particles freeze mid-flight. Its CPU clock does not freeze with them —
+/// `update_particle_time` (`spawning.rs`) keeps advancing `system_time` and
+/// refilling `simulation_steps` every frame regardless — so when the emitter
+/// becomes visible again it resumes from GPU state as old as the hidden
+/// interval, with emission phase that has moved on without it. That can read
+/// as a pop, and the longer it was hidden the worse it is. This is a real
+/// behaviour change, not a free win: the bargain is that an author who wrote
+/// `Visibility::Hidden` has said the effect is off, and an effect that is off
+/// has no state anyone is entitled to see continue.
+///
+/// **Why [`InheritedVisibility`] and not [`ViewVisibility`].** `ViewVisibility`
+/// is the frustum-culled signal and would win far more, but it cannot be
+/// trusted to mean "no particle of this emitter is on screen". The `Aabb` these
+/// entities are culled against is computed from their `Mesh3d`, and
+/// `build_particle_mesh` (`mesh.rs`) stacks `particle_count` copies of the base
+/// geometry at *identical* origin-local positions — every particle's real
+/// position arrives in the vertex shader out of the sorted particle buffer.
+/// So the AABB bounds the emitter's origin quad, not the particle cloud, and
+/// with the default `use_local_coords: false` the particles stay in world space
+/// where they were emitted while the emitter walks off camera. The asset does
+/// carry a particle-aware box, [`EmitterDrawPass::visibility_aabb`](
+/// crate::asset::EmitterDrawPass::visibility_aabb) — but nothing in this crate
+/// ever puts it on an entity; it is read only by the editor's inspector and
+/// gizmo. Until something applies it, frustum culling answers a question about
+/// the emitter's origin, and freezing a whole effect on that answer would be
+/// wrong. Gating on the authored "this is off" instead is a smaller win that
+/// is always correct.
+///
+/// A missing component counts as visible. Every emitter spawned by
+/// `setup_particle_systems` carries `Visibility`, which requires
+/// `InheritedVisibility`, so in a real app the `Option` is always `Some`; the
+/// fallback is there so a harness that never runs visibility propagation gets
+/// simulation rather than silence.
+pub fn emitter_is_simulated(inherited: Option<&InheritedVisibility>) -> bool {
+    inherited.is_none_or(|v| v.get())
+}
+
 pub fn extract_particle_systems(
     mut commands: Commands,
     emitter_query: Extract<
@@ -642,6 +691,7 @@ pub fn extract_particle_systems(
             &ParticleBufferHandle,
             &GlobalTransform,
             Option<&SubEmitterBufferHandle>,
+            Option<&InheritedVisibility>,
         )>,
     >,
     system_query: Extract<
@@ -673,6 +723,7 @@ pub fn extract_particle_systems(
         _buffer_handle,
         _global_transform,
         sub_emitter_buf,
+        _inherited_visibility,
     ) in emitter_query.iter()
     {
         let Some(sub_buf) = sub_emitter_buf else {
@@ -703,8 +754,17 @@ pub fn extract_particle_systems(
         buffer_handle,
         global_transform,
         sub_emitter_buf,
+        inherited_visibility,
     ) in emitter_query.iter()
     {
+        // Deliberately gated here and not in the sub-emitter pass above: that
+        // pass only records which buffer feeds which target, and a target must
+        // keep knowing it is fed from elsewhere even on a frame when its source
+        // is hidden, or it would fall back to emitting for itself.
+        if !emitter_is_simulated(inherited_visibility) {
+            continue;
+        }
+
         let Ok((particle_system, _system_runtime, effect_drives)) =
             system_query.get(emitter_entity.parent_system)
         else {
@@ -1201,5 +1261,159 @@ mod drive_tests {
             src.contains("spawn_probability: f32"),
             "particle_simulate.wgsl must declare spawn_probability to match EmitterUniforms",
         );
+    }
+}
+
+/// Headless proof that the visibility gate in [`extract_particle_systems`]
+/// removes real per-frame work.
+///
+/// These tests run the **real** extract system in a **real** render sub-app —
+/// [`ExtractPlugin`](bevy::render::extract_plugin::ExtractPlugin) builds one
+/// without ever touching a GPU, so `ExtractedParticleSystem` can be read back
+/// and counted on a machine with no adapter at all. What they measure is
+/// therefore work *eliminated*, not frame time: nobody here can time a frame.
+/// Emitters extracted and compute dispatches issued are the honest proxies,
+/// and they are the two quantities the gate actually moves.
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    use crate::asset::{
+        EmitterData, InitialTransform, ParticlesAsset, ParticlesAuthors, ParticlesDimension,
+    };
+    use crate::runtime::{ParticleSystemRuntime, SimulationStep};
+    use bevy::asset::AssetPlugin;
+    use bevy::ecs::schedule::ScheduleLabel;
+    use bevy::render::{Render, RenderApp, extract_plugin::ExtractPlugin};
+
+    /// Steps per emitter in the fixture. Each one becomes one entry in
+    /// `uniform_steps`, which is one compute dispatch in
+    /// `run_particle_compute_node` — so the dispatch count the tests assert is
+    /// the count that shader actually issues, not a stand-in for it.
+    const STEPS_PER_EMITTER: usize = 2;
+
+    /// Builds an app whose render sub-app runs `extract_particle_systems` for
+    /// real, with one emitter entity per entry in `visible`.
+    ///
+    /// `update_schedule` has to be set by hand: `ExtractPlugin` alone leaves it
+    /// `None`, and the extract schedule deliberately defers its commands to
+    /// `RenderSystems::ExtractCommands` in `Render` — so without this the
+    /// `ExtractedParticleSystem` resource is built and then never inserted.
+    fn extract_app(visible: &[bool]) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .add_plugins(ExtractPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.init_resource::<GradientTextureCache>();
+        app.init_resource::<CurveTextureCache>();
+
+        let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+        render_app.update_schedule = Some(Render.intern());
+        render_app.add_systems(ExtractSchedule, extract_particle_systems);
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(ParticlesAsset::new(
+                "fixture".into(),
+                ParticlesDimension::D3,
+                InitialTransform::default(),
+                vec![EmitterData::default()],
+                vec![],
+                false,
+                ParticlesAuthors::default(),
+            ))
+        };
+
+        let system_entity = app
+            .world_mut()
+            .spawn((
+                Particles3d(handle),
+                ParticleSystemRuntime::default(),
+                GlobalTransform::default(),
+            ))
+            .id();
+
+        for &is_visible in visible {
+            let mut runtime = EmitterRuntime::new(0, Some(7));
+            runtime.simulation_steps = (0..STEPS_PER_EMITTER)
+                .map(|i| SimulationStep {
+                    prev_system_time: i as f32 * 0.1,
+                    system_time: (i + 1) as f32 * 0.1,
+                    cycle: 0,
+                    delta_time: 0.1,
+                    clear_requested: false,
+                    trail_history_write_index: 0,
+                })
+                .collect();
+
+            app.world_mut().spawn((
+                EmitterEntity {
+                    parent_system: system_entity,
+                },
+                runtime,
+                ParticleBufferHandle {
+                    particle_buffer: Handle::default(),
+                    indices_buffer: Handle::default(),
+                    sorted_particles_buffer: Handle::default(),
+                    emitter_uniforms_buffer: Handle::default(),
+                    max_particles: 160,
+                    amount: 160,
+                    trail_size: 1,
+                    trail_history_buffer: None,
+                    trail_history_frames: 0,
+                },
+                GlobalTransform::default(),
+                if is_visible {
+                    InheritedVisibility::VISIBLE
+                } else {
+                    InheritedVisibility::HIDDEN
+                },
+            ));
+        }
+
+        app.update();
+        app
+    }
+
+    /// `(emitters extracted, compute dispatches those emitters will issue)`.
+    fn counts(app: &App) -> (usize, usize) {
+        let extracted = app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<ExtractedParticleSystem>();
+        (
+            extracted.emitters.len(),
+            extracted
+                .emitters
+                .iter()
+                .map(|(_, data)| data.uniform_steps.len())
+                .sum(),
+        )
+    }
+
+    #[test]
+    fn an_emitter_with_no_visibility_component_at_all_is_still_simulated() {
+        assert!(emitter_is_simulated(None));
+    }
+
+    #[test]
+    fn a_hidden_emitter_is_dropped_from_the_extract_and_a_visible_one_is_not() {
+        let app = extract_app(&[true, false, true, false, true]);
+        assert_eq!(counts(&app).0, 3);
+    }
+
+    /// The headline measurement for the visibility gate, stated as work
+    /// removed: eight emitters in the scene, three of them hidden, and the
+    /// render world is handed five. Frame time is not measured and cannot be
+    /// from here.
+    #[test]
+    fn hiding_three_of_eight_emitters_removes_their_extract_and_their_dispatches() {
+        let all_visible = extract_app(&[true; 8]);
+        let three_hidden = extract_app(&[
+            true, true, false, true, false, true, false, true,
+        ]);
+
+        assert_eq!(counts(&all_visible), (8, 8 * STEPS_PER_EMITTER));
+        assert_eq!(counts(&three_hidden), (5, 5 * STEPS_PER_EMITTER));
     }
 }

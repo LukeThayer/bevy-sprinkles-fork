@@ -468,6 +468,19 @@ fn handle_drive_trigger_click(
 /// (`Added<DriveRowsContainer>`), on any dirty edit (an add/delete/edit
 /// anywhere -- including ones this module itself just committed), or on an
 /// emitter-selection change (the target this button now means has changed).
+///
+/// **`dirty_state.is_changed()` is what keeps this popover and `drives.rs`'s
+/// Drives list agreeing**, and it is load-bearing rather than incidental.
+/// The same drive can be open in both at once, and both spawn their rows
+/// through [`spawn_drive_row`], which reads `drive.output` out of the asset
+/// at rebuild time -- neither holds an edited copy. So an edit committed in
+/// either surface reaches the other for one reason only: the commit
+/// observers flip the dirty flag, and both lists watch it. A commit path
+/// that mutated a drive WITHOUT dirtying would leave whichever surface did
+/// not host it displaying a stale number indefinitely, which is why
+/// `tests::an_output_edit_dirties_so_the_other_surface_rebuilds` pins the
+/// output commit specifically (delete and reorder are already pinned in
+/// `drives.rs`).
 fn rebuild_drive_rows(
     mut commands: Commands,
     editor_state: Res<EditorState>,
@@ -1074,6 +1087,98 @@ mod tests {
         app.world_mut().trigger(CheckboxCommitEvent {
             entity: checkbox_entity,
             checked: false,
+        });
+
+        assert!(
+            !app.world().resource::<DirtyState>().has_unsaved_changes,
+            "committing the already-current value must not dirty the project"
+        );
+    }
+
+    // --- The two output editors agreeing ------------------------------
+    //
+    // `Drive::output` is editable from two surfaces at once: this popover
+    // and `drives.rs`'s Drives list. Both spawn their rows through the one
+    // `spawn_drive_row` and read `drive.output` from the asset at rebuild
+    // time, so neither can hold a stale edited copy -- what they can do is
+    // fail to REBUILD, and both watch exactly one signal for that,
+    // `DirtyState::is_changed()`. These pin the output commit's end of that
+    // contract, which `rebuild_drive_rows`' doc states in full.
+
+    fn app_with_an_output_field(min: f32, max: f32) -> (App, Entity, Handle<ParticlesAsset>) {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.init_resource::<DirtyState>();
+        app.add_observer(handle_drive_output_commit);
+
+        let mut asset = asset_with_one_variable_one_emitter();
+        upsert_drive(
+            &mut asset,
+            DriveTarget::Emitter {
+                index: 0,
+                prop: EmitterProp::SizeMul,
+            },
+            VariableId(0),
+        );
+        asset.drives[0].output = ParticleRange { min, max };
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(asset)
+        };
+        app.insert_resource(EditorState {
+            current_project: Some(handle.clone()),
+            current_project_path: None,
+            inspecting: None,
+        });
+
+        let field = app
+            .world_mut()
+            .spawn(DriveOutputField {
+                index: 0,
+                bound: OutputBound::Min,
+            })
+            .id();
+        (app, field, handle)
+    }
+
+    #[test]
+    fn an_output_edit_dirties_so_the_other_surface_rebuilds() {
+        // One row's commit is the only thing that tells the OTHER surface
+        // its copy of this number is out of date. Drop the dirty flip and
+        // the popover and the Drives list disagree until something else
+        // happens to dirty the project.
+        let (mut app, field, handle) = app_with_an_output_field(1.0, 1.0);
+
+        app.world_mut().trigger(TextEditCommitEvent {
+            entity: field,
+            text: "0.25".into(),
+        });
+
+        let asset = app
+            .world()
+            .resource::<Assets<ParticlesAsset>>()
+            .get(&handle)
+            .unwrap();
+        assert_eq!(asset.drives[0].output.min, 0.25, "the asset is the truth");
+        assert!(
+            app.world().resource::<DirtyState>().has_unsaved_changes,
+            "without this flip neither row list rebuilds and the two \
+             surfaces show different numbers for the same drive"
+        );
+    }
+
+    #[test]
+    fn re_committing_the_same_output_value_does_not_spuriously_dirty() {
+        // The read-compare-write half, mirroring the mute pair above: a
+        // repaint of one surface must not read as an edit to the other.
+        let (mut app, field, _) = app_with_an_output_field(1.0, 1.0);
+
+        app.world_mut().trigger(TextEditCommitEvent {
+            entity: field,
+            text: "1.0".into(),
         });
 
         assert!(

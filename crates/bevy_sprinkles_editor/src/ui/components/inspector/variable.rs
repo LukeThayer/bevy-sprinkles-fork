@@ -36,14 +36,21 @@ struct VariableSection;
 #[derive(Component)]
 struct VariableContent;
 
-/// Marks the scrub text field's root entity with the variable name and
-/// declared range it previews -- deliberately not a `FieldBinding`, so the
-/// generic commit path never touches the asset for this field.
+/// Marks the scrub text field's root entity with the variable it previews --
+/// deliberately not a `FieldBinding`, so the generic commit path never
+/// touches the asset for this field.
+///
+/// The NAME is all it stores. It used to carry a copy of `decl.range` as
+/// well, captured when this section was built, and `on_scrub_commit` clamped
+/// against that copy -- but this section is built ONCE
+/// (`section_needs_setup` fires only while no content exists) while the
+/// `range` field three rows above it edits the asset, so widening a range
+/// left the scrub clamping to the old bounds with nothing on screen to
+/// explain why the number would not go past the old maximum. The bounds are
+/// read from the asset per commit now; see [`VariableScrub::set_clamped`].
 #[derive(Component)]
 struct ScrubField {
     name: String,
-    min: f32,
-    max: f32,
 }
 
 pub fn plugin(app: &mut App) {
@@ -140,8 +147,6 @@ fn setup_variable_content(
                     ))
                     .insert(ScrubField {
                         name: decl.name.clone(),
-                        min: decl.range.min,
-                        max: decl.range.max,
                     })
                     .insert(ChildOf(row_target));
             });
@@ -163,6 +168,8 @@ fn on_scrub_commit(
     trigger: On<TextEditCommitEvent>,
     fields: Query<&ScrubField>,
     parents: Query<&ChildOf>,
+    editor_state: Res<EditorState>,
+    assets: Res<Assets<ParticlesAsset>>,
     mut scrub: ResMut<VariableScrub>,
 ) {
     let Some((_, field)) = find_ancestor(trigger.entity, &fields, &parents) else {
@@ -171,14 +178,21 @@ fn on_scrub_commit(
     let Ok(value) = trigger.text.trim().parse::<f32>() else {
         return;
     };
-    let (lo, hi) = (field.min.min(field.max), field.min.max(field.max));
-    scrub.set(&field.name, value.clamp(lo, hi));
+    let Some(asset) = editor_state
+        .current_project
+        .as_ref()
+        .and_then(|h| assets.get(h))
+    else {
+        return;
+    };
+    scrub.set_clamped(&field.name, value, &asset.variables);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bevy::asset::AssetPlugin;
+    use bevy_sprinkles::asset::VariableDecl;
 
     use crate::io::EditorData;
     use crate::state::{DirtyState, Inspecting};
@@ -257,8 +271,6 @@ mod tests {
             .world_mut()
             .spawn(ScrubField {
                 name: "temperature".into(),
-                min: 0.0,
-                max: 1.0,
             })
             .id();
         let leaf = app.world_mut().spawn((EditorTextEdit, ChildOf(root))).id();
@@ -307,6 +319,104 @@ mod tests {
         assert!(
             app.world().resource::<DirtyState>().has_unsaved_changes,
             "an ordinary bound field must still dirty on commit"
+        );
+    }
+
+    /// An app carrying the real `on_scrub_commit` observer and one declared
+    /// variable, so a commit can be driven end to end against a range the
+    /// test then edits out from under the control.
+    fn scrub_app(range: ParticleRange) -> (App, Handle<ParticlesAsset>) {
+        let mut app = test_app();
+        app.init_resource::<VariableScrub>();
+        app.add_observer(on_scrub_commit);
+
+        let handle = app
+            .world()
+            .resource::<EditorState>()
+            .current_project
+            .clone()
+            .unwrap();
+        {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut asset = assets.get_mut(&handle).unwrap();
+            asset.variables = vec![VariableDecl {
+                name: "temperature".into(),
+                range,
+                ..Default::default()
+            }];
+        }
+        (app, handle)
+    }
+
+    fn commit_scrub(app: &mut App, text: &str) {
+        let root = app
+            .world_mut()
+            .spawn(ScrubField {
+                name: "temperature".into(),
+            })
+            .id();
+        let leaf = app.world_mut().spawn((EditorTextEdit, ChildOf(root))).id();
+        app.update();
+        app.world_mut().trigger(TextEditCommitEvent {
+            entity: leaf,
+            text: text.into(),
+        });
+        app.update();
+    }
+
+    /// The desync this whole change exists for: the range field and the
+    /// scrub control are two editors of the same variable, and the scrub
+    /// used to clamp against a copy of the range captured when its section
+    /// was built. Widening the range then did nothing -- the control went on
+    /// refusing anything past the old maximum, with no error and nothing on
+    /// screen to blame.
+    ///
+    /// The two commits below are the same text against two different ranges.
+    /// The first pins that clamping still happens at all (so the second is
+    /// not passing merely because the clamp was deleted).
+    #[test]
+    fn widening_a_variables_range_widens_what_the_scrub_accepts() {
+        let (mut app, handle) = scrub_app(ParticleRange { min: 0.0, max: 1.0 });
+
+        commit_scrub(&mut app, "5.0");
+        assert_eq!(
+            app.world().resource::<VariableScrub>().get("temperature"),
+            Some(1.0),
+            "5.0 must clamp to the declared maximum of 1.0"
+        );
+
+        {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut asset = assets.get_mut(&handle).unwrap();
+            asset.variables[0].range = ParticleRange {
+                min: 0.0,
+                max: 10.0,
+            };
+        }
+
+        commit_scrub(&mut app, "5.0");
+        assert_eq!(
+            app.world().resource::<VariableScrub>().get("temperature"),
+            Some(5.0),
+            "the clamp must follow the range the asset declares NOW, not the \
+             one captured when the control was built"
+        );
+    }
+
+    /// A scrub on a name the asset no longer declares is dropped rather than
+    /// stored unclamped -- `retain_declared` would evict it on the next
+    /// frame anyway, and storing it flashes a ghost value in between.
+    #[test]
+    fn a_scrub_on_an_undeclared_variable_stores_nothing() {
+        let (mut app, handle) = scrub_app(ParticleRange { min: 0.0, max: 1.0 });
+        {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.get_mut(&handle).unwrap().variables.clear();
+        }
+        commit_scrub(&mut app, "0.5");
+        assert_eq!(
+            app.world().resource::<VariableScrub>().get("temperature"),
+            None
         );
     }
 }

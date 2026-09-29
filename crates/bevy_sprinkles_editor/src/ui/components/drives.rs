@@ -398,6 +398,13 @@ fn setup_drives_section(mut commands: Commands, panels: Query<Entity, Added<Edit
 /// is the mechanism that keeps every row-marker index correct after a delete
 /// or a move (see the module doc's reuse note and the `tests` module's
 /// stale-index pins).
+///
+/// It is also the mechanism that keeps this list agreeing with the per-field
+/// popover, which can be showing the SAME drive at the same time: both build
+/// their rows from `asset.drives` and neither holds an edited copy, so an
+/// edit committed in one shows up in the other on the next tick and only
+/// because the commit observer dirtied. `drive_button::rebuild_drive_rows`'
+/// doc carries the full statement of that coupling.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_drives_list(
     mut commands: Commands,

@@ -56,6 +56,34 @@ impl VariableScrub {
         self.0.get(name).copied()
     }
 
+    /// Stores a scrubbed value clamped to the variable's range **as the
+    /// asset declares it right now**, rather than to whatever the range was
+    /// when the control was built.
+    ///
+    /// The bounds are looked up here, per commit, on purpose. The editor's
+    /// range field and its scrub control are two separate surfaces onto the
+    /// same variable, and the scrub control used to carry its own copy of
+    /// `decl.range` captured at setup time -- so widening the range in the
+    /// inspector left the scrub still clamping to the old one, with nothing
+    /// on screen to explain why the number would not go past 1.0. Deriving
+    /// the bounds from the asset is the fix that cannot be forgotten;
+    /// re-syncing a stored copy is the one that already was.
+    ///
+    /// An undeclared name is ignored rather than stored unclamped:
+    /// [`retain_declared`](Self::retain_declared) would drop the entry on
+    /// the next frame anyway, and storing it would flash a ghost value in
+    /// between.
+    pub fn set_clamped(&mut self, name: &str, value: f32, decls: &[VariableDecl]) {
+        let Some(decl) = decls.iter().find(|d| d.name == name) else {
+            return;
+        };
+        let (lo, hi) = (
+            decl.range.min.min(decl.range.max),
+            decl.range.min.max(decl.range.max),
+        );
+        self.set(name, value.clamp(lo, hi));
+    }
+
     pub fn value_or_default(&self, name: &str, decls: &[VariableDecl]) -> f32 {
         self.get(name).unwrap_or_else(|| {
             decls

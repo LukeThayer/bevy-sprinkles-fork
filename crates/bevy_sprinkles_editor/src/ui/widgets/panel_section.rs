@@ -21,6 +21,16 @@ struct PanelSectionButtonsContainer;
 #[derive(Component)]
 pub struct PanelSectionAddButton(pub Entity);
 
+/// A second, independently-clickable add affordance beside the primary one
+/// (`PanelSectionAddButton`) -- e.g. the Emitters section's "Add Mesh FX"
+/// preset sitting next to its plain "Add Emitter". Kept as its own component
+/// and event (`SecondaryButtonClickEvent`) rather than reusing
+/// `PanelSectionAddButton`/`ButtonClickEvent`, because both buttons redirect
+/// through the same section entity: a single shared event type would leave
+/// the section's observer unable to tell which of the two was pressed.
+#[derive(Component)]
+pub struct PanelSectionSecondaryAddButton(pub Entity);
+
 #[derive(Component)]
 struct PanelSectionCollapseButton(Entity);
 
@@ -31,6 +41,7 @@ struct Collapsed(bool);
 struct PanelSectionState {
     has_add_button: bool,
     collapsible: bool,
+    secondary_add_icon: Option<String>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -55,6 +66,7 @@ pub struct PanelSectionProps {
     pub size: PanelSectionSize,
     pub has_add_button: bool,
     pub collapsible: bool,
+    pub secondary_add_icon: Option<String>,
 }
 
 impl PanelSectionProps {
@@ -75,6 +87,15 @@ impl PanelSectionProps {
         self
     }
 
+    /// A second add-affordance icon button, placed beside the primary one.
+    /// Its clicks arrive as `SecondaryButtonClickEvent` rather than
+    /// `ButtonClickEvent`, so it needs its own `.observe()` on the section
+    /// entity distinct from the primary add button's.
+    pub fn with_secondary_add_button(mut self, icon: impl Into<String>) -> Self {
+        self.secondary_add_icon = Some(icon.into());
+        self
+    }
+
     pub fn collapsible(mut self) -> Self {
         self.collapsible = true;
         self
@@ -87,6 +108,7 @@ pub fn panel_section(props: PanelSectionProps) -> impl Scene {
         size,
         has_add_button,
         collapsible,
+        secondary_add_icon,
     } = props;
     let padding = size.padding();
 
@@ -104,6 +126,7 @@ pub fn panel_section(props: PanelSectionProps) -> impl Scene {
         template_value(PanelSectionState {
             has_add_button,
             collapsible,
+            secondary_add_icon,
         })
         Children [
             (
@@ -167,6 +190,19 @@ fn setup_panel_section_buttons(
             commands.entity(container_entity).add_child(add_entity);
         }
 
+        if let Some(icon) = &state.secondary_add_icon {
+            let secondary_entity = commands
+                .spawn_scene(icon_button(
+                    IconButtonProps::new(icon.clone()).variant(ButtonVariant::Ghost),
+                ))
+                .insert(PanelSectionSecondaryAddButton(section_entity))
+                .observe(on_secondary_add_click)
+                .id();
+            commands
+                .entity(container_entity)
+                .add_child(secondary_entity);
+        }
+
         if state.collapsible {
             let collapse_entity = commands
                 .spawn_scene(icon_button(
@@ -196,6 +232,27 @@ fn on_add_click(
     };
     commands.trigger(ButtonClickEvent {
         entity: add_button.0,
+    });
+}
+
+/// Fired at the section entity when its secondary add button is clicked.
+/// A distinct type from `ButtonClickEvent` -- see `PanelSectionSecondaryAddButton`'s
+/// doc comment for why the primary and secondary buttons cannot share one.
+#[derive(EntityEvent)]
+pub struct SecondaryButtonClickEvent {
+    pub entity: Entity,
+}
+
+fn on_secondary_add_click(
+    event: On<ButtonClickEvent>,
+    secondary_buttons: Query<&PanelSectionSecondaryAddButton>,
+    mut commands: Commands,
+) {
+    let Ok(secondary_button) = secondary_buttons.get(event.entity) else {
+        return;
+    };
+    commands.trigger(SecondaryButtonClickEvent {
+        entity: secondary_button.0,
     });
 }
 

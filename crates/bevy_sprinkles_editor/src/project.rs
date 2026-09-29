@@ -53,6 +53,10 @@ pub enum SaveResultStatus {
     SerializationError,
     WriteError(String),
     CreateError,
+    /// The asset broke an invariant `validate_drives` enforces at LOAD, so
+    /// writing it would produce a file the editor could not reopen. Carries
+    /// `validate_drives`' own message, which names the offender.
+    Invalid(String),
 }
 
 #[derive(Resource, Clone)]
@@ -205,16 +209,47 @@ fn poll_browse_open_result(result: Option<Res<BrowseOpenResult>>, mut commands: 
     }
 }
 
+/// The write barrier: validates, then serializes, returning the bytes a save
+/// may put on disk.
+///
+/// `validate_drives` is the loader's own gate (`asset::versions::finish` runs
+/// it on every successful parse), and until this existed nothing ran it on the
+/// way OUT. Two one-keystroke paths through the Variables Name field produced
+/// a file the editor could not reopen: clearing the name, and renaming to a
+/// duplicate. Both are legal intermediate states while editing, which is why
+/// the editor does not forbid them -- it refuses to WRITE them, and says why.
+///
+/// This is a write barrier, not an edit check. It also closes the whole class
+/// of positional-renumbering defects the delete/duplicate helpers each guard
+/// individually (`data_panel::remove_emitter` and friends), including any
+/// instance nobody has found: no path through this editor can serialize an
+/// asset the loader would reject, wherever the breakage came from.
+pub(crate) fn prepare_save_contents(
+    asset: &bevy_sprinkles::asset::ParticlesAsset,
+) -> Result<String, SaveResultStatus> {
+    bevy_sprinkles::asset::drive::validate_drives(asset)
+        .map_err(SaveResultStatus::Invalid)?;
+    ron::ser::to_string_pretty(asset, ron::ser::PrettyConfig::default())
+        .map_err(|_| SaveResultStatus::SerializationError)
+}
+
+/// Writes `asset` to `path`, or refuses and reports why.
+///
+/// Returns whether a write was actually dispatched, so a caller can leave the
+/// project dirty on a refusal instead of marking it saved.
 pub fn save_project_to_path(
     path: PathBuf,
     asset: &bevy_sprinkles::asset::ParticlesAsset,
     result: Arc<Mutex<Option<SaveResultStatus>>>,
-) {
-    let Ok(contents) = ron::ser::to_string_pretty(asset, ron::ser::PrettyConfig::default()) else {
-        if let Ok(mut guard) = result.lock() {
-            *guard = Some(SaveResultStatus::SerializationError);
+) -> bool {
+    let contents = match prepare_save_contents(asset) {
+        Ok(contents) => contents,
+        Err(status) => {
+            if let Ok(mut guard) = result.lock() {
+                *guard = Some(status);
+            }
+            return false;
         }
-        return;
     };
 
     IoTaskPool::get()
@@ -238,6 +273,7 @@ pub fn save_project_to_path(
             }
         })
         .detach();
+    true
 }
 
 fn on_save_project_event(
@@ -256,9 +292,15 @@ fn on_save_project_event(
 
     if let Some(path) = &editor_state.current_project_path {
         let result = Arc::new(Mutex::new(None));
-        save_project_to_path(path.clone(), asset, result.clone());
+        let wrote = save_project_to_path(path.clone(), asset, result.clone());
         commands.insert_resource(SaveResult(result));
-        dirty_state.has_unsaved_changes = false;
+        // A refused save leaves the project dirty. Clearing the flag on a
+        // refusal would tell the author their work is on disk when the file
+        // was never touched -- and the next thing many authors do after Ctrl+S
+        // is close the window.
+        if wrote {
+            dirty_state.has_unsaved_changes = false;
+        }
     } else {
         commands.trigger(SaveProjectAsEvent);
     }
@@ -276,6 +318,15 @@ fn on_save_project_as_event(
     let Some(asset) = assets.get(handle) else {
         return;
     };
+
+    // Checked BEFORE the file dialog opens, not only inside the write: asking
+    // an author where to put a file and then refusing to write it is a worse
+    // way to deliver the same refusal. `save_project_to_path` still re-checks
+    // -- it is the barrier, this is only the early exit.
+    if let Err(SaveResultStatus::Invalid(message)) = prepare_save_contents(asset) {
+        commands.trigger(ToastEvent::error(format!("Cannot save: {message}")));
+        return;
+    }
 
     let projects_dir = projects_dir();
     let default_name = format!("{}.ron", asset.name.to_kebab_case());
@@ -366,6 +417,12 @@ fn poll_save_result(result: Option<Res<SaveResult>>, mut commands: Commands) {
             SaveResultStatus::CreateError => {
                 commands.trigger(ToastEvent::error("Failed to create project file"));
             }
+            // `validate_drives`' own wording, verbatim: it names the offender
+            // ("duplicate variable name \"heat\""), which a generic "invalid
+            // project" would throw away.
+            SaveResultStatus::Invalid(message) => {
+                commands.trigger(ToastEvent::error(format!("Cannot save: {message}")));
+            }
         }
         commands.remove_resource::<SaveResult>();
     }
@@ -379,5 +436,108 @@ fn handle_save_keyboard_shortcut(keyboard: Res<ButtonInput<KeyCode>>, mut comman
 
     if ctrl_or_cmd && keyboard.just_pressed(KeyCode::KeyS) {
         commands.trigger(SaveProjectEvent);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_sprinkles::asset::{
+        EmitterData, ParticlesAsset, ParticlesAuthors, ParticlesDimension, VariableDecl,
+    };
+
+    fn asset_with(variables: Vec<VariableDecl>) -> ParticlesAsset {
+        let mut a = ParticlesAsset::new(
+            "t".into(),
+            ParticlesDimension::D3,
+            Default::default(),
+            vec![EmitterData::default()],
+            vec![],
+            false,
+            ParticlesAuthors::default(),
+        );
+        a.variables = variables;
+        a
+    }
+
+    fn named(name: &str) -> VariableDecl {
+        VariableDecl {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// One keystroke in the Variables Name field: select all, delete.
+    #[test]
+    fn a_variable_with_no_name_refuses_to_save() {
+        let asset = asset_with(vec![named("")]);
+        match prepare_save_contents(&asset) {
+            Err(SaveResultStatus::Invalid(message)) => {
+                assert!(message.contains("empty"), "must say what is wrong: {message}");
+            }
+            Err(_) => panic!("must be refused as Invalid, not as a serialization failure"),
+            Ok(_) => panic!("the loader rejects this file, so the editor must not write it"),
+        }
+    }
+
+    /// The other one-keystroke path: rename a variable onto its neighbour.
+    #[test]
+    fn two_variables_sharing_a_name_refuse_to_save() {
+        let asset = asset_with(vec![named("heat"), named("heat")]);
+        match prepare_save_contents(&asset) {
+            Err(SaveResultStatus::Invalid(message)) => {
+                assert!(
+                    message.contains("heat"),
+                    "must name the offender so the author can find it: {message}"
+                );
+            }
+            Err(_) => panic!("must be refused as Invalid, not as a serialization failure"),
+            Ok(_) => panic!("the loader rejects this file, so the editor must not write it"),
+        }
+    }
+
+    /// The barrier must not be a wall. Round-trips the bytes back through the
+    /// REAL loader (`migrate_str`, which runs `validate_drives` itself), so
+    /// this pins the actual contract -- "what the editor writes, the editor
+    /// reopens" -- rather than merely that `Ok` came back.
+    #[test]
+    fn a_valid_asset_still_saves_and_the_bytes_reload() {
+        let asset = asset_with(vec![named("heat")]);
+        let contents = prepare_save_contents(&asset).unwrap_or_else(|_| {
+            panic!("a valid asset must still serialize");
+        });
+        bevy_sprinkles::asset::versions::migrate_str(&contents)
+            .expect("the loader must accept what the editor just wrote");
+    }
+
+    /// The refusal reaches the real write path, and nothing lands on disk.
+    /// `IoTaskPool` is deliberately never initialised here: if the barrier
+    /// ever stopped short-circuiting, `save_project_to_path` would reach
+    /// `IoTaskPool::get()` and panic, which is a louder failure than a missing
+    /// file and a fine second signal.
+    #[test]
+    fn a_refused_save_writes_no_file_and_reports_why() {
+        let dir = std::env::temp_dir().join(format!(
+            "sprinkles-save-barrier-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("refused.ron");
+        let _ = std::fs::remove_file(&path);
+
+        let asset = asset_with(vec![named("heat"), named("heat")]);
+        let result = Arc::new(Mutex::new(None));
+        let wrote = save_project_to_path(path.clone(), &asset, result.clone());
+
+        assert!(!wrote, "a refused save must report that it did not write");
+        assert!(!path.exists(), "nothing may reach disk");
+        assert!(
+            matches!(
+                result.lock().unwrap().as_ref(),
+                Some(SaveResultStatus::Invalid(_))
+            ),
+            "the refusal must be surfaced, not swallowed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

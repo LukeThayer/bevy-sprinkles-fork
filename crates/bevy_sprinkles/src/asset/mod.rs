@@ -1,15 +1,30 @@
 mod curve;
+/// Variable-to-property wiring.
+pub mod drive;
+/// Stylized-FX material settings (scroll, flow, erosion, fresnel, soft fade,
+/// gradient remap) and their GPU uniform.
+pub mod fx;
 mod gradient;
+/// Effect-owned scene lights.
+pub mod light;
 mod particle_material;
 pub(crate) mod serde_helpers;
+/// Effect-declared variables the host drives per instance.
+pub mod variables;
 /// Asset format versioning, validation, and migration.
 pub mod versions;
 
 pub use curve::{Curve, CurveEasing, CurveMode, CurvePoint, CurveTexture};
+pub use drive::{
+    DRIVE_SLOT_COUNT, Drive, DriveOp, DriveTarget, EmitterProp, LightProp, Stage, TransformProp,
+};
+pub use fx::{FxSettings, FxUniform};
 pub use gradient::{Gradient, GradientInterpolation, GradientStop, SolidOrGradientColor};
+pub use light::{FxLightKind, LightData};
 pub use particle_material::{
     DrawPassMaterial, SerializableAlphaMode, SerializableFace, StandardParticleMaterial,
 };
+pub use variables::{VariableDecl, VariableId};
 
 use bevy::{
     asset::{AssetLoader, LoadContext, io::Reader},
@@ -122,7 +137,7 @@ impl DrawOrder {
 }
 
 /// Timing and lifecycle configuration for an emitter.
-#[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
 #[serde(default)]
 pub struct EmitterTime {
     /// The amount of time each particle will exist, in seconds.
@@ -1413,6 +1428,15 @@ pub struct ParticlesAsset {
     /// Optional colliders that particles can interact with.
     #[serde(default)]
     pub colliders: Vec<ColliderData>,
+    /// Knobs this effect exposes to the host game. See [`VariableDecl`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<VariableDecl>,
+    /// Wiring from variables to properties. See [`Drive`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drives: Vec<Drive>,
+    /// Lights this effect owns. See [`LightData`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lights: Vec<LightData>,
     /// Whether to despawn the particle system entity when all one-shot emitters finish.
     ///
     /// Defaults to `false`.
@@ -1444,9 +1468,138 @@ impl ParticlesAsset {
             initial_transform,
             emitters,
             colliders,
+            variables: Vec::new(),
+            drives: Vec::new(),
+            lights: Vec::new(),
             despawn_on_finish,
             authors,
             sprinkles_editor: SprinklesEditorData::default(),
         }
+    }
+}
+
+/// An emitter configured as a single pinned mesh, rather than a particle spray.
+///
+/// The design originally had a separate `MeshEffectData` object -- a non-particle
+/// mesh with its own transform, material and timing, for cones, rings, beams and
+/// shockwaves. It was cut during brainstorming: an emitter shaped like this
+/// (`particles_amount: 1`, `one_shot: true`, zero velocity/spread/gravity,
+/// `use_local_coords: true`, `transform_align: None`) already IS one, and it
+/// arrives with lifetime curves, gradients, timing, sub-emitters and the entire
+/// existing inspector already working. A separate object type would have
+/// re-implemented all of that to reach the same place, and would have made
+/// bursts of N expanding rings *harder* rather than easier.
+///
+/// This function is the convenience that cut bought: one call (one editor click)
+/// instead of six hand-set fields. It configures no new runtime behaviour --
+/// nothing here exists outside `EmitterData`'s ordinary fields.
+///
+/// Zeroing `accelerations.gravity` is required, not optional polish:
+/// `EmitterAccelerations::default()` is `(0.0, -9.8, 0.0)`, applied every
+/// simulation step regardless of `use_local_coords` or velocity (gravity is
+/// an acceleration, not a velocity, so a zero initial velocity does not
+/// cancel it). Leaving it at the default would make the "pinned" mesh fall.
+pub fn mesh_fx_emitter() -> EmitterData {
+    EmitterData {
+        name: "Mesh FX".to_string(),
+        time: EmitterTime {
+            one_shot: true,
+            ..Default::default()
+        },
+        draw_pass: EmitterDrawPass {
+            use_local_coords: true,
+            transform_align: None,
+            // A hollow cone, not a solid one: `cap_top` is inert either way
+            // since `top_radius: 0.0` already collapses the top to a point,
+            // but `cap_bottom` is a deliberate choice, not an oversight --
+            // the base sits at the emitter's own origin, which is normally
+            // hidden behind or inside whatever the effect is attached to, so
+            // a closing cap there would spend triangles on a face nothing
+            // ever sees.
+            mesh: ParticleMesh::Cylinder {
+                top_radius: 0.0,
+                bottom_radius: 1.0,
+                height: 2.0,
+                radial_segments: 16,
+                rings: 1,
+                cap_top: false,
+                cap_bottom: false,
+            },
+            ..Default::default()
+        },
+        emission: EmitterEmission {
+            particles_amount: 1,
+            ..Default::default()
+        },
+        velocities: EmitterVelocities {
+            initial_velocity: Range::new(0.0, 0.0),
+            spread: 0.0,
+            ..Default::default()
+        },
+        accelerations: EmitterAccelerations {
+            gravity: Vec3::ZERO,
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod mesh_fx_tests {
+    use super::*;
+
+    #[test]
+    fn the_mesh_fx_preset_produces_a_single_pinned_mesh_particle() {
+        let e = mesh_fx_emitter();
+        assert_eq!(
+            e.emission.particles_amount, 1,
+            "one particle -- it IS the mesh"
+        );
+        assert!(e.time.one_shot);
+        assert_eq!(
+            e.velocities.initial_velocity,
+            Range::new(0.0, 0.0),
+            "it must not drift"
+        );
+        assert!(e.draw_pass.use_local_coords, "it must follow the effect");
+        assert!(
+            e.draw_pass.transform_align.is_none(),
+            "it must not billboard"
+        );
+    }
+
+    #[test]
+    fn the_mesh_fx_preset_has_zero_spread_and_a_cone_shaped_default_mesh() {
+        let e = mesh_fx_emitter();
+        assert_eq!(
+            e.velocities.spread, 0.0,
+            "spread must not drift the mesh either"
+        );
+        match e.draw_pass.mesh {
+            ParticleMesh::Cylinder {
+                top_radius,
+                bottom_radius,
+                ..
+            } => {
+                assert_eq!(top_radius, 0.0, "a cone: pinched to a point at the top");
+                assert!(bottom_radius > 0.0);
+            }
+            other => panic!("expected a Cylinder mesh (a cone via top_radius 0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_mesh_fx_preset_gets_a_recognisable_default_name() {
+        // Not load-bearing behaviour, but a name of "Emitter" would make it
+        // indistinguishable from a plain `Add Emitter` in the outliner list.
+        assert_eq!(mesh_fx_emitter().name, "Mesh FX");
+    }
+
+    #[test]
+    fn the_mesh_fx_preset_has_no_gravity_so_the_pinned_mesh_does_not_fall() {
+        // `EmitterAccelerations::default()` is `(0.0, -9.8, 0.0)`, applied every
+        // simulation step regardless of `use_local_coords` or velocity -- a
+        // zero initial velocity does not cancel an acceleration. Without this,
+        // a "pinned" mesh visibly falls over its lifetime.
+        assert_eq!(mesh_fx_emitter().accelerations.gravity, Vec3::ZERO);
     }
 }

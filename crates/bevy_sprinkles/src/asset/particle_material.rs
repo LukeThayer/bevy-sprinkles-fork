@@ -2,6 +2,7 @@ use bevy::{material::AlphaMode, prelude::*, render::render_resource::Face};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
+use super::fx::FxSettings;
 use super::serde_helpers::{is_false, is_true, is_zero_f32};
 use crate::textures::preset::TextureRef;
 
@@ -423,6 +424,15 @@ pub struct StandardParticleMaterial {
     ///
     /// Normals, occlusion textures, roughness, metallic, reflectance, emissive,
     /// shadows, alpha mode and ambient light are ignored if this is set to `true`.
+    ///
+    /// Forwarded to [`StandardMaterial::unlit`] by `to_standard_material`
+    /// below, which is what actually makes this work: the particle
+    /// fragment shader reads it back out at runtime
+    /// (`STANDARD_MATERIAL_FLAGS_UNLIT_BIT` in
+    /// `shaders/particle_material.wgsl`'s forward fragment) rather than
+    /// through a compile-time shader def -- see the comment beside that
+    /// read for why a def is unnecessary here, in a shader that does not
+    /// share bevy's own `pbr.wgsl` unlit-gating pitfall.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unlit: bool,
 
@@ -441,6 +451,14 @@ pub struct StandardParticleMaterial {
     /// Defaults to `0.0`.
     #[serde(default, skip_serializing_if = "is_zero_f32")]
     pub depth_bias: f32,
+
+    /// Stylized-FX settings. See [`FxSettings`]; defaults to entirely inert.
+    #[serde(default, skip_serializing_if = "is_default_fx")]
+    pub fx: FxSettings,
+}
+
+fn is_default_fx(f: &FxSettings) -> bool {
+    *f == FxSettings::default()
 }
 
 impl Default for StandardParticleMaterial {
@@ -475,6 +493,7 @@ impl Default for StandardParticleMaterial {
             unlit: false,
             fog_enabled: true,
             depth_bias: 0.0,
+            fx: FxSettings::default(),
         }
     }
 }
@@ -558,6 +577,7 @@ impl StandardParticleMaterial {
             unlit: material.unlit,
             fog_enabled: material.fog_enabled,
             depth_bias: material.depth_bias,
+            fx: FxSettings::default(),
         }
     }
 
@@ -605,6 +625,7 @@ impl StandardParticleMaterial {
         self.unlit.hash(&mut hasher);
         self.fog_enabled.hash(&mut hasher);
         hash_f32(&mut hasher, self.depth_bias);
+        self.fx.cache_key().hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -648,5 +669,80 @@ impl DrawPassMaterial {
             }
         }
         hasher.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::app::ScheduleRunnerPlugin;
+    use bevy::asset::AssetPlugin;
+    use bevy::prelude::{App, MinimalPlugins};
+    use std::time::Duration;
+
+    /// A minimal `App` good enough to hand `to_standard_material` a real
+    /// `AssetServer` -- neither material built below sets a texture, so
+    /// `load_tex`'s `Option::map` never actually calls `asset_server.load`,
+    /// and no fixture files need to exist on disk for this test.
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(
+            MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(10))),
+        );
+        app.add_plugins(AssetPlugin::default());
+        app
+    }
+
+    /// `unlit` is the one field the particle fragment shader reads back at
+    /// runtime (`STANDARD_MATERIAL_FLAGS_UNLIT_BIT` in
+    /// `shaders/particle_material.wgsl`'s forward fragment) to decide
+    /// whether to light a particle at all. That only works if the authored
+    /// flag actually survives the trip through `to_standard_material` into
+    /// the `StandardMaterial` bevy's PBR pipeline sets the flag bit from --
+    /// nothing else pins the `unlit: self.unlit` forward line above, and a
+    /// silently dropped forward would look, in play, exactly like the
+    /// dead-shader-def bug this task removed (`FxDefs.lit`/`FX_LIT`): a
+    /// setting that appears to exist and does nothing.
+    #[test]
+    fn to_standard_material_forwards_the_unlit_flag_in_both_directions() {
+        let app = test_app();
+        let asset_server = app.world().resource::<AssetServer>();
+
+        let lit = StandardParticleMaterial {
+            unlit: false,
+            ..Default::default()
+        };
+        let unlit = StandardParticleMaterial {
+            unlit: true,
+            ..Default::default()
+        };
+
+        assert!(!lit.to_standard_material(asset_server, &[]).unlit);
+        assert!(unlit.to_standard_material(asset_server, &[]).unlit);
+    }
+
+    /// Task 22's material-rebuild question, pinned at the exact seam
+    /// `sync_particle_material` (`spawning.rs`) reads: it compares
+    /// `StandardParticleMaterial::cache_key()`, not `FxSettings::cache_key()`
+    /// directly, every frame, for every emitter, unconditionally (no
+    /// `Changed<>` filter -- it re-derives `new_material` from the asset
+    /// fresh each tick and only SKIPS the rebuild when the two keys already
+    /// match). `FxSettings`'s own tests already pin that ITS `cache_key`
+    /// changes with a field; this test pins that the fold at line ~628
+    /// (`self.fx.cache_key().hash(&mut hasher)`) actually carries that
+    /// change up into the key `sync_particle_material` looks at, so an
+    /// fx-only edit is never mistaken for "nothing changed" the way Task
+    /// 21's light bug mistook a spawn-only read for a live one.
+    #[test]
+    fn an_fx_only_difference_changes_the_materials_own_cache_key() {
+        let a = StandardParticleMaterial::default();
+        let b = StandardParticleMaterial {
+            fx: FxSettings {
+                scroll: bevy::math::Vec2::new(0.0, 0.4),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_ne!(a.cache_key(), b.cache_key());
     }
 }

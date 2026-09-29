@@ -87,6 +87,17 @@
 //! }
 //! ```
 //!
+//! # Host requirements
+//!
+//! One feature needs something from the consuming app's CAMERA rather than
+//! from this crate: an effect whose material sets
+//! [`FxSettings::soft_fade`](asset::FxSettings::soft_fade) above zero reads the
+//! view's depth texture, which only exists on a camera carrying bevy's
+//! [`DepthPrepass`](bevy::core_pipeline::prepass::DepthPrepass). Without it the
+//! fragment shader fails to COMPILE — an error that names a missing binding
+//! rather than the effect that asked for it, so it is worth knowing before
+//! meeting it.
+//!
 //! # Feature flags
 //!
 //! - `preset-textures` - Bundles a library of built-in particle
@@ -158,12 +169,13 @@
 /// Particle system asset definitions, emitter data, and serialization types.
 pub mod asset;
 mod compute;
+pub mod drives;
 mod extract;
+/// Effect-owned scene lights, driven by their own clock and by drives.
+pub mod lights;
 /// Particle material extension for GPU-driven particle rendering.
 pub mod material;
 mod mesh;
-/// Per-instance runtime overrides for particle systems.
-pub mod r#override;
 /// Convenience re-exports for common particle system types.
 pub mod prelude;
 /// Runtime components and state for active particle systems.
@@ -185,18 +197,18 @@ const SHADER_COMMON: Handle<Shader> = uuid_handle!("10b6a301-2396-4ce0-906a-b3e3
 use asset::{ParticlesAsset, ParticlesAssetLoader};
 use compute::ParticleComputePlugin;
 use extract::{extract_colliders, extract_particle_systems};
+use lights::{advance_light_clocks, setup_effect_lights, sync_effect_lights};
 use mesh::ParticleMeshCache;
 use runtime::check_particle_system_finished;
 use sort::ParticleSortPlugin;
 use spawning::{
-    apply_emissive_override, cleanup_particle_entities, setup_particle_systems, sync_collider_data,
-    sync_particle_buffers, sync_particle_material, sync_particle_mesh, update_particle_time,
-    write_emitter_uniforms,
+    cleanup_particle_entities, setup_particle_systems, sync_collider_data, sync_particle_buffers,
+    sync_particle_material, sync_particle_mesh, update_particle_time, write_emitter_uniforms,
 };
 use textures::{
     CurveTextureCache, FallbackCurveTexture, FallbackGradientTexture, GradientTextureCache,
-    bake_override_textures, create_fallback_curve_texture, create_fallback_gradient_texture,
-    prepare_curve_textures, prepare_gradient_textures,
+    create_fallback_curve_texture, create_fallback_gradient_texture, prepare_curve_textures,
+    prepare_gradient_textures,
 };
 
 /// Plugin that adds GPU particle system support to a Bevy app.
@@ -226,8 +238,6 @@ impl Plugin for SprinklesPlugin {
             .add_systems(Startup, create_fallback_curve_texture)
             .add_systems(PostUpdate, prepare_curve_textures);
 
-        app.add_systems(PostUpdate, bake_override_textures);
-
         app.init_resource::<ParticleMeshCache>();
 
         app.add_plugins(MaterialPlugin::<runtime::ParticleMaterial>::default());
@@ -239,11 +249,17 @@ impl Plugin for SprinklesPlugin {
                 sync_particle_buffers.after(setup_particle_systems),
                 sync_particle_mesh.after(sync_particle_buffers),
                 sync_particle_material,
-                apply_emissive_override.after(sync_particle_material),
                 sync_collider_data,
                 update_particle_time,
                 check_particle_system_finished.after(update_particle_time),
                 cleanup_particle_entities,
+                crate::drives::evaluate_drives,
+                crate::drives::apply_transform_drives.after(crate::drives::evaluate_drives),
+                setup_effect_lights,
+                advance_light_clocks.after(setup_effect_lights),
+                sync_effect_lights
+                    .after(advance_light_clocks)
+                    .after(crate::drives::evaluate_drives),
             ),
         );
 
@@ -272,6 +288,8 @@ pub use asset::{
     ParticleMesh, ParticlesColliderShape3D, ParticlesDimension, QuadOrientation, RibbonTrailShape,
     SerializableAlphaMode, StandardParticleMaterial, TransformAlign,
 };
+pub use drives::ParticleVariables;
+pub use lights::{EffectLightsSpawned, LightEntity, LightRuntime};
 pub use material::ParticleMaterialExtension;
 pub use runtime::{
     ColliderEntity, EmitterEntity, EmitterRuntime, Finished, ParticleBufferHandle, ParticleData,

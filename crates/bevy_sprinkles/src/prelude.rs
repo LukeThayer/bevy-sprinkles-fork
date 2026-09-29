@@ -10,6 +10,7 @@ pub use crate::asset::{
     ParticlesDimension, QuadOrientation, Range as ParticleRange, RibbonTrailShape,
     SerializableAlphaMode, SerializableFace, SolidOrGradientColor, SprinklesEditorData,
     StandardParticleMaterial, SubEmitterConfig, SubEmitterMode, TransformAlign, VisibilityAabb,
+    mesh_fx_emitter,
 };
 #[cfg(feature = "preset-textures")]
 pub use crate::textures::preset::PresetTexture;
@@ -21,4 +22,6 @@ pub use crate::runtime::{
     SubEmitterBufferHandle,
 };
 
-pub use crate::r#override::{ParticleEmitterOverrides, ParticleOverride};
+pub use crate::drives::ParticleVariables;
+
+pub use crate::lights::{EffectLightsSpawned, LightEntity, LightRuntime};

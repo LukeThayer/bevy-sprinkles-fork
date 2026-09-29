@@ -98,6 +98,14 @@ pub(super) fn get_inspected_data<'a>(
             let collider = asset.colliders.get(inspecting.index as usize)?;
             Some(collider)
         }
+        Inspectable::Variable => {
+            let variable = asset.variables.get(inspecting.index as usize)?;
+            Some(variable)
+        }
+        Inspectable::Light => {
+            let light = asset.lights.get(inspecting.index as usize)?;
+            Some(light)
+        }
     }
 }
 
@@ -116,6 +124,14 @@ pub(super) fn get_inspected_data_mut<'a>(
         Inspectable::Collider => {
             let collider = asset.colliders.get_mut(inspecting.index as usize)?;
             Some(collider)
+        }
+        Inspectable::Variable => {
+            let variable = asset.variables.get_mut(inspecting.index as usize)?;
+            Some(variable)
+        }
+        Inspectable::Light => {
+            let light = asset.lights.get_mut(inspecting.index as usize)?;
+            Some(light)
         }
     }
 }
@@ -441,7 +457,7 @@ impl ReflectPath {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) enum FieldValue {
     None,
     F32(f32),
@@ -676,30 +692,44 @@ pub(super) fn get_variant_index_by_reflection(
     variants.iter().position(|v| v.name == variant_name)
 }
 
+/// Resolves one field, unwrapping at most one enum "shell" first -- `value`
+/// itself may already be the struct/enum that owns `field_name` (the base
+/// case every call eventually bottoms out on), or it may be an enum whose
+/// active variant's sole tuple field owns it (an `Option<T>`, or a
+/// `DrawPassMaterial::Standard(StandardParticleMaterial)`-shaped wrapper).
+///
+/// Task 22 widened this from a one-shot "unwrap once, then check struct-or-
+/// enum" match into a recursion. That was needed because `FxSettings`
+/// (`draw_pass.material.fx.scroll`) is a STRUCT nested inside a struct
+/// nested inside an enum -- one hop deeper than any chain that existed
+/// before it (`alpha_mode.cutoff`, enum-in-enum, was the deepest case). The
+/// recursion is a strict superset of the old match: every path the old code
+/// resolved still resolves the same way, in exactly one more indirection
+/// (an enum whose inner is a struct still ends at `struct_ref.field(..)`).
+/// What it additionally reaches is `value` arriving as a plain STRUCT on
+/// entry -- which happens exactly when [`resolve_chained_variant_field_ref`]
+/// has already unwrapped one hop of a dotted chain into a struct and is now
+/// asking this function to resolve the next hop against that struct
+/// directly, with no further enum to unwrap.
 pub(crate) fn resolve_variant_field_ref<'a>(
     value: &'a dyn PartialReflect,
     field_name: &str,
 ) -> Option<&'a dyn PartialReflect> {
-    let ReflectRef::Enum(enum_ref) = value.reflect_ref() else {
-        return None;
-    };
-    if let Some(field) = enum_ref.field(field_name) {
-        return Some(field);
-    }
-    if let Some(inner) = enum_ref.field_at(0) {
-        match inner.reflect_ref() {
-            ReflectRef::Struct(struct_ref) => {
-                return struct_ref.field(field_name);
+    match value.reflect_ref() {
+        ReflectRef::Enum(enum_ref) => {
+            if let Some(field) = enum_ref.field(field_name) {
+                return Some(field);
             }
-            ReflectRef::Enum(inner_enum) => {
-                return inner_enum.field(field_name);
-            }
-            _ => {}
+            let inner = enum_ref.field_at(0)?;
+            resolve_variant_field_ref(inner, field_name)
         }
+        ReflectRef::Struct(struct_ref) => struct_ref.field(field_name),
+        _ => None,
     }
-    None
 }
 
+/// Mutable twin of [`resolve_variant_field_ref`]; see its doc for why the
+/// recursion (rather than a one-shot unwrap) is load-bearing.
 pub(super) fn with_variant_field_mut<F, R>(
     value: &mut dyn PartialReflect,
     field_name: &str,
@@ -708,31 +738,25 @@ pub(super) fn with_variant_field_mut<F, R>(
 where
     F: FnOnce(&mut dyn PartialReflect) -> R,
 {
-    let ReflectMut::Enum(enum_mut) = value.reflect_mut() else {
-        return None;
-    };
-    if let Some(field) = enum_mut.field_mut(field_name) {
-        return Some(f(field));
-    }
-    if let Some(inner) = enum_mut.field_at_mut(0) {
-        match inner.reflect_mut() {
-            ReflectMut::Struct(struct_mut) => {
-                if let Some(field) = struct_mut.field_mut(field_name) {
-                    return Some(f(field));
-                }
+    match value.reflect_mut() {
+        ReflectMut::Enum(enum_mut) => {
+            if let Some(field) = enum_mut.field_mut(field_name) {
+                return Some(f(field));
             }
-            ReflectMut::Enum(inner_enum) => {
-                if let Some(field) = inner_enum.field_mut(field_name) {
-                    return Some(f(field));
-                }
-            }
-            _ => {}
+            let inner = enum_mut.field_at_mut(0)?;
+            with_variant_field_mut(inner, field_name, f)
         }
+        ReflectMut::Struct(struct_mut) => struct_mut.field_mut(field_name).map(f),
+        _ => None,
     }
-    None
 }
 
-fn resolve_chained_variant_field_ref<'a>(
+/// `pub(crate)`: `texture_edit`'s `read_current_texture_ref` needs the same
+/// dotted-chain resolution `FieldBinding::resolve_ref` gets for free (Task
+/// 22 -- a texture field nested under `FxSettings`, e.g.
+/// `fx.flow_texture`, is a two-hop chain), but lives outside this module's
+/// parent and so cannot reach `FieldBinding`'s own `pub(super)` methods.
+pub(crate) fn resolve_chained_variant_field_ref<'a>(
     value: &'a dyn PartialReflect,
     field_name: &str,
 ) -> Option<&'a dyn PartialReflect> {
@@ -935,5 +959,133 @@ fn set_optional_enum_by_name(
             target.apply(&some);
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_sprinkles::asset::FxSettings;
+    use crate::ui::widgets::vector_edit::VectorSuffixes;
+
+    /// A real `EmitterData` with a real `DrawPassMaterial::Standard`, not a
+    /// fabricated dynamic reflect value -- `EmitterData::default()` already
+    /// carries one (`EmitterDrawPass::default`'s `DrawPassMaterial::default`
+    /// is `Standard(StandardParticleMaterial::default())`), so the fixture
+    /// exercises the exact production type the field-chaining code below
+    /// resolves against.
+    fn emitter_with_fx(set: impl FnOnce(&mut FxSettings)) -> EmitterData {
+        let mut emitter = EmitterData::default();
+        let DrawPassMaterial::Standard(mat) = &mut emitter.draw_pass.material else {
+            unreachable!("EmitterData::default() carries a Standard material");
+        };
+        set(&mut mat.fx);
+        emitter
+    }
+
+    fn fx_of(emitter: &EmitterData) -> &FxSettings {
+        let DrawPassMaterial::Standard(mat) = &emitter.draw_pass.material else {
+            unreachable!("EmitterData::default() carries a Standard material");
+        };
+        &mat.fx
+    }
+
+    /// Pins Task 22's whole reason for widening `resolve_variant_field_ref`:
+    /// `fx.fresnel_power` is enum (`DrawPassMaterial`) -> struct
+    /// (`StandardParticleMaterial`) -> struct (`FxSettings`) -> f32, one hop
+    /// deeper than any binding this codebase authored before it (the
+    /// deepest prior case, `alpha_mode.cutoff`, is enum -> struct -> enum).
+    /// Before the widening this returned `FieldValue::None` -- the second
+    /// hop's `resolve_variant_field_ref(FxSettings, "fresnel_power")` call
+    /// required `value.reflect_ref()` to be `Enum`, and `FxSettings` is a
+    /// plain struct.
+    #[test]
+    fn a_field_nested_two_hops_inside_an_enum_reads_through_the_chain() {
+        let emitter = emitter_with_fx(|fx| fx.fresnel_power = 2.5);
+        let binding = FieldBinding::emitter_variant_field(
+            "draw_pass.material",
+            "fx.fresnel_power",
+            FieldKind::F32,
+        );
+        match binding.read_value(&emitter) {
+            FieldValue::F32(v) => assert_eq!(v, 2.5),
+            other => panic!("expected FieldValue::F32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_same_two_hop_chain_writes_back_through_with_resolved_mut() {
+        let mut emitter = emitter_with_fx(|fx| fx.fresnel_power = 0.0);
+        let binding = FieldBinding::emitter_variant_field(
+            "draw_pass.material",
+            "fx.fresnel_power",
+            FieldKind::F32,
+        );
+        let changed = binding.write_value(&mut emitter, &FieldValue::F32(4.0));
+        assert!(changed, "the chained write must report a real change");
+        assert_eq!(fx_of(&emitter).fresnel_power, 4.0);
+    }
+
+    #[test]
+    fn a_vec2_field_two_hops_inside_an_enum_round_trips_through_the_chain() {
+        // The Scroll section's own shape: a vector field, not a scalar --
+        // pins that the widened chain also carries `Vec2` correctly, not
+        // just `f32`.
+        let mut emitter = emitter_with_fx(|fx| fx.scroll = Vec2::ZERO);
+        let binding = FieldBinding::emitter_variant_field(
+            "draw_pass.material",
+            "fx.scroll",
+            FieldKind::Vector(VectorSuffixes::XY),
+        );
+        assert!(binding.write_value(&mut emitter, &FieldValue::Vec2(Vec2::new(0.1, -0.2))));
+        assert_eq!(fx_of(&emitter).scroll, Vec2::new(0.1, -0.2));
+        match binding.read_value(&emitter) {
+            FieldValue::Vec2(v) => assert_eq!(v, Vec2::new(0.1, -0.2)),
+            other => panic!("expected FieldValue::Vec2, got {other:?}"),
+        }
+    }
+
+    /// `Option<TextureRef>` needs its own pin: `FieldValue` has no texture
+    /// variant, so texture fields never go through `read_value`/
+    /// `write_value` -- they use `read_reflected`/`write_reflected` directly
+    /// (`texture_edit.rs`'s own read path, and `handle_texture_commit`'s
+    /// `target.apply`). This exercises the chain at that lower level.
+    #[test]
+    fn an_option_texture_ref_two_hops_inside_an_enum_reads_through_the_chain() {
+        let emitter =
+            emitter_with_fx(|fx| fx.flow_texture = Some(TextureRef::Preset(PresetTexture::Circle1)));
+        let binding = FieldBinding::emitter_variant_field(
+            "draw_pass.material",
+            "fx.flow_texture",
+            FieldKind::TextureRef,
+        );
+        let reflected = binding
+            .read_reflected(&emitter)
+            .expect("the chain must resolve to Some(..)");
+        let texture = reflected
+            .try_downcast_ref::<Option<TextureRef>>()
+            .expect("must downcast to Option<TextureRef>");
+        assert_eq!(*texture, Some(TextureRef::Preset(PresetTexture::Circle1)));
+    }
+
+    /// Symmetric write for the same `Option<TextureRef>` chain, mirroring
+    /// `handle_texture_commit`'s own `target.apply(&trigger.value)`.
+    #[test]
+    fn an_option_texture_ref_two_hops_inside_an_enum_writes_through_the_chain() {
+        let mut emitter = emitter_with_fx(|fx| fx.flow_texture = None);
+        let binding = FieldBinding::emitter_variant_field(
+            "draw_pass.material",
+            "fx.flow_texture",
+            FieldKind::TextureRef,
+        );
+        let value: Option<TextureRef> = Some(TextureRef::Preset(PresetTexture::Circle1));
+        let changed = binding.write_reflected(&mut emitter, |target| {
+            target.apply(&value);
+        });
+        assert!(changed);
+        assert_eq!(
+            fx_of(&emitter).flow_texture,
+            Some(TextureRef::Preset(PresetTexture::Circle1))
+        );
     }
 }

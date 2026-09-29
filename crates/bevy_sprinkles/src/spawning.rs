@@ -3,8 +3,14 @@ use bevy::{
 };
 
 use crate::{
-    asset::{DrawPassMaterial, EmitterData, EmitterTrail, ParticlesAsset},
-    material::{ParticleEmitterUniforms, ParticleMaterialExtension, TRAIL_THICKNESS_CURVE_SAMPLES},
+    asset::{
+        DRIVE_SLOT_COUNT, DrawPassMaterial, EmitterData, EmitterTrail, FxSettings, FxUniform,
+        ParticlesAsset,
+    },
+    drives::{EffectDrives, EmitterResolved},
+    material::{
+        FxDefs, ParticleEmitterUniforms, ParticleMaterialExtension, TRAIL_THICKNESS_CURVE_SAMPLES,
+    },
     mesh::ParticleMeshCache,
     runtime::{
         ColliderEntity, CurrentMaterialConfig, CurrentMeshConfig, EditorMode, EmitterEntity,
@@ -12,6 +18,7 @@ use crate::{
         ParticleMaterialHandle, ParticleMeshHandle, ParticleSystemRuntime, Particles3d,
         ParticlesCollider3D, SimulationStep, SubEmitterBufferHandle, TrailHistoryEntry,
     },
+    textures::GradientTextureCache,
 };
 
 const MAX_FRAME_DELTA: f32 = 0.1;
@@ -207,15 +214,89 @@ fn transform_align_to_u32(align: Option<crate::asset::TransformAlign>) -> u32 {
     }
 }
 
+/// Resolves [`FxSettings::gradient_remap`] into a baked, sampleable texture
+/// handle through `cache` -- the exact same [`GradientTextureCache`] (and
+/// thus the exact same cache-key-keyed `get_or_create`) that an emitter's own
+/// colour-over-lifetime gradient bakes through in
+/// [`prepare_gradient_textures`](crate::textures::prepare_gradient_textures)
+/// (`textures/baked.rs`). Two emitters whose `gradient_remap` gradients are
+/// equal (`Gradient::cache_key`) share one baked handle rather than each
+/// paying for their own texture.
+///
+/// Pulled out of `build_extension` as its own pure function -- taking only
+/// plain, `Default`-constructible values (`GradientTextureCache`,
+/// `Assets<Image>`), not `AssetServer` or any ECS scaffolding -- specifically
+/// so a unit test can drive it directly. `build_extension` itself has no
+/// test coverage (see `spawning.rs`'s test module, which only covers
+/// `fold_render_slots`), so without this split a revert of the `.map()` call
+/// below back to a hardcoded `None` would compile and pass every test in the
+/// suite -- exactly the "wired to nothing" defect class this feature's
+/// acceptance criterion exists to prevent.
+fn resolve_gradient_texture(
+    fx: &FxSettings,
+    cache: &mut GradientTextureCache,
+    images: &mut Assets<Image>,
+) -> Option<Handle<Image>> {
+    fx.gradient_remap
+        .as_ref()
+        .map(|gradient| cache.get_or_create(gradient, images))
+}
+
+/// Builds the [`ParticleMaterialExtension`] from a buffer pair plus an
+/// authored [`FxSettings`]: the clamped GPU uniform, the loaded feature
+/// textures, and the shader-def flags that pick which `#ifdef` blocks the
+/// fragment compiles.
+fn build_extension(
+    sorted_particles: Handle<ShaderBuffer>,
+    emitter_uniforms: Handle<ShaderBuffer>,
+    fx: &FxSettings,
+    asset_server: &AssetServer,
+    assets_folders: &[String],
+    gradient_cache: &mut GradientTextureCache,
+    images: &mut Assets<Image>,
+) -> ParticleMaterialExtension {
+    let flow_texture = fx
+        .flow_texture
+        .as_ref()
+        .map(|t| t.load(asset_server, assets_folders));
+    let erosion_texture = fx
+        .erosion_texture
+        .as_ref()
+        .map(|t| t.load(asset_server, assets_folders));
+    let gradient_texture = resolve_gradient_texture(fx, gradient_cache, images);
+
+    ParticleMaterialExtension {
+        sorted_particles,
+        emitter_uniforms,
+        fx: FxUniform::from(fx),
+        flow_texture,
+        erosion_texture,
+        gradient_texture,
+        defs: FxDefs {
+            scroll: fx.scroll_enabled(),
+            flow: fx.flow_enabled(),
+            erosion: fx.erosion_enabled(),
+            fresnel: fx.fresnel_enabled(),
+            soft: fx.soft_enabled(),
+            gradient: fx.gradient_enabled(),
+        },
+    }
+}
+
 fn create_particle_material_from_config(
     config: &DrawPassMaterial,
     sorted_particles_buffer: Handle<ShaderBuffer>,
     emitter_uniforms_buffer: Handle<ShaderBuffer>,
     asset_server: &AssetServer,
     assets_folders: &[String],
+    gradient_cache: &mut GradientTextureCache,
+    images: &mut Assets<Image>,
 ) -> ParticleMaterial {
-    let base = match config {
-        DrawPassMaterial::Standard(mat) => mat.to_standard_material(asset_server, assets_folders),
+    let (base, fx_settings) = match config {
+        DrawPassMaterial::Standard(mat) => (
+            mat.to_standard_material(asset_server, assets_folders),
+            &mat.fx,
+        ),
         DrawPassMaterial::CustomShader { .. } => {
             todo!("custom shader support not yet implemented")
         }
@@ -223,10 +304,15 @@ fn create_particle_material_from_config(
 
     ExtendedMaterial {
         base,
-        extension: ParticleMaterialExtension {
-            sorted_particles: sorted_particles_buffer,
-            emitter_uniforms: emitter_uniforms_buffer,
-        },
+        extension: build_extension(
+            sorted_particles_buffer,
+            emitter_uniforms_buffer,
+            fx_settings,
+            asset_server,
+            assets_folders,
+            gradient_cache,
+            images,
+        ),
     }
 }
 
@@ -250,6 +336,8 @@ pub fn setup_particle_systems(
     mut mesh_cache: ResMut<ParticleMeshCache>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut materials: ResMut<Assets<ParticleMaterial>>,
+    mut gradient_cache: ResMut<GradientTextureCache>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     for (system_entity, particle_system, is_editor) in query.iter() {
         let Some(asset) = assets.get(particle_system) else {
@@ -324,6 +412,8 @@ pub fn setup_particle_systems(
                 emitter_uniforms_buffer_handle.clone(),
                 &asset_server,
                 assets_folders,
+                &mut gradient_cache,
+                &mut images,
             ));
 
             let mut runtime = EmitterRuntime::new(emitter_index, emitter.time.fixed_seed);
@@ -353,7 +443,6 @@ pub fn setup_particle_systems(
                 ParticleMaterialHandle(material_handle),
                 emitter.initial_transform.to_transform(),
                 Visibility::default(),
-                crate::r#override::OverrideBakedTextures::default(),
             ));
 
             if !shadow_caster {
@@ -529,6 +618,8 @@ pub(crate) fn sync_particle_buffers(
     mut meshes: ResMut<Assets<Mesh>>,
     mut mesh_cache: ResMut<ParticleMeshCache>,
     mut materials: ResMut<Assets<ParticleMaterial>>,
+    mut gradient_cache: ResMut<GradientTextureCache>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     for (
         emitter,
@@ -609,6 +700,8 @@ pub(crate) fn sync_particle_buffers(
             new_uniforms_buf,
             &asset_server,
             assets_folders,
+            &mut gradient_cache,
+            &mut images,
         ));
         material3d.0 = new_material.clone();
         material_handle.0 = new_material;
@@ -622,10 +715,32 @@ pub(crate) fn sync_particle_buffers(
     }
 }
 
+/// Folds one emitter's resolved render-stage drives into the flat slot array
+/// the GPU uniform carries.
+///
+/// This is the one place `Option<f32>` collapses to a plain `f32`: `None` --
+/// no drive touched this slot, or there is no resolved state at all yet (the
+/// entity has no `EffectDrives`, or this emitter has none) -- becomes the
+/// identity `1.0`, the multiplier that leaves the emitter's authored value
+/// unchanged. `Some(v)` becomes `v`, even when `v` is `0.0` -- a resolved zero
+/// must reach the GPU as zero, not silently fall back to identity.
+/// `resolve_drives`/`EffectDrives` keep the `None`/`Some(1.0)` distinction
+/// intact all the way up to this boundary.
+fn fold_render_slots(resolved: Option<&EmitterResolved>) -> [f32; DRIVE_SLOT_COUNT] {
+    let mut slots = [1.0f32; DRIVE_SLOT_COUNT];
+    if let Some(e) = resolved {
+        for (i, v) in e.render.iter().enumerate() {
+            if let Some(v) = v {
+                slots[i] = *v;
+            }
+        }
+    }
+    slots
+}
+
 pub fn write_emitter_uniforms(
     particle_systems: Query<&Particles3d>,
-    overrides: Query<&crate::r#override::ParticleOverride>,
-    per_emitter: Query<&crate::r#override::ParticleEmitterOverrides>,
+    drives: Query<&EffectDrives>,
     emitter_query: Query<(
         &EmitterEntity,
         &EmitterRuntime,
@@ -648,12 +763,12 @@ pub fn write_emitter_uniforms(
         let trail_size = emitter_data.trail_size();
         let trail_thickness_curve = bake_thickness_curve(&emitter_data.trail);
 
-        let ovr = crate::r#override::effective_override(
-            &emitter_data.name,
-            overrides.get(emitter.parent_system).ok(),
-            per_emitter.get(emitter.parent_system).ok(),
+        let drive_slots = fold_render_slots(
+            drives
+                .get(emitter.parent_system)
+                .ok()
+                .and_then(|d| d.0.emitters.get(runtime.emitter_index)),
         );
-        let (tint, size_mul) = crate::r#override::emitter_multipliers(ovr);
 
         let uniforms = ParticleEmitterUniforms {
             emitter_transform: global_transform.to_matrix(),
@@ -663,8 +778,7 @@ pub fn write_emitter_uniforms(
             trail_size,
             transform_align: transform_align_to_u32(emitter_data.draw_pass.transform_align),
             trail_thickness_curve,
-            tint,
-            size_mul,
+            drive_slots,
         };
 
         if let Some(mut buffer) = buffers.get_mut(&buffer_handle.emitter_uniforms_buffer) {
@@ -686,6 +800,8 @@ pub fn sync_particle_material(
     assets: Res<Assets<ParticlesAsset>>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<ParticleMaterial>>,
+    mut gradient_cache: ResMut<GradientTextureCache>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     for (emitter, runtime, mut current_config, mut material_handle, mut material3d) in
         emitter_query.iter_mut()
@@ -726,6 +842,8 @@ pub fn sync_particle_material(
                 emitter_uniforms_handle,
                 &asset_server,
                 assets_folders,
+                &mut gradient_cache,
+                &mut images,
             ));
 
             material3d.0 = new_material_handle.clone();
@@ -735,53 +853,102 @@ pub fn sync_particle_material(
     }
 }
 
-/// Applies `ParticleOverride::emissive` to each emitter's per-instance material.
-/// Runs after `sync_particle_material` so a config-driven rebuild doesn't clobber it.
-pub fn apply_emissive_override(
-    overrides: Query<&crate::r#override::ParticleOverride>,
-    per_emitter: Query<&crate::r#override::ParticleEmitterOverrides>,
-    particle_systems: Query<&Particles3d>,
-    emitter_query: Query<(&EmitterEntity, &EmitterRuntime, &ParticleMaterialHandle)>,
-    assets: Res<Assets<ParticlesAsset>>,
-    mut materials: ResMut<Assets<ParticleMaterial>>,
-) {
-    for (emitter, runtime, material_handle) in emitter_query.iter() {
-        let Some(emitter_data) = get_emitter_data(
-            emitter.parent_system,
-            runtime.emitter_index,
-            &particle_systems,
-            &assets,
-        ) else {
-            continue;
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let ovr = crate::r#override::effective_override(
-            &emitter_data.name,
-            overrides.get(emitter.parent_system).ok(),
-            per_emitter.get(emitter.parent_system).ok(),
-        );
+    #[test]
+    fn no_resolved_state_yields_identity_everywhere() {
+        // No `EffectDrives` on the entity, or the entity's emitter index has
+        // no `EmitterResolved` -- `write_emitter_uniforms` passes `None` here
+        // in both cases.
+        assert_eq!(fold_render_slots(None), [1.0; DRIVE_SLOT_COUNT]);
+    }
 
-        // Effective emissive = the override if set, else the asset's authored value.
-        // `None` must revert to the asset value, mirroring every other override layer.
-        let effective_emissive = if let Some(e) = ovr.and_then(|o| o.emissive) {
-            e
-        } else {
-            let DrawPassMaterial::Standard(m) = &emitter_data.draw_pass.material else {
-                continue;
-            };
-            Color::linear_rgba(m.emissive[0], m.emissive[1], m.emissive[2], m.emissive[3]).into()
-        };
+    #[test]
+    fn an_untouched_slot_is_identity() {
+        let resolved = EmitterResolved::default(); // render: [None; DRIVE_SLOT_COUNT]
+        assert_eq!(fold_render_slots(Some(&resolved)), [1.0; DRIVE_SLOT_COUNT]);
+    }
 
-        // Avoid per-frame material churn: `Assets::get_mut` marks the asset changed
-        // even when writing an identical value, so only write when the effective
-        // value actually differs from what's currently stored.
-        let Some(material) = materials.get(&material_handle.0) else {
-            continue;
-        };
-        if material.base.emissive != effective_emissive {
-            if let Some(mut material) = materials.get_mut(&material_handle.0) {
-                material.base.emissive = effective_emissive;
-            }
+    #[test]
+    fn a_resolved_zero_reaches_the_slot_as_zero_not_identity() {
+        // The case that catches a lazy `unwrap_or(1.0)` written as
+        // `filter(|v| *v != 0.0)`: a drive that genuinely computed 0.0 must
+        // not be mistaken for "untouched" and folded back to identity.
+        let mut resolved = EmitterResolved::default();
+        resolved.render[0] = Some(0.0);
+        let slots = fold_render_slots(Some(&resolved));
+        assert_eq!(slots[0], 0.0);
+        for (i, s) in slots.iter().enumerate().skip(1) {
+            assert_eq!(*s, 1.0, "slot {i} must stay untouched");
         }
+    }
+
+    #[test]
+    fn a_resolved_non_default_value_passes_through() {
+        let mut resolved = EmitterResolved::default();
+        resolved.render[2] = Some(4.0);
+        let slots = fold_render_slots(Some(&resolved));
+        assert_eq!(slots[2], 4.0);
+    }
+
+    fn one_stop_gradient(r: f32) -> crate::asset::Gradient {
+        crate::asset::Gradient {
+            stops: vec![crate::asset::GradientStop {
+                color: [r, 0.0, 0.0, 1.0],
+                position: 0.0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// This is the one that catches a revert of `resolve_gradient_texture`'s
+    /// `.map()` call back to a hardcoded `None`: an authored
+    /// `gradient_remap` must actually resolve to a baked handle, not just
+    /// have a WGSL reader waiting for one.
+    #[test]
+    fn an_authored_gradient_resolves_to_a_baked_handle() {
+        let fx = FxSettings {
+            gradient_remap: Some(one_stop_gradient(1.0)),
+            ..Default::default()
+        };
+        let mut cache = GradientTextureCache::default();
+        let mut images = Assets::<Image>::default();
+        let handle = resolve_gradient_texture(&fx, &mut cache, &mut images);
+        assert!(handle.is_some(), "an authored gradient must bake a texture");
+    }
+
+    #[test]
+    fn no_gradient_remap_resolves_to_no_texture() {
+        let fx = FxSettings::default();
+        let mut cache = GradientTextureCache::default();
+        let mut images = Assets::<Image>::default();
+        let handle = resolve_gradient_texture(&fx, &mut cache, &mut images);
+        assert!(
+            handle.is_none(),
+            "an unauthored effect must not bake anything"
+        );
+    }
+
+    #[test]
+    fn two_equal_gradients_resolve_to_the_same_baked_handle() {
+        let fx_a = FxSettings {
+            gradient_remap: Some(one_stop_gradient(0.5)),
+            ..Default::default()
+        };
+        let fx_b = FxSettings {
+            gradient_remap: Some(one_stop_gradient(0.5)),
+            ..Default::default()
+        };
+        let mut cache = GradientTextureCache::default();
+        let mut images = Assets::<Image>::default();
+        let handle_a = resolve_gradient_texture(&fx_a, &mut cache, &mut images).unwrap();
+        let handle_b = resolve_gradient_texture(&fx_b, &mut cache, &mut images).unwrap();
+        assert_eq!(
+            handle_a.id(),
+            handle_b.id(),
+            "two emitters authoring an equal gradient must share one baked texture"
+        );
     }
 }

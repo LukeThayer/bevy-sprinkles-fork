@@ -824,7 +824,7 @@ fn handle_create_project(
     );
 
     let result = Arc::new(Mutex::new(None));
-    save_project_to_path(path.clone(), &asset, result.clone());
+    let wrote = save_project_to_path(path.clone(), &asset, result.clone());
     commands.insert_resource(SaveResult(result));
 
     let handle = assets.add(asset);
@@ -834,7 +834,14 @@ fn handle_create_project(
         kind: Inspectable::Emitter,
         index: 0,
     });
-    dirty_state.has_unsaved_changes = false;
+    // A refused save (the `validate_drives` write barrier) must leave the
+    // project dirty, the same as `on_save_project_event` honours it -- see
+    // that function's comment. Not reachable today: a freshly synthesized
+    // template has no variables and no drives, so `validate_drives` cannot
+    // fail here yet, but it becomes wrong the day this template gains either.
+    if wrote {
+        dirty_state.has_unsaved_changes = false;
+    }
 
     editor_data.cache.add_recent_project(simplify_path(&path));
     save_editor_data(&editor_data);

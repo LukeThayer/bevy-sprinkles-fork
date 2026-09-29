@@ -431,6 +431,11 @@ fn create_tube_trail_mesh(
 
             positions.push([cos_theta * radius, -section_frac, sin_theta * radius]);
             normals.push([cos_theta, 0.0, sin_theta]);
+            // V (index 1) is section_frac, 0..1 head-to-tail, so a scrolling
+            // texture travels ALONG the tube; U (index 0) wraps 0..1 around the
+            // circumference. Do not swap these — a swap makes a texture scroll
+            // around the tube instead of down it, and nothing else here would
+            // catch that. See mesh::tests for the pinning tests.
             uvs.push([u, section_frac]);
             uv_bs.push([0.0, section_frac]);
         }
@@ -523,6 +528,11 @@ fn create_ribbon_trail_mesh(
         for row in 0..=total_subdivs {
             let section_frac = row as f32 / total_subdivs as f32;
 
+            // V (index 1) is section_frac, 0..1 head-to-tail, so a scrolling
+            // texture travels ALONG the ribbon; U (index 0) is the strip edge
+            // (0.0 left / 1.0 right), across the width. Do not swap these — a
+            // swap makes a texture scroll across the ribbon instead of down it,
+            // and nothing else here would catch that. See mesh::tests.
             positions.push([-size * offsets[0], -section_frac, -size * offsets[1]]);
             normals.push(normal);
             uvs.push([0.0, section_frac]);
@@ -754,4 +764,145 @@ fn extract_float32x3(
         VertexAttributeValues::Float32x3(v) => Some(v.clone()),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pins the UV convention on the two trail generators: V (index 1) runs
+    //! 0..1 along the trail's LENGTH, U (index 0) runs across the
+    //! cross-section (the ribbon's width, or the tube's circumference).
+    //! `create_ribbon_trail_mesh` and `create_tube_trail_mesh` are private to
+    //! this module, so this `mod tests` — a child of `mesh`, which Rust's
+    //! privacy rules give access to every private item its ancestor module
+    //! defines — reaches them directly with no visibility change needed.
+    //!
+    //! Every assertion below checks an *exact* distinct-value count or an
+    //! exact coordinate, not merely "some value reaches 0 or 1". That is what
+    //! makes them swap-sensitive: a build with U and V exchanged in the
+    //! generator produces a mesh where index 0 and index 1 have exactly
+    //! swapped their cardinalities (U's small edge-set count where V's
+    //! full-ramp count was expected, and vice versa), which a "some component
+    //! hits 1.0" style check would not notice at all.
+
+    use super::*;
+
+    /// Extracts UV_0 as `Vec<[f32; 2]>`, panicking with a clear message if the
+    /// attribute is missing or a different format — a mesh with a mismatched
+    /// UV format is itself a bug this suite should surface loudly rather than
+    /// silently skip.
+    fn uv0(mesh: &Mesh) -> Vec<[f32; 2]> {
+        match mesh.attribute(Mesh::ATTRIBUTE_UV_0) {
+            Some(VertexAttributeValues::Float32x2(v)) => v.clone(),
+            other => panic!("expected Float32x2 ATTRIBUTE_UV_0, got {other:?}"),
+        }
+    }
+
+    /// Counts distinct values in `values`, rounding to 6 decimal places first
+    /// so that values which are mathematically equal (computed the same way
+    /// twice) but could differ by float noise still collapse to one bucket.
+    fn distinct_count(values: impl Iterator<Item = f32>) -> usize {
+        let mut rounded: Vec<i64> = values.map(|v| (v * 1_000_000.0).round() as i64).collect();
+        rounded.sort_unstable();
+        rounded.dedup();
+        rounded.len()
+    }
+
+    fn min_max(values: &[f32]) -> (f32, f32) {
+        (
+            values.iter().cloned().fold(f32::MAX, f32::min),
+            values.iter().cloned().fold(f32::MIN, f32::max),
+        )
+    }
+
+    #[test]
+    fn a_ribbon_trails_uvs_run_from_zero_to_one_along_its_length() {
+        // Without this, a scrolling texture on a ribbon trail scrolls ACROSS
+        // it instead of ALONG it, which is the one direction a beam must not
+        // go.
+        let sections = 8;
+        let section_rings = 1;
+        let mesh = create_ribbon_trail_mesh(1.0, sections, section_rings, RibbonTrailShape::Flat);
+        let uvs = uv0(&mesh);
+        let vs: Vec<f32> = uvs.iter().map(|uv| uv[1]).collect();
+
+        let (v_min, v_max) = min_max(&vs);
+        assert!((v_min - 0.0).abs() < 1e-5, "v_min = {v_min}");
+        assert!((v_max - 1.0).abs() < 1e-5, "v_max = {v_max}");
+
+        // total_subdivs = sections * section_rings.max(1) = 8, rows 0..=8:
+        // 9 distinct V values, a continuous ramp, not just the two endpoints.
+        let total_subdivs = sections * section_rings.max(1);
+        assert_eq!(distinct_count(vs.into_iter()), (total_subdivs + 1) as usize);
+    }
+
+    #[test]
+    fn a_ribbon_trails_uvs_span_zero_to_one_across_its_width() {
+        // U must sit at exactly the two strip edges (left/right), not ramp
+        // the way V does — if it ramps too, the axes have been swapped.
+        let mesh = create_ribbon_trail_mesh(1.0, 8, 1, RibbonTrailShape::Flat);
+        let uvs = uv0(&mesh);
+        let us: Vec<f32> = uvs.iter().map(|uv| uv[0]).collect();
+
+        assert!(us.iter().any(|u| (*u - 0.0).abs() < 1e-5));
+        assert!(us.iter().any(|u| (*u - 1.0).abs() < 1e-5));
+        // Exactly two distinct U values, the flat strip's left and right
+        // edges — this is the count that is swap-sensitive: swapped, U would
+        // instead carry the full 9-value length ramp.
+        assert_eq!(distinct_count(us.into_iter()), 2);
+    }
+
+    #[test]
+    fn a_tube_trails_body_uvs_run_from_zero_to_one_along_its_length() {
+        // Restricted to the BODY vertices — the first
+        // (total_rings+1)*(radial_steps+1) entries `create_tube_trail_mesh`
+        // pushes, ring-major then segment — before the end-cap block that
+        // follows, which reuses UV_0 for an unrelated polar-coordinate
+        // texture mapping and would otherwise pollute this count.
+        let radial_steps = 6u32;
+        let sections = 8u32;
+        let section_rings = 1u32;
+        let mesh = create_tube_trail_mesh(0.5, radial_steps, sections, section_rings);
+        let uvs = uv0(&mesh);
+
+        let total_rings = sections * section_rings.max(1);
+        let body_count = ((total_rings + 1) * (radial_steps + 1)) as usize;
+        let body = &uvs[..body_count];
+        let vs: Vec<f32> = body.iter().map(|uv| uv[1]).collect();
+
+        let (v_min, v_max) = min_max(&vs);
+        assert!((v_min - 0.0).abs() < 1e-5, "v_min = {v_min}");
+        assert!((v_max - 1.0).abs() < 1e-5, "v_max = {v_max}");
+        assert_eq!(distinct_count(vs.into_iter()), (total_rings + 1) as usize);
+    }
+
+    #[test]
+    fn a_tube_trails_body_uvs_vary_around_the_circumference_not_constant() {
+        // Same body-vertex restriction as the length test above.
+        let radial_steps = 6u32;
+        let sections = 8u32;
+        let section_rings = 1u32;
+        let mesh = create_tube_trail_mesh(0.5, radial_steps, sections, section_rings);
+        let uvs = uv0(&mesh);
+
+        let total_rings = sections * section_rings.max(1);
+        let body_count = ((total_rings + 1) * (radial_steps + 1)) as usize;
+        let body = &uvs[..body_count];
+
+        // Across the WHOLE body, U (index 0) must take exactly
+        // radial_steps+1 distinct values — the count that is swap-sensitive:
+        // swapped, U would instead carry the (total_rings+1) length ramp.
+        let us: Vec<f32> = body.iter().map(|uv| uv[0]).collect();
+        assert_eq!(distinct_count(us.into_iter()), (radial_steps + 1) as usize);
+
+        // And within a single ring (constant V), U must still vary across
+        // all radial_steps+1 values rather than sitting at one constant —
+        // proof it genuinely wraps the circumference rather than coming along
+        // for the ride on a single per-ring value.
+        let first_ring = &body[..(radial_steps + 1) as usize];
+        let ring_us: Vec<f32> = first_ring.iter().map(|uv| uv[0]).collect();
+        assert_eq!(
+            distinct_count(ring_us.into_iter()),
+            (radial_steps + 1) as usize
+        );
+    }
 }

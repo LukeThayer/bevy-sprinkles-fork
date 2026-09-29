@@ -21,7 +21,7 @@ impl GradientInterpolation {
 }
 
 /// A single color stop within a [`Gradient`].
-#[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
 pub struct GradientStop {
     /// The color at this stop, as linear RGBA values in `[0.0, 1.0]`.
     pub color: [f32; 4],
@@ -34,7 +34,7 @@ pub struct GradientStop {
 /// Gradients are baked into 1D textures for efficient GPU sampling. The
 /// [`interpolation`](Self::interpolation) mode controls how colors are blended
 /// between stops.
-#[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
 pub struct Gradient {
     /// The ordered list of color stops that define this gradient.
     pub stops: Vec<GradientStop>,

@@ -709,7 +709,13 @@ fn spawn_variant_fields_for_entity(
     }
 }
 
-fn spawn_field_widget(
+/// `pub(crate)`: `inspector::mod`'s `InspectorItem::MaterialField` arm (Task
+/// 22) reuses this dispatch verbatim for `FxSettings` fields nested two hops
+/// under the draw-pass material (`fx.scroll`, `fx.flow_texture`, ...) rather
+/// than re-deriving a widget per `FieldKind` -- the exact reuse this
+/// function's row-rendering caller already relies on for every OTHER
+/// variant-carried field (`base_color_texture`, `alpha_mode`, ...).
+pub(crate) fn spawn_field_widget(
     commands: &mut Commands,
     asset_server: &AssetServer,
     field: &VariantField,

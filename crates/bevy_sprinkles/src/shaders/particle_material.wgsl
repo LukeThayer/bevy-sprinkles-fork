@@ -1,17 +1,27 @@
 #import bevy_sprinkles::common::{
     Particle,
     ParticleEmitterUniforms,
+    FxUniform,
     PARTICLE_FLAG_ACTIVE,
     TRANSFORM_ALIGN_BILLBOARD,
     TRANSFORM_ALIGN_Y_TO_VELOCITY,
     TRANSFORM_ALIGN_BILLBOARD_Y_TO_VELOCITY,
     TRANSFORM_ALIGN_BILLBOARD_FIXED_Y,
     TRAIL_THICKNESS_CURVE_SAMPLES,
+    DRIVE_SLOT_TINT,
+    DRIVE_SLOT_ALPHA,
+    DRIVE_SLOT_SIZE_MUL,
+    DRIVE_SLOT_EMISSIVE,
+    DRIVE_SLOT_SCROLL_U,
+    DRIVE_SLOT_SCROLL_V,
+    DRIVE_SLOT_FLOW,
+    DRIVE_SLOT_EROSION,
+    DRIVE_SLOT_FRESNEL,
 }
 #import bevy_pbr::{
     mesh_functions,
-    mesh_view_bindings::view,
-    view_transformations::position_world_to_clip,
+    mesh_view_bindings::{view, globals},
+    view_transformations::{position_world_to_clip, depth_ndc_to_view_z},
 }
 
 #ifdef PREPASS_PIPELINE
@@ -29,6 +39,18 @@
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing, alpha_discard},
 }
+// FX_SOFT only: `prepass_depth` (bevy_pbr::prepass_utils, gated `#ifdef
+// DEPTH_PREPASS` in its own source) only exists when the VIEW/camera has a
+// depth prepass enabled -- a property of the camera, independent of this
+// material's own FX_SOFT flag. Importing it only under FX_SOFT means an
+// effect that doesn't use soft particles never requires a depth prepass;
+// gated only here (not also by DEPTH_PREPASS) is deliberate -- a
+// soft-particle effect rendered by a camera without one is a documented
+// misconfiguration (see FxSettings::soft_fade) that should fail loudly at
+// shader-compile time, not be silently patched over.
+#ifdef FX_SOFT
+#import bevy_pbr::prepass_utils::prepass_depth
+#endif
 #endif
 
 const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
@@ -44,10 +66,24 @@ const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
 #else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<storage, read> sorted_particles: array<Particle>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> emitter_uniforms: ParticleEmitterUniforms;
+@group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> fx: FxUniform;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var flow_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var flow_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var erosion_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var erosion_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var gradient_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var gradient_sampler: sampler;
 #endif
 #else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<storage, read> sorted_particles: array<Particle>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> emitter_uniforms: ParticleEmitterUniforms;
+@group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> fx: FxUniform;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var flow_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var flow_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var erosion_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var erosion_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var gradient_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var gradient_sampler: sampler;
 #endif
 
 // computes a shortest-arc rotation matrix that aligns the Y axis to a direction
@@ -256,7 +292,7 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     let is_active = (flags & PARTICLE_FLAG_ACTIVE) != 0u;
 
     let particle_position = particle.position.xyz;
-    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.size_mul, is_active);
+    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.drive_slots[DRIVE_SLOT_SIZE_MUL], is_active);
     let is_local = emitter_uniforms.use_local_coords != 0u;
 
     var rotated_position = vertex.position;
@@ -438,7 +474,12 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     }
 
 #ifdef VERTEX_COLORS
-    out.color = vertex.color * particle.color * emitter_uniforms.tint;
+    out.color = vertex.color * particle.color * vec4<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_ALPHA],
+    );
 #endif
 
     return out;
@@ -595,7 +636,7 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     let is_active = (flags & PARTICLE_FLAG_ACTIVE) != 0u;
 
     let particle_position = particle.position.xyz;
-    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.size_mul, is_active);
+    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.drive_slots[DRIVE_SLOT_SIZE_MUL], is_active);
     let is_local = emitter_uniforms.use_local_coords != 0u;
 
     var rotated_position = vertex.position;
@@ -777,7 +818,12 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     }
 
 #ifdef VERTEX_COLORS
-    out.color = vertex.color * particle.color * emitter_uniforms.tint;
+    out.color = vertex.color * particle.color * vec4<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_ALPHA],
+    );
 #endif
 
     return out;
@@ -934,7 +980,7 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     let is_active = (flags & PARTICLE_FLAG_ACTIVE) != 0u;
 
     let particle_position = particle.position.xyz;
-    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.size_mul, is_active);
+    let particle_scale = select(0.0, particle.position.w * emitter_uniforms.drive_slots[DRIVE_SLOT_SIZE_MUL], is_active);
     let is_local = emitter_uniforms.use_local_coords != 0u;
 
     var rotated_position = vertex.position;
@@ -1116,7 +1162,12 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
     }
 
 #ifdef VERTEX_COLORS
-    out.color = vertex.color * particle.color * emitter_uniforms.tint;
+    out.color = vertex.color * particle.color * vec4<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_TINT],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_ALPHA],
+    );
 #endif
 
     return out;
@@ -1152,6 +1203,20 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 #ifdef PREPASS_PIPELINE
 #ifndef PREPASS_FRAGMENT
 #ifdef MAY_DISCARD
+// The DEPTH-ONLY prepass fragment. It discards inactive and fully transparent
+// particles and nothing else -- notably NOT FX_EROSION, whose discard lives
+// only in the two fragments below.
+//
+// That asymmetry is deliberate but worth stating, because it would be a real
+// bug under a different alpha mode: an Opaque or Mask material runs this
+// prepass and writes depth, so a fragment erosion later discards in the
+// forward pass would already have stamped depth here and would occlude
+// whatever is behind it -- a hole in the world shaped like the dissolving
+// particle. It is unreachable for Blend and Additive, which every stylized
+// erosion case uses and which do not write depth in the prepass at all. Left
+// as a note rather than a fix for exactly that reason; sampling the erosion
+// texture here would cost every depth-prepass fragment a texture read to
+// guard a combination nothing authors.
 @fragment
 fn fragment(
     in: VertexOutput,
@@ -1211,7 +1276,102 @@ fn fragment(
         discard;
     }
 
-    var pbr_input = pbr_input_from_standard_material(in, is_front);
+    var frag_in = in;
+#ifdef FX_SCROLL
+    // drive_slots let a host variable modulate the authored rate at runtime;
+    // an untouched slot carries 1.0, so an undriven effect scrolls exactly as
+    // authored.
+    let scroll_rate = fx.scroll_tiling.xy * vec2<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_U],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_V],
+    );
+    frag_in.uv = in.uv * fx.scroll_tiling.zw + scroll_rate * globals.time;
+#endif
+#ifdef FX_FLOW
+    // Offsetting the base UV by a second, independently scrolling texture is
+    // what makes fire and smoke CHURN. A single scrolling layer reads as a
+    // sliding sheet no matter how good the texture is.
+    let flow_uv = in.uv * fx.scroll_tiling.zw + fx.flow_fresnel.yz * globals.time;
+    let flow = textureSample(flow_texture, flow_sampler, flow_uv).rg * 2.0 - 1.0;
+    let flow_amount = fx.flow_fresnel.x * emitter_uniforms.drive_slots[DRIVE_SLOT_FLOW];
+    frag_in.uv = frag_in.uv + flow * flow_amount;
+#endif
+
+    var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
+#ifdef FX_GRADIENT
+    // Treat the base texture as a MASK and colour it through an authored
+    // gradient, rather than using its own colour. This is why one greyscale
+    // smoke texture can serve a dozen effects, and it is the colour authoring
+    // surface -- which is why the Tint drive slot stays a scalar multiplier
+    // and does not also try to author colour. Placed right after the base
+    // color sample (before FX_EROSION's rim mix and FX_FRESNEL's rgb
+    // multiply) so both later stages operate on the remapped colour, the
+    // same "immediately after the sample" placement FX_EROSION documents for
+    // itself below.
+    let gradient_mask = pbr_input.material.base_color.r;
+    let gradient_remapped = textureSample(gradient_texture, gradient_sampler, vec2<f32>(gradient_mask, 0.5));
+    pbr_input.material.base_color = vec4<f32>(
+        gradient_remapped.rgb,
+        gradient_remapped.a * pbr_input.material.base_color.a,
+    );
+#endif
+#ifdef FX_EROSION
+    // The signature stylized burn-away: sample noise, discard below a moving
+    // threshold, and emit a bright rim in the band just above it. Driving the
+    // threshold from a variable is how an effect dissolves on command. Sampled
+    // at frag_in.uv (post scroll/flow) so the dissolve pattern travels with
+    // the churned surface rather than sitting still on top of it. Placed
+    // right after the base color sample and before every later stage
+    // (emissive scaling, the particle-color multiply, lighting, and -- in the
+    // forward fragment -- alpha_discard), so a discarded fragment pays for
+    // none of that.
+    let erosion_noise = textureSample(erosion_texture, erosion_sampler, frag_in.uv).r;
+    let erosion_threshold = clamp(
+        fx.erosion_soft.x * emitter_uniforms.drive_slots[DRIVE_SLOT_EROSION],
+        0.0, 1.0,
+    );
+    if (erosion_noise < erosion_threshold) {
+        discard;
+    }
+    let erosion_edge = fx.erosion_soft.y;
+    if (erosion_edge > 0.0) {
+        // 1 at the cut, falling to 0 `edge` above it.
+        let erosion_rim = 1.0 - clamp((erosion_noise - erosion_threshold) / erosion_edge, 0.0, 1.0);
+        pbr_input.material.base_color = mix(
+            pbr_input.material.base_color,
+            fx.erosion_edge_color,
+            erosion_rim * fx.erosion_edge_color.a,
+        );
+    }
+#endif
+#ifdef FX_FRESNEL
+    // Rim brightening: a dot product and a power, but it's much of why a
+    // stylized mesh reads as volumetric rather than as a flat painted shape.
+    // Uses the raw vertex normal/position (unaffected by FX_SCROLL/FX_FLOW's
+    // UV distortion), so it composes independently of them.
+    //
+    // For a camera-facing billboard the normal points at the camera
+    // everywhere, so `dot(n, v)` is ~1 everywhere and the rim is
+    // near-uniform -- this earns its keep on mesh particles (cones, spheres,
+    // tubes), not quads. An author who tries it on a quad first will
+    // conclude it is broken; it isn't, it just has nothing to rim.
+    let fresnel_n = normalize(in.world_normal);
+    let fresnel_v = normalize(view.world_position.xyz - in.world_position.xyz);
+    let fresnel_power = fx.flow_fresnel.w * emitter_uniforms.drive_slots[DRIVE_SLOT_FRESNEL];
+    let fresnel_rim = pow(1.0 - saturate(dot(fresnel_n, fresnel_v)), max(fresnel_power, 0.001));
+    pbr_input.material.base_color = vec4<f32>(
+        pbr_input.material.base_color.rgb
+            + pbr_input.material.base_color.rgb * fresnel_rim * fx.erosion_soft.z,
+        pbr_input.material.base_color.a,
+    );
+#endif
+    // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
+    // effect's emissive contribution is unchanged. Scaling rgb only leaves
+    // the exposure-weight alpha channel (read in pbr_functions.wgsl) alone.
+    pbr_input.material.emissive = vec4<f32>(
+        pbr_input.material.emissive.rgb * emitter_uniforms.drive_slots[DRIVE_SLOT_EMISSIVE],
+        pbr_input.material.emissive.a,
+    );
     pbr_input.material.base_color = pbr_input.material.base_color * particle_color;
     let out = deferred_output(in, pbr_input);
 
@@ -1248,14 +1408,160 @@ fn fragment(
         discard;
     }
 
-    var pbr_input = pbr_input_from_standard_material(in, is_front);
+    var frag_in = in;
+#ifdef FX_SCROLL
+    // drive_slots let a host variable modulate the authored rate at runtime;
+    // an untouched slot carries 1.0, so an undriven effect scrolls exactly as
+    // authored.
+    let scroll_rate = fx.scroll_tiling.xy * vec2<f32>(
+        emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_U],
+        emitter_uniforms.drive_slots[DRIVE_SLOT_SCROLL_V],
+    );
+    frag_in.uv = in.uv * fx.scroll_tiling.zw + scroll_rate * globals.time;
+#endif
+#ifdef FX_FLOW
+    // Offsetting the base UV by a second, independently scrolling texture is
+    // what makes fire and smoke CHURN. A single scrolling layer reads as a
+    // sliding sheet no matter how good the texture is.
+    let flow_uv = in.uv * fx.scroll_tiling.zw + fx.flow_fresnel.yz * globals.time;
+    let flow = textureSample(flow_texture, flow_sampler, flow_uv).rg * 2.0 - 1.0;
+    let flow_amount = fx.flow_fresnel.x * emitter_uniforms.drive_slots[DRIVE_SLOT_FLOW];
+    frag_in.uv = frag_in.uv + flow * flow_amount;
+#endif
+
+    var pbr_input = pbr_input_from_standard_material(frag_in, is_front);
+#ifdef FX_GRADIENT
+    // Treat the base texture as a MASK and colour it through an authored
+    // gradient, rather than using its own colour. This is why one greyscale
+    // smoke texture can serve a dozen effects, and it is the colour authoring
+    // surface -- which is why the Tint drive slot stays a scalar multiplier
+    // and does not also try to author colour. Placed right after the base
+    // color sample (before FX_EROSION's rim mix and FX_FRESNEL's rgb
+    // multiply) so both later stages operate on the remapped colour, the
+    // same "immediately after the sample" placement FX_EROSION documents for
+    // itself below.
+    let gradient_mask = pbr_input.material.base_color.r;
+    let gradient_remapped = textureSample(gradient_texture, gradient_sampler, vec2<f32>(gradient_mask, 0.5));
+    pbr_input.material.base_color = vec4<f32>(
+        gradient_remapped.rgb,
+        gradient_remapped.a * pbr_input.material.base_color.a,
+    );
+#endif
+#ifdef FX_EROSION
+    // The signature stylized burn-away: sample noise, discard below a moving
+    // threshold, and emit a bright rim in the band just above it. Driving the
+    // threshold from a variable is how an effect dissolves on command. Sampled
+    // at frag_in.uv (post scroll/flow) so the dissolve pattern travels with
+    // the churned surface rather than sitting still on top of it. Placed
+    // right after the base color sample and before every later stage
+    // (emissive scaling, the particle-color multiply, lighting, and -- in the
+    // forward fragment -- alpha_discard), so a discarded fragment pays for
+    // none of that.
+    let erosion_noise = textureSample(erosion_texture, erosion_sampler, frag_in.uv).r;
+    let erosion_threshold = clamp(
+        fx.erosion_soft.x * emitter_uniforms.drive_slots[DRIVE_SLOT_EROSION],
+        0.0, 1.0,
+    );
+    if (erosion_noise < erosion_threshold) {
+        discard;
+    }
+    let erosion_edge = fx.erosion_soft.y;
+    if (erosion_edge > 0.0) {
+        // 1 at the cut, falling to 0 `edge` above it.
+        let erosion_rim = 1.0 - clamp((erosion_noise - erosion_threshold) / erosion_edge, 0.0, 1.0);
+        pbr_input.material.base_color = mix(
+            pbr_input.material.base_color,
+            fx.erosion_edge_color,
+            erosion_rim * fx.erosion_edge_color.a,
+        );
+    }
+#endif
+#ifdef FX_FRESNEL
+    // Rim brightening: a dot product and a power, but it's much of why a
+    // stylized mesh reads as volumetric rather than as a flat painted shape.
+    // Uses the raw vertex normal/position (unaffected by FX_SCROLL/FX_FLOW's
+    // UV distortion), so it composes independently of them.
+    //
+    // For a camera-facing billboard the normal points at the camera
+    // everywhere, so `dot(n, v)` is ~1 everywhere and the rim is
+    // near-uniform -- this earns its keep on mesh particles (cones, spheres,
+    // tubes), not quads. An author who tries it on a quad first will
+    // conclude it is broken; it isn't, it just has nothing to rim.
+    let fresnel_n = normalize(in.world_normal);
+    let fresnel_v = normalize(view.world_position.xyz - in.world_position.xyz);
+    let fresnel_power = fx.flow_fresnel.w * emitter_uniforms.drive_slots[DRIVE_SLOT_FRESNEL];
+    let fresnel_rim = pow(1.0 - saturate(dot(fresnel_n, fresnel_v)), max(fresnel_power, 0.001));
+    pbr_input.material.base_color = vec4<f32>(
+        pbr_input.material.base_color.rgb
+            + pbr_input.material.base_color.rgb * fresnel_rim * fx.erosion_soft.z,
+        pbr_input.material.base_color.a,
+    );
+#endif
+    // DRIVE_SLOT_EMISSIVE: an untouched slot carries 1.0, so an undriven
+    // effect's emissive contribution is unchanged. Scaling rgb only leaves
+    // the exposure-weight alpha channel (read in pbr_functions.wgsl) alone.
+    pbr_input.material.emissive = vec4<f32>(
+        pbr_input.material.emissive.rgb * emitter_uniforms.drive_slots[DRIVE_SLOT_EMISSIVE],
+        pbr_input.material.emissive.a,
+    );
     pbr_input.material.base_color = pbr_input.material.base_color * particle_color;
+#ifdef FX_SOFT
+    // Fade as the fragment approaches whatever opaque geometry is behind it
+    // -- the hard intersection line where a quad clips the floor is the
+    // single most common tell of amateur VFX; this is the whole fix.
+    //
+    // Forward fragment ONLY: `prepass_depth` reads the depth texture the
+    // depth prepass *produced*, i.e. a texture that must already be
+    // complete. The other two fragment functions in this file (the
+    // depth-only discard prepass and the deferred/normal/motion prepass)
+    // execute DURING that same prepass and cannot meaningfully read their
+    // own not-yet-finished output -- at best garbage, at worst a
+    // driver-undefined read of a texture bound as both render target and
+    // sampled resource in the same pass. Only this forward fragment runs in
+    // a later pass, after the depth prepass has completed for the frame, so
+    // it's the only one of the three where this read is coherent. See the
+    // `#ifdef FX_SOFT #import ... prepass_depth #endif` above for why the
+    // camera must carry `DepthPrepass` for this to compile at all.
+    //
+    // `in.position.z` is already device/NDC depth (the @builtin(position)
+    // fragment input is post-perspective-divide), the same space
+    // `prepass_depth` returns -- both convert through
+    // `depth_ndc_to_view_z` into linear view-space units before
+    // subtracting, so the fade distance means the same thing at every
+    // camera range. Under reversed-Z, nearer is a LARGER raw depth value,
+    // but view-space z is uniformly negative (view space: -z is forward),
+    // so the plain subtraction is already correct without a sign flip.
+    let soft_scene_depth = prepass_depth(in.position, 0u);
+    let soft_this_view_z = depth_ndc_to_view_z(in.position.z);
+    let soft_scene_view_z = depth_ndc_to_view_z(soft_scene_depth);
+    let soft_fade = saturate(
+        abs(soft_scene_view_z - soft_this_view_z) / max(fx.erosion_soft.w, 0.0001),
+    );
+    pbr_input.material.base_color.a = pbr_input.material.base_color.a * soft_fade;
+#endif
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
 
     let particle_alpha = pbr_input.material.base_color.a;
 
     var out: FragmentOutput;
 
+    // Runtime-branched on the material's `unlit` flag, deliberately -- NOT a
+    // shader def. An earlier plan draft assumed this needed `#ifdef`-gating
+    // because bevy's own `pbr.wgsl:81-85` branches the unlit bit outside
+    // `apply_pbr_lighting`, so a shader calling that fn unconditionally
+    // would ignore `unlit` entirely (this exact bug shipped in a sibling
+    // project's ToonMaterial). It does not apply here: this fragment reads
+    // `STANDARD_MATERIAL_FLAGS_UNLIT_BIT` itself and only calls
+    // `apply_pbr_lighting` in the else branch below, so `unlit` already
+    // reaches the fragment correctly through `StandardParticleMaterial::
+    // to_standard_material`'s `unlit: self.unlit` forward
+    // (asset/particle_material.rs). See
+    // `bevy_sprinkles::asset::particle_material::tests` for the Rust-side
+    // pin and this file's `assert_occurs_only_in_forward_fragment` test in
+    // `material.rs` for the shader-side one. There is no `FX_LIT` def --
+    // one was pushed in `specialize` with no `#ifdef` anywhere to read it,
+    // and was removed rather than wired up, since this runtime branch
+    // already does the job.
     let is_unlit = (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) != 0u;
 
     if is_unlit {

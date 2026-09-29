@@ -1,10 +1,12 @@
 use bevy::prelude::*;
+use bevy_sprinkles::asset::EmitterProp;
 use bevy_sprinkles::prelude::*;
 
 use crate::state::EditorState;
 use crate::ui::widgets::inspector_field::{InspectorFieldProps, fields_row, spawn_inspector_field};
 use crate::ui::widgets::vector_edit::VectorSuffixes;
 
+use super::drive_button::{DriveButtonProps, drive_button};
 use super::{InspectorSection, section_needs_setup};
 use crate::ui::components::binding::get_inspecting_emitter;
 
@@ -67,11 +69,26 @@ fn setup_turbulence_options(
             },
         ))
         .with_children(|parent| {
-            let rows: Vec<(Vec<InspectorFieldProps>,)> = vec![
-                (vec![
+            parent.spawn(fields_row()).with_children(|row| {
+                spawn_inspector_field(
+                    row,
                     InspectorFieldProps::new("turbulence.noise_strength"),
+                    &asset_server,
+                );
+                spawn_inspector_field(
+                    row,
                     InspectorFieldProps::new("turbulence.noise_scale"),
-                ],),
+                    &asset_server,
+                );
+                let row_target = row.target_entity();
+                row.commands()
+                    .spawn_scene(drive_button(DriveButtonProps::new(
+                        EmitterProp::TurbulenceStrength,
+                    )))
+                    .insert(ChildOf(row_target));
+            });
+
+            let rows: Vec<(Vec<InspectorFieldProps>,)> = vec![
                 (vec![
                     InspectorFieldProps::new("turbulence.noise_speed").vector(VectorSuffixes::XYZ),
                 ],),

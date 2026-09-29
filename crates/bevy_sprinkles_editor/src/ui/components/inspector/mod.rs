@@ -4,7 +4,13 @@ mod collider_properties;
 mod collision;
 mod colors;
 mod draw_pass;
+// `pub(crate)`: `components::drives` (Task 20's flat list) reuses several of
+// this module's row-editing pieces verbatim (`spawn_drive_row`, its marker
+// components, `stage_label`) rather than reimplementing them.
+pub(crate) mod drive_button;
 mod emission;
+mod light;
+mod material_fx;
 mod particle_flags;
 mod project_properties;
 mod scale;
@@ -16,6 +22,7 @@ mod transform;
 mod turbulence;
 pub mod types;
 pub mod utils;
+mod variable;
 mod velocities;
 mod visibility_aabb;
 
@@ -23,10 +30,11 @@ pub use types::{ComboBoxOption, FieldKind, VariantField};
 pub use utils::{name_to_label, path_to_label};
 
 use bevy::prelude::*;
+use bevy_sprinkles::asset::EmitterProp;
 use bevy_sprinkles::prelude::*;
 
 use crate::state::{ActiveSidebarTab, EditorState, Inspectable, SidebarTab};
-use crate::ui::icons::{ICON_BOX, ICON_SHOWERS};
+use crate::ui::icons::{ICON_BOX, ICON_HASHTAG, ICON_INFORMATION, ICON_SHOWERS};
 use crate::ui::tokens::{
     BORDER_COLOR, FONT_PATH, TEXT_BODY_COLOR, TEXT_MUTED_COLOR, TEXT_SIZE_LG, TEXT_SIZE_SM,
 };
@@ -36,13 +44,14 @@ use crate::ui::widgets::inspector_field::{InspectorFieldProps, fields_row, spawn
 use crate::ui::widgets::panel::{PanelDirection, PanelProps, panel};
 use crate::ui::widgets::panel_section::{PanelSectionProps, PanelSectionSize, panel_section};
 use crate::ui::widgets::scroll::scrollbar;
-use crate::ui::widgets::variant_edit::{VariantEditProps, variant_edit};
+use crate::ui::widgets::variant_edit::{VariantEditProps, spawn_field_widget, variant_edit};
 
 use super::binding::FieldBinding;
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<InspectedEmitterTracker>()
         .init_resource::<InspectedColliderTracker>()
+        .init_resource::<InspectedLightTracker>()
         .add_plugins((
             super::binding::plugin,
             time::plugin,
@@ -60,14 +69,19 @@ pub fn plugin(app: &mut App) {
             particle_flags::plugin,
             collider_properties::plugin,
         ))
+        .add_plugins(variable::plugin)
+        .add_plugins(light::plugin)
         .add_plugins(project_properties::plugin)
         .add_plugins(visibility_aabb::plugin)
+        .add_plugins(drive_button::plugin)
+        .add_plugins(material_fx::plugin)
         .add_systems(
             Update,
             (
                 (
                     update_inspected_emitter_tracker,
                     update_inspected_collider_tracker,
+                    update_inspected_light_tracker,
                 ),
                 (
                     cleanup_dynamic_sections,
@@ -77,7 +91,8 @@ pub fn plugin(app: &mut App) {
                     toggle_inspector_content,
                 )
                     .after(update_inspected_emitter_tracker)
-                    .after(update_inspected_collider_tracker),
+                    .after(update_inspected_collider_tracker)
+                    .after(update_inspected_light_tracker),
             ),
         );
 }
@@ -89,6 +104,11 @@ pub struct InspectedEmitterTracker {
 
 #[derive(Resource, Default)]
 pub struct InspectedColliderTracker {
+    pub current_index: Option<u8>,
+}
+
+#[derive(Resource, Default)]
+pub struct InspectedLightTracker {
     pub current_index: Option<u8>,
 }
 
@@ -126,6 +146,23 @@ pub(super) fn update_inspected_collider_tracker(
     }
 }
 
+pub(super) fn update_inspected_light_tracker(
+    editor_state: Res<EditorState>,
+    mut tracker: ResMut<InspectedLightTracker>,
+) {
+    let new_index = editor_state
+        .inspecting
+        .as_ref()
+        .filter(|i| i.kind == Inspectable::Light)
+        .map(|i| i.index);
+
+    if tracker.current_index != new_index {
+        tracker.current_index = new_index;
+    } else if editor_state.is_changed() {
+        tracker.set_changed();
+    }
+}
+
 #[derive(Component, Default, Clone)]
 pub struct EditorInspectorPanel;
 
@@ -136,6 +173,8 @@ struct InspectorPanelContent;
 enum InspectorContentKind {
     Emitter,
     Collider,
+    Variable,
+    Light,
     Project,
     Settings,
     EnabledCheckbox,
@@ -197,6 +236,15 @@ fn setup_inspector_panel(
                             .with_children(|emitter_content| {
                                 spawn_section(emitter_content, time::time_section());
                                 spawn_section(emitter_content, draw_pass::draw_pass_section());
+                                spawn_section(emitter_content, material_fx::scroll_section());
+                                spawn_section(emitter_content, material_fx::flow_section());
+                                spawn_section(emitter_content, material_fx::erosion_section());
+                                spawn_section(emitter_content, material_fx::fresnel_section());
+                                spawn_section(emitter_content, material_fx::soft_section());
+                                spawn_section(
+                                    emitter_content,
+                                    material_fx::gradient_remap_section(),
+                                );
                                 spawn_section(
                                     emitter_content,
                                     visibility_aabb::visibility_aabb_section(),
@@ -242,6 +290,37 @@ fn setup_inspector_panel(
                                     collider_properties::collider_properties_section(),
                                 );
                                 spawn_section(collider_content, transform::transform_section());
+                            });
+
+                        content
+                            .spawn((
+                                InspectorContentKind::Variable,
+                                Node {
+                                    width: percent(100),
+                                    flex_direction: FlexDirection::Column,
+                                    display: Display::None,
+                                    ..default()
+                                },
+                            ))
+                            .with_children(|variable_content| {
+                                spawn_section(variable_content, variable::variable_section());
+                            });
+
+                        content
+                            .spawn((
+                                InspectorContentKind::Light,
+                                Node {
+                                    width: percent(100),
+                                    flex_direction: FlexDirection::Column,
+                                    display: Display::None,
+                                    ..default()
+                                },
+                            ))
+                            .with_children(|light_content| {
+                                spawn_section(light_content, light::light_section());
+                                spawn_section(light_content, light::light_transform_section());
+                                spawn_section(light_content, light::light_time_section());
+                                spawn_section(light_content, light::light_color_section());
                             });
 
                         content
@@ -310,6 +389,8 @@ fn toggle_inspector_content(
         let visible = match kind {
             InspectorContentKind::Emitter => inspecting_kind == Some(Inspectable::Emitter),
             InspectorContentKind::Collider => inspecting_kind == Some(Inspectable::Collider),
+            InspectorContentKind::Variable => inspecting_kind == Some(Inspectable::Variable),
+            InspectorContentKind::Light => inspecting_kind == Some(Inspectable::Light),
             InspectorContentKind::Project => {
                 active_tab.0 == SidebarTab::Project && editor_state.current_project.is_some()
             }
@@ -405,6 +486,31 @@ pub enum InspectorItem {
     Variant {
         path: String,
         props: VariantEditProps,
+    },
+    /// A numeric field paired with the drive affordance for the
+    /// `EmitterProp` it authors -- see `drive_button`'s module doc. Kept as
+    /// its own variant (rather than a builder method on `InspectorFieldProps`)
+    /// so the widgets crate does not need to know about `EmitterProp`.
+    Driven {
+        field: InspectorFieldProps,
+        prop: EmitterProp,
+    },
+    /// A field reached through the enclosing draw-pass material's own
+    /// `VariantField` accessor rather than a bare emitter path -- Task 22's
+    /// `FxSettings` fields, which live at `draw_pass.material.fx.<name>`,
+    /// two hops inside the `StandardParticleMaterial` a
+    /// `DrawPassMaterial::Standard` tuple variant carries. Dispatches
+    /// through `variant_edit::spawn_field_widget` (Task 19/20's per-
+    /// `FieldKind` widget picker), the same dispatch every OTHER variant-
+    /// carried field in this inspector already goes through, rather than
+    /// re-deriving a widget per `FieldKind` here. `drives` lists the
+    /// `EmitterProp`s (zero, one, or -- for a vector field whose components
+    /// are driven independently, like `fx.scroll`'s `ScrollU`/`ScrollV` --
+    /// two) that get a drive button appended after the field.
+    MaterialField {
+        base_path: &'static str,
+        field: VariantField,
+        drives: Vec<EmitterProp>,
     },
 }
 
@@ -515,6 +621,43 @@ fn setup_inspector_section_fields(
                                     .insert(FieldBinding::emitter(&path, FieldKind::default()))
                                     .insert(ChildOf(row_target));
                             }
+                            InspectorItem::Driven { field, prop } => {
+                                spawn_inspector_field(row, field, &asset_server);
+                                let row_target = row.target_entity();
+                                row.commands()
+                                    .spawn_scene(drive_button::drive_button(
+                                        drive_button::DriveButtonProps::new(prop),
+                                    ))
+                                    .insert(ChildOf(row_target));
+                            }
+                            InspectorItem::MaterialField {
+                                base_path,
+                                field,
+                                drives,
+                            } => {
+                                let row_target = row.target_entity();
+                                let binding = FieldBinding::emitter_variant_field(
+                                    base_path,
+                                    &field.name,
+                                    field.kind.clone(),
+                                );
+                                let label = path_to_label(&field.name);
+                                let mut cmds = row.commands();
+                                let widget_entity = spawn_field_widget(
+                                    &mut cmds,
+                                    &asset_server,
+                                    &field,
+                                    label,
+                                    binding,
+                                );
+                                cmds.entity(widget_entity).insert(ChildOf(row_target));
+                                for prop in drives {
+                                    cmds.spawn_scene(drive_button::drive_button(
+                                        drive_button::DriveButtonProps::new(prop),
+                                    ))
+                                    .insert(ChildOf(row_target));
+                                }
+                            }
                         }
                     }
                 });
@@ -540,6 +683,18 @@ fn get_outliner_title(
             let collider = asset.colliders.get(inspecting.index as usize);
             let name = collider.map(|c| c.name.clone()).unwrap_or_default();
             (name, ICON_BOX)
+        }
+        Inspectable::Variable => {
+            let variable = asset.variables.get(inspecting.index as usize);
+            let name = variable.map(|v| v.name.clone()).unwrap_or_default();
+            (name, ICON_HASHTAG)
+        }
+        Inspectable::Light => {
+            let light = asset.lights.get(inspecting.index as usize);
+            let name = light.map(|l| l.name.clone()).unwrap_or_default();
+            // No dedicated light-bulb icon asset exists yet; the info glyph
+            // is a placeholder rather than a claim this is the right icon.
+            (name, ICON_INFORMATION)
         }
     })
 }
@@ -582,9 +737,11 @@ fn cleanup_dynamic_sections(
     mut commands: Commands,
     emitter_tracker: Res<InspectedEmitterTracker>,
     collider_tracker: Res<InspectedColliderTracker>,
+    light_tracker: Res<InspectedLightTracker>,
     existing: Query<Entity, With<DynamicSectionContent>>,
 ) {
-    if !emitter_tracker.is_changed() && !collider_tracker.is_changed() {
+    if !emitter_tracker.is_changed() && !collider_tracker.is_changed() && !light_tracker.is_changed()
+    {
         return;
     }
 

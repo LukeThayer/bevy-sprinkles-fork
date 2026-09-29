@@ -18,7 +18,7 @@ pub use curve::{Curve, CurveEasing, CurveMode, CurvePoint, CurveTexture};
 pub use drive::{
     DRIVE_SLOT_COUNT, Drive, DriveOp, DriveTarget, EmitterProp, LightProp, Stage, TransformProp,
 };
-pub use fx::{FxSettings, FxUniform};
+pub use fx::{DrivenFx, FxSettings, FxUniform};
 pub use gradient::{Gradient, GradientInterpolation, GradientStop, SolidOrGradientColor};
 pub use light::{FxLightKind, LightData};
 pub use particle_material::{

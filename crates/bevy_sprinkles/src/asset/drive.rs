@@ -32,14 +32,21 @@ pub enum Stage {
 ///
 /// The practical consequence, which the drive an author actually writes turns
 /// on: a property whose authored baseline is `0.0` multiplies to zero no
-/// matter which op the drive uses. A drivable property needs a non-zero
-/// baseline (see [`super::FxSettings::erosion_threshold`], which defaults to
-/// zero precisely because zero means "feature off").
+/// matter which op the drive uses.
 ///
-/// `DriveTarget::Transform`'s `Pos*` and `Rot*` channels are the one genuine
-/// exception: `drives::apply_transform_drives` WRITES the resolved value into
-/// the `Transform` rather than scaling the authored one, so there the
-/// authored value really is replaced -- by any op, not just `Replace`.
+/// There are two exceptions, both at the CONSUMER rather than in the fold:
+///
+/// - The five FX scalars (`ScrollU`, `ScrollV`, `FlowStrength`,
+///   `ErosionThreshold`, `FresnelPower`) substitute a `1.0` baseline when the
+///   authored value is exactly `0.0` and a drive targets them, so the
+///   multiply passes the drive's output through. See
+///   [`super::FxUniform::from_settings`]; those five default to zero because
+///   zero means "feature off", which would otherwise make them the properties
+///   an author is most likely to want driven and least able to drive.
+/// - `DriveTarget::Transform`'s `Pos*` and `Rot*` channels:
+///   `drives::apply_transform_drives` WRITES the resolved value into the
+///   `Transform` rather than scaling the authored one, so there the authored
+///   value really is replaced -- by any op, not just `Replace`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, Reflect)]
 pub enum DriveOp {
     /// Discard what EARLIER DRIVES on this target contributed, and start from

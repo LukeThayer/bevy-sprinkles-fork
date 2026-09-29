@@ -4,8 +4,8 @@ use bevy::{
 
 use crate::{
     asset::{
-        DRIVE_SLOT_COUNT, DrawPassMaterial, EmitterData, EmitterTrail, FxSettings, FxUniform,
-        ParticlesAsset,
+        DRIVE_SLOT_COUNT, DrawPassMaterial, DrivenFx, EmitterData, EmitterTrail, FxSettings,
+        FxUniform, ParticlesAsset,
     },
     drives::{EffectDrives, EmitterResolved},
     material::{
@@ -68,6 +68,23 @@ pub(crate) fn get_emitter_data<'a>(
 ) -> Option<&'a EmitterData> {
     get_particle_asset(parent_system, particle_systems, assets)
         .and_then(|asset| asset.emitters.get(emitter_index))
+}
+
+/// What the effect's drive list aims at one emitter, for the callers that
+/// reach the asset through an `EmitterEntity` rather than iterating it.
+///
+/// An unreachable asset answers `DrivenFx::NONE` rather than panicking: both
+/// callers have already bailed out of the frame by the time that could
+/// happen, and the authored-only answer is the safe one regardless.
+fn driven_fx_for(
+    parent_system: Entity,
+    emitter_index: usize,
+    particle_systems: &Query<&Particles3d>,
+    assets: &Assets<ParticlesAsset>,
+) -> DrivenFx {
+    get_particle_asset(parent_system, particle_systems, assets)
+        .map(|asset| DrivenFx::for_emitter(&asset.drives, emitter_index))
+        .unwrap_or(DrivenFx::NONE)
 }
 
 fn get_editor_assets_folders<'a>(
@@ -242,14 +259,43 @@ fn resolve_gradient_texture(
         .map(|gradient| cache.get_or_create(gradient, images))
 }
 
+/// Decides which FX `#ifdef` blocks this emitter's fragment shader compiles.
+///
+/// Split out of [`build_extension`] for the same reason
+/// [`resolve_gradient_texture`] was: `build_extension` needs an
+/// `AssetServer` and so has no test coverage, and this answer is the half
+/// that a drive can change. Reverting any of the four `*_with_drives` calls
+/// below to its authored-only sibling is exactly the regression Fix 1
+/// repaired, and the tests at the bottom of this file fail on each.
+///
+/// `soft` and `gradient` take the authored-only predicates because no
+/// [`EmitterProp`](crate::asset::EmitterProp) targets either -- there is no
+/// drive that could switch them on.
+fn build_fx_defs(fx: &FxSettings, driven: DrivenFx) -> FxDefs {
+    FxDefs {
+        scroll: fx.scroll_enabled_with_drives(driven),
+        flow: fx.flow_enabled_with_drives(driven),
+        erosion: fx.erosion_enabled_with_drives(driven),
+        fresnel: fx.fresnel_enabled_with_drives(driven),
+        soft: fx.soft_enabled(),
+        gradient: fx.gradient_enabled(),
+    }
+}
+
 /// Builds the [`ParticleMaterialExtension`] from a buffer pair plus an
 /// authored [`FxSettings`]: the clamped GPU uniform, the loaded feature
 /// textures, and the shader-def flags that pick which `#ifdef` blocks the
 /// fragment compiles.
+///
+/// `driven` is what the effect's drive list aims at THIS emitter, and it
+/// reaches both halves: a drive can switch a feature's block on
+/// ([`build_fx_defs`]) and can lift a zero baseline out of the multiply
+/// ([`FxUniform::from_settings`]). Either one alone leaves the drive inert.
 fn build_extension(
     sorted_particles: Handle<ShaderBuffer>,
     emitter_uniforms: Handle<ShaderBuffer>,
     fx: &FxSettings,
+    driven: DrivenFx,
     asset_server: &AssetServer,
     assets_folders: &[String],
     gradient_cache: &mut GradientTextureCache,
@@ -268,18 +314,11 @@ fn build_extension(
     ParticleMaterialExtension {
         sorted_particles,
         emitter_uniforms,
-        fx: FxUniform::from(fx),
+        fx: FxUniform::from_settings(fx, driven),
         flow_texture,
         erosion_texture,
         gradient_texture,
-        defs: FxDefs {
-            scroll: fx.scroll_enabled(),
-            flow: fx.flow_enabled(),
-            erosion: fx.erosion_enabled(),
-            fresnel: fx.fresnel_enabled(),
-            soft: fx.soft_enabled(),
-            gradient: fx.gradient_enabled(),
-        },
+        defs: build_fx_defs(fx, driven),
     }
 }
 
@@ -287,6 +326,7 @@ fn create_particle_material_from_config(
     config: &DrawPassMaterial,
     sorted_particles_buffer: Handle<ShaderBuffer>,
     emitter_uniforms_buffer: Handle<ShaderBuffer>,
+    driven: DrivenFx,
     asset_server: &AssetServer,
     assets_folders: &[String],
     gradient_cache: &mut GradientTextureCache,
@@ -308,6 +348,7 @@ fn create_particle_material_from_config(
             sorted_particles_buffer,
             emitter_uniforms_buffer,
             fx_settings,
+            driven,
             asset_server,
             assets_folders,
             gradient_cache,
@@ -410,6 +451,7 @@ pub fn setup_particle_systems(
                 &current_material,
                 sorted_particles_buffer_handle.clone(),
                 emitter_uniforms_buffer_handle.clone(),
+                DrivenFx::for_emitter(&asset.drives, emitter_index),
                 &asset_server,
                 assets_folders,
                 &mut gradient_cache,
@@ -698,6 +740,12 @@ pub(crate) fn sync_particle_buffers(
             &emitter_data.draw_pass.material,
             new_sorted_buf,
             new_uniforms_buf,
+            driven_fx_for(
+                emitter.parent_system,
+                runtime.emitter_index,
+                &particle_systems,
+                &assets,
+            ),
             &asset_server,
             assets_folders,
             &mut gradient_cache,
@@ -840,6 +888,12 @@ pub fn sync_particle_material(
                 &new_material,
                 sorted_particles_handle,
                 emitter_uniforms_handle,
+                driven_fx_for(
+                    emitter.parent_system,
+                    runtime.emitter_index,
+                    &particle_systems,
+                    &assets,
+                ),
                 &asset_server,
                 assets_folders,
                 &mut gradient_cache,
@@ -950,5 +1004,114 @@ mod tests {
             handle_b.id(),
             "two emitters authoring an equal gradient must share one baked texture"
         );
+    }
+
+    // --- Drive-aware shader-def gating -------------------------------
+    //
+    // A def that is never pushed means the `#ifdef` block never compiles, so
+    // the feature is absent from the shader entirely -- no uniform value and
+    // no drive can switch it back on at draw time. These pin the first half
+    // of Fix 1; `asset::fx`'s tests pin the second (the zero baseline).
+
+    fn driven(prop: crate::asset::EmitterProp) -> DrivenFx {
+        DrivenFx::for_emitter(
+            &[crate::asset::Drive {
+                variable: crate::asset::VariableId(0),
+                target: crate::asset::DriveTarget::Emitter { index: 0, prop },
+                curve: crate::asset::CurveTexture::default(),
+                output: crate::asset::Range { min: 0.0, max: 1.0 },
+                op: crate::asset::DriveOp::Multiply,
+                muted: false,
+            }],
+            0,
+        )
+    }
+
+    fn a_texture() -> Option<crate::TextureRef> {
+        Some(crate::TextureRef::Asset("noise.png".into()))
+    }
+
+    #[test]
+    fn a_drive_on_a_zero_authored_scalar_compiles_its_block_in() {
+        use crate::asset::EmitterProp::*;
+        let bare = FxSettings::default();
+        let with_textures = FxSettings {
+            flow_texture: a_texture(),
+            erosion_texture: a_texture(),
+            ..Default::default()
+        };
+
+        assert!(
+            build_fx_defs(&bare, driven(ScrollU)).scroll,
+            "a ScrollU drive must push FX_SCROLL"
+        );
+        assert!(
+            build_fx_defs(&bare, driven(ScrollV)).scroll,
+            "a ScrollV drive must push FX_SCROLL"
+        );
+        assert!(
+            build_fx_defs(&with_textures, driven(FlowStrength)).flow,
+            "a FlowStrength drive must push FX_FLOW"
+        );
+        assert!(
+            build_fx_defs(&with_textures, driven(ErosionThreshold)).erosion,
+            "an ErosionThreshold drive must push FX_EROSION"
+        );
+        assert!(
+            build_fx_defs(&bare, driven(FresnelPower)).fresnel,
+            "a FresnelPower drive must push FX_FRESNEL"
+        );
+    }
+
+    #[test]
+    fn an_undriven_zero_authored_scalar_still_compiles_nothing() {
+        // Without this, the test above would pass for the wrong reason (defs
+        // pushed unconditionally) and every stock effect would pay for four
+        // shader blocks it never uses.
+        let defs = build_fx_defs(
+            &FxSettings {
+                flow_texture: a_texture(),
+                erosion_texture: a_texture(),
+                ..Default::default()
+            },
+            DrivenFx::NONE,
+        );
+        assert_eq!(defs, FxDefs::default());
+    }
+
+    #[test]
+    fn a_flow_or_erosion_drive_with_no_texture_compiles_nothing() {
+        // A drive satisfies only the SCALAR half of these two gates: both
+        // blocks sample a texture binding, and with nothing bound there is
+        // no pattern for the drive to scale.
+        use crate::asset::EmitterProp::*;
+        let bare = FxSettings::default();
+        assert!(
+            !build_fx_defs(&bare, driven(FlowStrength)).flow,
+            "no flow texture means nothing for FX_FLOW to sample"
+        );
+        assert!(
+            !build_fx_defs(&bare, driven(ErosionThreshold)).erosion,
+            "no erosion texture means nothing for FX_EROSION to sample"
+        );
+    }
+
+    #[test]
+    fn a_drive_never_compiles_the_two_undrivable_blocks() {
+        // `soft` and `gradient` have no `EmitterProp` targeting them, so
+        // they must stay on the authored-only predicates -- a drive-aware
+        // gate there could only ever be dead code that misleads a reader.
+        let defs = build_fx_defs(
+            &FxSettings::default(),
+            DrivenFx {
+                scroll_u: true,
+                scroll_v: true,
+                flow_strength: true,
+                erosion_threshold: true,
+                fresnel_power: true,
+            },
+        );
+        assert!(!defs.soft);
+        assert!(!defs.gradient);
     }
 }

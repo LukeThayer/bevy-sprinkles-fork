@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::ShaderType;
 use serde::{Deserialize, Serialize};
 
+use super::{Drive, DriveTarget, EmitterProp};
 use crate::TextureRef;
 
 /// The stylized-FX half of a particle material: everything that makes a
@@ -43,16 +44,19 @@ pub struct FxSettings {
     /// Noise value below which a fragment is discarded. `0` disables erosion
     /// regardless of whether a texture is set.
     ///
-    /// **A zero baseline cannot be driven up.** The shader multiplies this by
-    /// the resolved drive slot (`fx.erosion_soft.x *
-    /// drive_slots[DRIVE_SLOT_EROSION]`), and no
+    /// **A zero baseline here means "the drive supplies the whole value".**
+    /// The shader multiplies this by the resolved drive slot
+    /// (`fx.erosion_soft.x * drive_slots[DRIVE_SLOT_EROSION]`) and no
     /// [`DriveOp`](super::DriveOp) changes that — the authored value is
-    /// applied downstream of the fold, never inside it. So an effect that
-    /// wants `EmitterProp::ErosionThreshold` to dissolve it on command must
-    /// author a non-zero threshold here and let the drive scale that, rather
-    /// than leaving this at its default and expecting the drive to supply the
-    /// whole value. The same holds for every drivable property whose authored
-    /// default is `0.0`.
+    /// applied downstream of the fold, never inside it — so a literal zero
+    /// would annihilate the wire. [`FxUniform::from_settings`] therefore
+    /// hands the GPU a `1.0` baseline when a drive targets
+    /// [`EmitterProp::ErosionThreshold`](super::EmitterProp::ErosionThreshold)
+    /// on this emitter and this field is exactly `0.0`, and
+    /// [`FxSettings::erosion_enabled_with_drives`] compiles the block in.
+    /// Authoring a NON-zero threshold still means what it always did: the
+    /// drive scales it. Same rule for the other four drivable FX scalars
+    /// (`scroll.x`, `scroll.y`, `flow_strength`, `fresnel_power`).
     pub erosion_threshold: f32,
     /// Width, in noise units, of the emissive rim painted just above the
     /// erosion cut.
@@ -101,6 +105,95 @@ impl Default for FxSettings {
     }
 }
 
+/// Which of the five drivable FX scalars a [`Drive`] targets on ONE emitter.
+///
+/// Those five are the only [`EmitterProp`]s whose baseline lives in
+/// [`FxSettings`] rather than in the simulation uniform, and they are the
+/// reason this type exists: whether a feature's shader block is compiled, and
+/// whether its authored baseline is substituted, cannot be answered from
+/// `FxSettings` alone -- that struct has never known anything about drives.
+///
+/// **A muted drive still counts.** `muted` is the editor's A/B toggle and is
+/// flipped live, but the shader defs this answer feeds are baked into the
+/// material when it is built, and nothing rebuilds a material when a drive
+/// changes -- so a mute-sensitive answer would go stale exactly when it
+/// mattered, giving a toggle that half-works rather than one that works.
+/// Muting keeps its documented meaning downstream instead, where it is
+/// honoured every frame: `drives::sample` returns `None`, the slot folds back
+/// to identity, and a substituted baseline of `1.0` then passes that identity
+/// through unchanged.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct DrivenFx {
+    /// Some drive targets [`EmitterProp::ScrollU`] -- the `x` lane of
+    /// [`FxSettings::scroll`].
+    pub scroll_u: bool,
+    /// Some drive targets [`EmitterProp::ScrollV`] -- the `y` lane of
+    /// [`FxSettings::scroll`].
+    pub scroll_v: bool,
+    /// Some drive targets [`EmitterProp::FlowStrength`].
+    pub flow_strength: bool,
+    /// Some drive targets [`EmitterProp::ErosionThreshold`].
+    pub erosion_threshold: bool,
+    /// Some drive targets [`EmitterProp::FresnelPower`].
+    pub fresnel_power: bool,
+}
+
+impl DrivenFx {
+    /// Nothing driven -- the answer for a caller with no drive list to hand,
+    /// and the one [`FxUniform`]'s `From<&FxSettings>` assumes.
+    pub const NONE: Self = Self {
+        scroll_u: false,
+        scroll_v: false,
+        flow_strength: false,
+        erosion_threshold: false,
+        fresnel_power: false,
+    };
+
+    /// Scans a whole effect's drive list for the wires aimed at one emitter.
+    ///
+    /// Drives are per-emitter ([`DriveTarget::Emitter`] carries the index), so
+    /// a fresnel drive on emitter 0 must not compile the fresnel block into
+    /// emitter 1's shader: that emitter would pay the block's fill rate to
+    /// multiply by an identity slot forever.
+    pub fn for_emitter(drives: &[Drive], emitter_index: usize) -> Self {
+        let mut out = Self::NONE;
+        for drive in drives {
+            let DriveTarget::Emitter { index, prop } = &drive.target else {
+                continue;
+            };
+            if *index as usize != emitter_index {
+                continue;
+            }
+            match prop {
+                EmitterProp::ScrollU => out.scroll_u = true,
+                EmitterProp::ScrollV => out.scroll_v = true,
+                EmitterProp::FlowStrength => out.flow_strength = true,
+                EmitterProp::ErosionThreshold => out.erosion_threshold = true,
+                EmitterProp::FresnelPower => out.fresnel_power = true,
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// The baseline an FX scalar hands the GPU, given whether a drive targets it.
+///
+/// The shader applies a drive by MULTIPLYING the slot into the authored value
+/// (`fx.flow_fresnel.w * drive_slots[DRIVE_SLOT_FRESNEL]` and its three
+/// siblings), so an authored `0.0` annihilates whatever the drive resolved to
+/// and the wire is inert no matter which [`DriveOp`](super::DriveOp) it uses.
+/// Substituting `1.0` for exactly that case turns the multiply into a
+/// pass-through: `0.0` comes to mean "no baseline, the drive supplies the
+/// whole value" instead of "permanently off".
+///
+/// A NON-ZERO authored value is left alone deliberately, so a drive on a
+/// `fresnel_power: 2.0` still scales that 2.0 rather than silently discarding
+/// an authored figure the author can see in the inspector.
+fn driven_baseline(v: f32, driven: bool) -> f32 {
+    if driven && v == 0.0 { 1.0 } else { v }
+}
+
 impl FxSettings {
     /// Whether UV scroll/tiling differs from the inert default.
     pub fn scroll_enabled(&self) -> bool {
@@ -125,6 +218,42 @@ impl FxSettings {
     /// Whether the gradient remap is active.
     pub fn gradient_enabled(&self) -> bool {
         self.gradient_remap.is_some()
+    }
+
+    // --- Drive-aware gating -------------------------------------------
+    //
+    // The `*_enabled` predicates above answer "did the AUTHOR switch this
+    // on", and that is what several callers want (the editor's FX summary
+    // and the per-feature reset buttons in `inspector::material_fx`, which
+    // clear exactly the fields those predicates read). The shader defs want
+    // a different question -- "can this feature ever do anything at runtime"
+    // -- and a drive is the other way one of these scalars becomes non-zero.
+    // Asking the authored-only question there is half of why a drive on a
+    // zero baseline was inert twice over: the block was never compiled in,
+    // and the uniform carried a zero. `driven_baseline` is the other half.
+    //
+    // A TEXTURE requirement is NOT relaxed. `flow` and `erosion` sample a
+    // texture binding; with nothing bound there is no pattern for a drive to
+    // scale, so a drive satisfies only the SCALAR half of those two gates.
+
+    /// [`scroll_enabled`](Self::scroll_enabled), or some drive scrolls a lane.
+    pub fn scroll_enabled_with_drives(&self, driven: DrivenFx) -> bool {
+        self.scroll_enabled() || driven.scroll_u || driven.scroll_v
+    }
+    /// [`flow_enabled`](Self::flow_enabled), or a drive supplies the strength
+    /// -- a flow texture is still mandatory.
+    pub fn flow_enabled_with_drives(&self, driven: DrivenFx) -> bool {
+        self.flow_texture.is_some() && (self.flow_strength != 0.0 || driven.flow_strength)
+    }
+    /// [`erosion_enabled`](Self::erosion_enabled), or a drive supplies the
+    /// threshold -- an erosion texture is still mandatory.
+    pub fn erosion_enabled_with_drives(&self, driven: DrivenFx) -> bool {
+        self.erosion_texture.is_some()
+            && (self.erosion_threshold > 0.0 || self.erosion_edge > 0.0 || driven.erosion_threshold)
+    }
+    /// [`fresnel_enabled`](Self::fresnel_enabled), or a drive supplies the power.
+    pub fn fresnel_enabled_with_drives(&self, driven: DrivenFx) -> bool {
+        self.fresnel_power > 0.0 || driven.fresnel_power
     }
 
     /// True when any feature is on. Used only by tests and the editor summary;
@@ -200,24 +329,37 @@ pub struct FxUniform {
     pub erosion_edge_color: Vec4,
 }
 
-impl From<&FxSettings> for FxUniform {
-    /// Clamps every authored value to something finite. Authored `.ron` is
-    /// untrusted input, and a NaN reaching the fragment shader can blank the
-    /// draw -- which an author reads as "my effect vanished".
-    fn from(f: &FxSettings) -> Self {
-        let scroll = finite2(f.scroll, Vec2::ZERO);
+impl FxUniform {
+    /// Builds the GPU uniform, substituting a `1.0` baseline for any of the
+    /// five drivable scalars that a drive targets and the author left at
+    /// zero. See [`driven_baseline`] for why, and [`DrivenFx`] for what
+    /// counts as driven.
+    ///
+    /// The substitution belongs HERE rather than in the shader: WGSL in this
+    /// crate is validated only at pipeline specialization, which no test and
+    /// no headless run reaches, so the same rule expressed in
+    /// `particle_material.wgsl` would be unverifiable. Expressed as this
+    /// function it is ordinary Rust with ordinary tests.
+    pub fn from_settings(f: &FxSettings, driven: DrivenFx) -> Self {
+        let mut scroll = finite2(f.scroll, Vec2::ZERO);
+        // Per COMPONENT, not per vector: `ScrollU` is `.x` and `ScrollV` is
+        // `.y`, so a drive on one lane must leave the other lane's authored
+        // value (very often a deliberate zero) exactly as authored.
+        scroll.x = driven_baseline(scroll.x, driven.scroll_u);
+        scroll.y = driven_baseline(scroll.y, driven.scroll_v);
         let tiling = finite2(f.tiling, Vec2::ONE);
         let flow_scroll = finite2(f.flow_scroll, Vec2::ZERO);
         Self {
             scroll_tiling: Vec4::new(scroll.x, scroll.y, tiling.x, tiling.y),
             flow_fresnel: Vec4::new(
-                finite(f.flow_strength, 0.0),
+                driven_baseline(finite(f.flow_strength, 0.0), driven.flow_strength),
                 flow_scroll.x,
                 flow_scroll.y,
-                finite(f.fresnel_power, 0.0),
+                driven_baseline(finite(f.fresnel_power, 0.0), driven.fresnel_power),
             ),
             erosion_soft: Vec4::new(
-                finite(f.erosion_threshold, 0.0).clamp(0.0, 1.0),
+                driven_baseline(finite(f.erosion_threshold, 0.0), driven.erosion_threshold)
+                    .clamp(0.0, 1.0),
                 finite(f.erosion_edge, 0.0).clamp(0.0, 1.0),
                 finite(f.fresnel_boost, 0.0),
                 finite(f.soft_fade, 0.0).max(0.0),
@@ -232,6 +374,20 @@ impl From<&FxSettings> for FxUniform {
                 Vec4::new(c[0], c[1], c[2], c[3].clamp(0.0, 1.0))
             },
         }
+    }
+}
+
+impl From<&FxSettings> for FxUniform {
+    /// The undriven conversion: every authored value clamped to something
+    /// finite and nothing substituted. Authored `.ron` is untrusted input,
+    /// and a NaN reaching the fragment shader can blank the draw -- which an
+    /// author reads as "my effect vanished".
+    ///
+    /// Kept as the `From` impl because it is the answer for a caller that has
+    /// no drive list; the material builder has one and calls
+    /// [`FxUniform::from_settings`] instead.
+    fn from(f: &FxSettings) -> Self {
+        Self::from_settings(f, DrivenFx::NONE)
     }
 }
 
@@ -343,5 +499,175 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(cold.erosion_edge_color.w, 0.0);
+    }
+
+    // --- A drive on a zero authored baseline -------------------------
+    //
+    // Two independent mechanisms used to kill such a drive, and these cover
+    // the second: the shader multiplies the slot into the authored value, so
+    // a literal `0.0` annihilated it. (`spawning::build_fx_defs`'s tests
+    // cover the first, which is that the block was never compiled at all.)
+
+    use crate::asset::{CurveTexture, DriveOp, Range, VariableId};
+
+    fn drive_targeting(prop: EmitterProp, emitter: u8) -> Drive {
+        Drive {
+            variable: VariableId(0),
+            target: DriveTarget::Emitter {
+                index: emitter,
+                prop,
+            },
+            curve: CurveTexture::default(),
+            output: Range { min: 0.0, max: 1.0 },
+            op: DriveOp::Multiply,
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn a_driven_zero_baseline_reaches_the_gpu_as_one() {
+        let fx = FxSettings::default(); // every one of the five is 0.0
+        let driven = DrivenFx {
+            scroll_u: true,
+            scroll_v: true,
+            flow_strength: true,
+            erosion_threshold: true,
+            fresnel_power: true,
+        };
+        let u = FxUniform::from_settings(&fx, driven);
+        assert_eq!(u.scroll_tiling.x, 1.0, "scroll U");
+        assert_eq!(u.scroll_tiling.y, 1.0, "scroll V");
+        assert_eq!(u.flow_fresnel.x, 1.0, "flow strength");
+        assert_eq!(u.flow_fresnel.w, 1.0, "fresnel power");
+        assert_eq!(u.erosion_soft.x, 1.0, "erosion threshold");
+    }
+
+    #[test]
+    fn an_authored_non_zero_baseline_is_not_replaced_by_a_drive() {
+        // The other half of the rule, and the one a "just make the drive
+        // authoritative" fix would break: an author who wrote `2.0` can see
+        // that 2.0 in the inspector, so the drive must scale it rather than
+        // silently discard it.
+        let fx = FxSettings {
+            scroll: Vec2::new(0.25, 0.5),
+            flow_strength: 3.0,
+            erosion_threshold: 0.4,
+            fresnel_power: 2.0,
+            ..Default::default()
+        };
+        let driven = DrivenFx {
+            scroll_u: true,
+            scroll_v: true,
+            flow_strength: true,
+            erosion_threshold: true,
+            fresnel_power: true,
+        };
+        let u = FxUniform::from_settings(&fx, driven);
+        assert_eq!(u.scroll_tiling.x, 0.25);
+        assert_eq!(u.scroll_tiling.y, 0.5);
+        assert_eq!(u.flow_fresnel.x, 3.0);
+        assert_eq!(u.erosion_soft.x, 0.4);
+        assert_eq!(u.flow_fresnel.w, 2.0);
+    }
+
+    #[test]
+    fn a_scroll_u_drive_substitutes_only_the_u_lane() {
+        // `scroll` is one `Vec2` but two independent props, so substituting
+        // the whole vector would start the V lane scrolling on its own.
+        let u = FxUniform::from_settings(
+            &FxSettings::default(),
+            DrivenFx {
+                scroll_u: true,
+                ..DrivenFx::NONE
+            },
+        );
+        assert_eq!(u.scroll_tiling.x, 1.0);
+        assert_eq!(u.scroll_tiling.y, 0.0, "the undriven lane stays authored");
+    }
+
+    #[test]
+    fn an_undriven_zero_baseline_still_reaches_the_gpu_as_zero() {
+        // Zero means "off" for an effect with no drive at all, and must keep
+        // meaning that -- otherwise every stock effect gains a fresnel rim.
+        let u = FxUniform::from(&FxSettings::default());
+        assert_eq!(u.flow_fresnel.w, 0.0);
+        assert_eq!(u.erosion_soft.x, 0.0);
+        assert_eq!(u.scroll_tiling.x, 0.0);
+    }
+
+    #[test]
+    fn the_authored_only_predicates_are_unmoved_by_a_drive() {
+        // Their callers (the editor's FX summary, `material_fx`'s per-feature
+        // reset buttons) ask "did the author switch this on", and the answer
+        // must not start including drives.
+        let fx = FxSettings::default();
+        let all = DrivenFx {
+            scroll_u: true,
+            scroll_v: true,
+            flow_strength: true,
+            erosion_threshold: true,
+            fresnel_power: true,
+        };
+        assert!(!fx.scroll_enabled());
+        assert!(!fx.flow_enabled());
+        assert!(!fx.erosion_enabled());
+        assert!(!fx.fresnel_enabled());
+        assert!(!fx.enabled());
+        assert!(
+            fx.fresnel_enabled_with_drives(all),
+            "and the drive-aware sibling must differ, or this test is vacuous"
+        );
+    }
+
+    #[test]
+    fn a_drive_on_another_emitter_leaves_this_one_undriven() {
+        // Drives carry an emitter index; compiling emitter 1's fresnel block
+        // into emitter 0 makes it pay that block's fill rate forever to
+        // multiply by an identity slot.
+        let drives = vec![drive_targeting(EmitterProp::FresnelPower, 1)];
+        assert!(!DrivenFx::for_emitter(&drives, 0).fresnel_power);
+        assert!(DrivenFx::for_emitter(&drives, 1).fresnel_power);
+    }
+
+    #[test]
+    fn for_emitter_reads_each_of_the_five_props_and_ignores_the_rest() {
+        let drives: Vec<Drive> = [
+            EmitterProp::ScrollU,
+            EmitterProp::ScrollV,
+            EmitterProp::FlowStrength,
+            EmitterProp::ErosionThreshold,
+            EmitterProp::FresnelPower,
+        ]
+        .into_iter()
+        .map(|p| drive_targeting(p, 0))
+        .collect();
+        assert_eq!(
+            DrivenFx::for_emitter(&drives, 0),
+            DrivenFx {
+                scroll_u: true,
+                scroll_v: true,
+                flow_strength: true,
+                erosion_threshold: true,
+                fresnel_power: true,
+            }
+        );
+
+        // A prop that is not an FX scalar must not set any flag: `Lifetime`
+        // is applied in `spawning.rs`, nowhere near `FxUniform`.
+        let unrelated = vec![drive_targeting(EmitterProp::Lifetime, 0)];
+        assert_eq!(DrivenFx::for_emitter(&unrelated, 0), DrivenFx::NONE);
+    }
+
+    #[test]
+    fn a_muted_drive_still_counts_as_driven() {
+        // Pins the ruling in `DrivenFx`'s doc, which is a real choice and not
+        // an oversight: `muted` is flipped live but the shader defs this
+        // feeds are baked into the material, and nothing rebuilds a material
+        // when a drive changes. Mute keeps its meaning downstream, where the
+        // slot folds to identity every frame and the substituted `1.0`
+        // baseline passes it through.
+        let mut drive = drive_targeting(EmitterProp::FresnelPower, 0);
+        drive.muted = true;
+        assert!(DrivenFx::for_emitter(&[drive], 0).fresnel_power);
     }
 }

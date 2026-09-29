@@ -34,7 +34,7 @@ pub enum Stage {
 /// on: a property whose authored baseline is `0.0` multiplies to zero no
 /// matter which op the drive uses.
 ///
-/// There are two exceptions, both at the CONSUMER rather than in the fold:
+/// There are three exceptions, all at the CONSUMER rather than in the fold:
 ///
 /// - The five FX scalars (`ScrollU`, `ScrollV`, `FlowStrength`,
 ///   `ErosionThreshold`, `FresnelPower`) substitute a `1.0` baseline when the
@@ -47,6 +47,12 @@ pub enum Stage {
 ///   `drives::apply_transform_drives` WRITES the resolved value into the
 ///   `Transform` rather than scaling the authored one, so there the authored
 ///   value really is replaced -- by any op, not just `Replace`.
+/// - [`EmitterProp::DirX`]/`DirY`/`DirZ`, the only `Emitter` targets that are
+///   not multiplies: `extract.rs::apply_sim_drives` WRITES each resolved
+///   component into `EmitterUniforms::direction`, again by any op. That
+///   variant's doc gives the two reasons a multiply could not work there; the
+///   consequence for this enum is that "every `Emitter` target means
+///   MULTIPLICATION" above has exactly these three exceptions.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, Reflect)]
 pub enum DriveOp {
     /// Discard what EARLIER DRIVES on this target contributed, and start from
@@ -101,6 +107,32 @@ pub enum EmitterProp {
     Spread,
     /// Radius of the emission volume.
     EmissionRadius,
+    /// X component of the initial spawn direction, REPLACING the authored
+    /// `velocities.initial_direction.x` (`EmitterUniforms::direction[0]`,
+    /// `extract.rs`; the authored default is `Vec3::X`).
+    ///
+    /// Replacement rather than the usual multiply, for two independent
+    /// reasons, either of which alone would be decisive:
+    ///
+    /// - the shader normalizes what it reads — `normalize(params.direction)`,
+    ///   `particle_simulate.wgsl:600` — so scaling all three components by one
+    ///   factor is a NO-OP. A multiplying `Dir*` trio could change the aim
+    ///   only by being wired unevenly, and could never be driven as a unit at
+    ///   all.
+    /// - a per-axis multiply can never introduce a component the author left
+    ///   at `0.0`, and two of the three are zero in the default direction
+    ///   (`Vec3::X`). The ordinary case — swinging an emitter authored along X
+    ///   round towards Y — would be unreachable.
+    ///
+    /// This matches [`TransformProp`]'s `Rot*` and `Pos*` channels, which
+    /// already write rather than scale; [`DriveOp`] lists every exception.
+    DirX,
+    /// Y component of the initial spawn direction, REPLACING the authored
+    /// one. See [`Self::DirX`] for why these three replace.
+    DirY,
+    /// Z component of the initial spawn direction, REPLACING the authored
+    /// one. See [`Self::DirX`].
+    DirZ,
 
     // --- Sim: read every step; reshapes particles already in flight ---
     /// Downward acceleration applied every step.
@@ -150,9 +182,10 @@ impl EmitterProp {
     /// `tests::emitter_prop_all_matches_the_reflected_enum_exactly`, which
     /// compares this list against the enum's own `#[derive(Reflect)]`
     /// variant metadata rather than against itself.
-    pub const ALL: [EmitterProp; 17] = [
+    pub const ALL: [EmitterProp; 20] = [
         Self::SpawnProbability, Self::Lifetime, Self::InitialSpeed, Self::SpawnSize,
         Self::Spread, Self::EmissionRadius,
+        Self::DirX, Self::DirY, Self::DirZ,
         Self::Gravity, Self::TurbulenceStrength,
         Self::Tint, Self::Alpha, Self::SizeMul, Self::EmissiveIntensity,
         Self::ScrollU, Self::ScrollV, Self::FlowStrength, Self::ErosionThreshold,
@@ -164,7 +197,8 @@ impl EmitterProp {
     pub fn stage(self) -> Stage {
         match self {
             Self::SpawnProbability | Self::Lifetime | Self::InitialSpeed
-            | Self::SpawnSize | Self::Spread | Self::EmissionRadius => Stage::Spawn,
+            | Self::SpawnSize | Self::Spread | Self::EmissionRadius
+            | Self::DirX | Self::DirY | Self::DirZ => Stage::Spawn,
 
             Self::Gravity | Self::TurbulenceStrength => Stage::Sim,
 
@@ -391,6 +425,24 @@ mod tests {
     fn a_non_render_prop_has_no_slot() {
         assert!(EmitterProp::Gravity.slot().is_none());
         assert!(EmitterProp::SpawnSize.slot().is_none());
+    }
+
+    #[test]
+    fn the_direction_components_are_spawn_stage_and_claim_no_render_slot() {
+        // The whole reason this addition needs no `.wgsl` edit: a Spawn prop
+        // rides the simulation uniform's existing `direction` field and takes
+        // no `drive_slots` entry, so `common.wgsl`'s `array<f32, 9>` -- which
+        // nothing in this repo links to `DRIVE_SLOT_COUNT` and no naga run has
+        // ever validated -- stays exactly as it is.
+        for p in [EmitterProp::DirX, EmitterProp::DirY, EmitterProp::DirZ] {
+            assert_eq!(p.stage(), Stage::Spawn, "{p:?} must be read at birth");
+            assert!(p.slot().is_none(), "{p:?} must not consume a render slot");
+        }
+        assert_eq!(
+            DRIVE_SLOT_COUNT, 9,
+            "adding Spawn props must not move the render-slot count -- \
+             that integer is layout-lockstep with shaders/common.wgsl"
+        );
     }
 
     #[test]

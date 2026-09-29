@@ -1365,4 +1365,17 @@ mod tests {
         assert_eq!(prop_label(TransformProp::ScaleY), "Scale Y");
         assert_eq!(prop_label(LightProp::Intensity), "Intensity");
     }
+
+    /// The target picker builds its option list from `EmitterProp::ALL`
+    /// reflectively, so a new variant appears in the combobox with no edit
+    /// here -- and with no check either. `name_to_label` runs the debug name
+    /// through `to_sentence_case`, which is where a variant could come out
+    /// blank or as an unreadable run-on; these three axis suffixes survive it
+    /// only because "x"/"y"/"z" are in `UPPERCASE_ACRONYMS`.
+    #[test]
+    fn the_direction_component_props_label_legibly_in_the_picker() {
+        assert_eq!(prop_label(EmitterProp::DirX), "Dir X");
+        assert_eq!(prop_label(EmitterProp::DirY), "Dir Y");
+        assert_eq!(prop_label(EmitterProp::DirZ), "Dir Z");
+    }
 }

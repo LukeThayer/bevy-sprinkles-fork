@@ -432,6 +432,21 @@ pub(crate) fn apply_sim_drives(u: &mut EmitterUniforms, r: &crate::drives::Emitt
         u.emission_ring_radius *= v;
         u.emission_ring_inner_radius *= v;
     }
+    // The three direction components REPLACE rather than multiply, which is
+    // the one place an `Emitter` drive does. `get_emission_velocity` does
+    // `normalize(params.direction)` (`shaders/particle_simulate.wgsl:600`), so
+    // a uniform scale of this vector is a no-op, and a per-axis multiply could
+    // never lift a component off an authored `0.0` -- and two of the three are
+    // zero in the default `Vec3::X`. See `EmitterProp::DirX`.
+    if let Some(v) = r.spawn.get(&P::DirX) {
+        u.direction[0] = *v;
+    }
+    if let Some(v) = r.spawn.get(&P::DirY) {
+        u.direction[1] = *v;
+    }
+    if let Some(v) = r.spawn.get(&P::DirZ) {
+        u.direction[2] = *v;
+    }
     if let Some(v) = r.sim.get(&P::Gravity) {
         u.gravity = [u.gravity[0] * v, u.gravity[1] * v, u.gravity[2] * v];
     }
@@ -1061,6 +1076,47 @@ mod drive_tests {
         assert_eq!(u.emission_sphere_radius, 0.5);
         assert_eq!(u.emission_ring_radius, 1.0);
         assert_eq!(u.emission_ring_inner_radius, 2.0);
+    }
+
+    #[test]
+    fn each_direction_component_lands_in_its_own_uniform_lane() {
+        // Three near-identical `if let` arms writing three indices of one
+        // array is exactly the shape a copy-paste typo hides in, so the three
+        // driven values are distinct and none is 0.0 or 1.0: any swapped or
+        // duplicated index moves an assertion.
+        let mut u = EmitterUniforms {
+            direction: [1.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        apply_sim_drives(
+            &mut u,
+            &resolved(&[
+                (EmitterProp::DirX, -0.25),
+                (EmitterProp::DirY, 0.75),
+                (EmitterProp::DirZ, 3.5),
+            ]),
+        );
+        assert_eq!(u.direction, [-0.25, 0.75, 3.5]);
+    }
+
+    #[test]
+    fn a_direction_drive_replaces_the_authored_component_rather_than_scaling_it() {
+        // The regression this property exists for. `Vec3::X` is the authored
+        // default, so `y` is 0.0; under the multiply every other Emitter prop
+        // uses, a drive asking for y = 2.0 would resolve to 0.0 * 2.0 = 0.0
+        // and the emitter would never turn. Aiming would be unreachable from
+        // the default direction, which is the one authors start from.
+        let mut u = EmitterUniforms {
+            direction: [1.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::DirY, 2.0)]));
+        assert_eq!(
+            u.direction[1], 2.0,
+            "DirY must WRITE the driven value, not scale the authored 0.0 by it",
+        );
+        assert_eq!(u.direction[0], 1.0, "an undriven component keeps its authored value");
+        assert_eq!(u.direction[2], 0.0);
     }
 
     #[test]

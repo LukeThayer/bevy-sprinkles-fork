@@ -5,7 +5,7 @@ use bevy::anti_alias::smaa::{Smaa, SmaaPreset};
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::primitives::Aabb;
-use bevy::camera::visibility::NoFrustumCulling;
+use bevy::camera::visibility::NoCpuCulling;
 use bevy::color::palettes::tailwind::{ZINC_200, ZINC_950};
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -1004,10 +1004,89 @@ pub fn sync_viewport_settings(
         (None, None) => {}
     }
 
+    // `NoFrustumCulling` is a per-*entity* opt-out (checked via
+    // `Has<NoFrustumCulling>` on the renderable in `visible_aabb_query`,
+    // bevy_camera-0.19.0/src/visibility/mod.rs:768) -- inserting it on the
+    // camera itself does nothing, since the camera is never a member of
+    // that query. The per-*camera* opt-out is `NoCpuCulling`: its own doc
+    // comment says it "can be attached to a `Camera` ... for disabling CPU
+    // culling completely for a `Camera`" (mod.rs:61-67), and
+    // `check_visibility_cpu_culling` reads it as `Has<NoCpuCulling>` on the
+    // view itself (`no_cpu_culling_camera`, mod.rs:756) and skips frustum
+    // culling for every entity visible through that view when it is set
+    // (`if !no_frustum_culling && !no_cpu_culling_camera`, mod.rs:823).
     if settings.frustum_culling {
-        commands.entity(entity).remove::<NoFrustumCulling>();
+        commands.entity(entity).remove::<NoCpuCulling>();
     } else {
-        commands.entity(entity).insert(NoFrustumCulling);
+        commands.entity(entity).insert(NoCpuCulling);
+    }
+}
+
+#[cfg(test)]
+mod viewport_culling_tests {
+    use super::*;
+
+    /// Builds a minimal app with one `EditorCamera` (just the components
+    /// `sync_viewport_settings`'s query needs: `Tonemapping`, no `Bloom`/
+    /// `Smaa`) and an `EditorData` resource, then runs the system once.
+    fn app_with_editor_camera(frustum_culling: bool) -> (App, Entity) {
+        let mut app = App::new();
+        let mut editor_data = EditorData::default();
+        editor_data.settings.frustum_culling = frustum_culling;
+        app.insert_resource(editor_data);
+        app.add_systems(Update, sync_viewport_settings);
+
+        let camera = app
+            .world_mut()
+            .spawn((EditorCamera, Tonemapping::None))
+            .id();
+        app.update();
+        (app, camera)
+    }
+
+    /// The bug this pins: the checkbox toggled `NoFrustumCulling` on the
+    /// *camera* entity, which nothing ever reads (see the doc comment on
+    /// `sync_viewport_settings`'s culling branch) -- the checkbox existed
+    /// and was wired to `EditorSettings::frustum_culling`, but no component
+    /// it touched changed what got rendered. This pins the camera getting
+    /// the component that view-level culling actually checks.
+    #[test]
+    fn turning_frustum_culling_off_gives_the_camera_no_cpu_culling() {
+        let (app, camera) = app_with_editor_camera(false);
+
+        assert!(
+            app.world().get::<NoCpuCulling>(camera).is_some(),
+            "unchecking frustum culling must attach NoCpuCulling to the camera"
+        );
+    }
+
+    #[test]
+    fn turning_frustum_culling_on_leaves_the_camera_without_no_cpu_culling() {
+        let (app, camera) = app_with_editor_camera(true);
+
+        assert!(
+            app.world().get::<NoCpuCulling>(camera).is_none(),
+            "checking frustum culling must not attach NoCpuCulling to the camera"
+        );
+    }
+
+    /// Round-trip: flipping the setting back on after it was off must
+    /// remove the component, not just leave a stale insert in place.
+    #[test]
+    fn re_enabling_frustum_culling_removes_a_previously_added_no_cpu_culling() {
+        let (mut app, camera) = app_with_editor_camera(false);
+        assert!(app.world().get::<NoCpuCulling>(camera).is_some());
+
+        app.world_mut()
+            .resource_mut::<EditorData>()
+            .settings
+            .frustum_culling = true;
+        app.update();
+
+        assert!(
+            app.world().get::<NoCpuCulling>(camera).is_none(),
+            "re-enabling frustum culling must remove NoCpuCulling again"
+        );
     }
 }
 

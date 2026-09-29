@@ -26,6 +26,13 @@
 //! move -- they are the same [`spawn_drive_row`] as before, shown for the ONE
 //! drive selected in the list, in the pane beneath it.
 //!
+//! The list takes the dock's whole leftover height and scrolls inside it,
+//! rather than stopping at a fixed cap and leaving the rest of a tall dock
+//! empty. The editor pane keeps what its content needs, and the list is the
+//! side that yields when the window is too short for both -- a selection has
+//! to land somewhere the author can see, and there is no scroll-to-entity
+//! facility here to rescue one that lands below the fold.
+//!
 //! # Order is meaning, and grouping hides it -- so the list prints it
 //!
 //! `resolve_drives` (`bevy_sprinkles::drives`) folds every drive onto its
@@ -119,13 +126,6 @@ use crate::ui::widgets::separator::{SeparatorProps, separator};
 const DOCK_WIDTH: u32 = 360;
 const DOCK_MIN_WIDTH: u32 = 280;
 const DOCK_MAX_WIDTH: u32 = 560;
-
-/// The collapsed list scrolls on its own past this height, rather than
-/// pushing the editor pane off the bottom of the dock. Without it a
-/// forty-drive effect reproduces the defect this redesign exists to fix: the
-/// author clicks a field's drive button, the selection lands in an editor
-/// pane below the fold, and nothing appears to happen.
-const LIST_MAX_HEIGHT: f32 = 320.0;
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<NewDriveDraft>()
@@ -749,8 +749,14 @@ fn setup_drives_dock(mut commands: Commands, docks: Query<Entity, Added<EditorDr
             .entity(dock_entity)
             .with_child(scrollbar(dock_entity));
 
+        // The list takes the dock's leftover height and scrolls inside it;
+        // the editor pane below keeps what its content needs. The order
+        // matters under compression: `fill`'s zero `min_height` is what
+        // makes the list the section that yields on a short window, so the
+        // editor pane a click selects into can never be pushed off the
+        // bottom.
         commands
-            .spawn_scene(panel_section(PanelSectionProps::new("Drives")))
+            .spawn_scene(panel_section(PanelSectionProps::new("Drives").fill()))
             .insert((DrivesListSection, ChildOf(dock_entity)));
 
         commands
@@ -822,6 +828,10 @@ fn spawn_list(
     draft: &NewDriveDraft,
     selected: Option<usize>,
 ) {
+    // Grows with its filling section, and like it may shrink to nothing:
+    // the chain from the dock down to the scrolling list is only as tall as
+    // its shortest link, so every link in it grows and every one carries a
+    // zero `min_height` (`panel_section::section_fill_sizing`).
     let wrapper = commands
         .spawn((
             DrivesListWrapper,
@@ -829,6 +839,8 @@ fn spawn_list(
                 width: percent(100),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(8.0),
+                flex_grow: 1.0,
+                min_height: px(0),
                 ..default()
             },
         ))
@@ -855,6 +867,12 @@ fn spawn_list(
     // `Hovered` because `scroll::update_scrollbar` reveals a scrollbar only
     // while its container is hovered, and the container here is this list
     // rather than the dock.
+    //
+    // The last link in the growing chain, and the one that scrolls: it takes
+    // whatever height the wrapper has left after the legend and the target
+    // picker, and the drives overflow inside it rather than lengthening the
+    // dock. It used to be capped at a flat 320px instead, which left the
+    // dock's lower half empty on a tall window.
     let list = commands
         .spawn((
             Hovered::default(),
@@ -862,7 +880,8 @@ fn spawn_list(
                 width: percent(100),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(4.0),
-                max_height: px(LIST_MAX_HEIGHT),
+                flex_grow: 1.0,
+                min_height: px(0),
                 overflow: Overflow::scroll_y(),
                 ..default()
             },

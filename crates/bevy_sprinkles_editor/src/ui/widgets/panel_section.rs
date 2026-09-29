@@ -60,6 +60,21 @@ impl PanelSectionSize {
     }
 }
 
+/// How a section sizes itself in its panel's column: a filling section takes
+/// the height left over by the others, the rest take what their content
+/// needs.
+///
+/// The `min_height` half of the pair is not decoration. A flex item's
+/// default `min-height: auto` is its content's minimum size, so a growing
+/// section holding a scrolling child would refuse to shrink below that
+/// child's full content height and would push whatever follows it off the
+/// bottom of the panel -- the exact failure the Drives list's old 320px cap
+/// existed to avoid. Zero is what lets the filling section yield first when
+/// the panel is too short for everything.
+pub fn section_fill_sizing(fill: bool) -> (f32, Val) {
+    if fill { (1.0, px(0)) } else { (0.0, Val::Auto) }
+}
+
 #[derive(Default)]
 pub struct PanelSectionProps {
     pub title: String,
@@ -67,6 +82,7 @@ pub struct PanelSectionProps {
     pub has_add_button: bool,
     pub collapsible: bool,
     pub secondary_add_icon: Option<String>,
+    pub fill: bool,
 }
 
 impl PanelSectionProps {
@@ -100,6 +116,14 @@ impl PanelSectionProps {
         self.collapsible = true;
         self
     }
+
+    /// Take the panel's leftover height instead of only what the content
+    /// needs. The section's own child is then free to grow into it -- see
+    /// [`section_fill_sizing`] for why that needs a `min_height` too.
+    pub fn fill(mut self) -> Self {
+        self.fill = true;
+        self
+    }
 }
 
 pub fn panel_section(props: PanelSectionProps) -> impl Scene {
@@ -109,8 +133,10 @@ pub fn panel_section(props: PanelSectionProps) -> impl Scene {
         has_add_button,
         collapsible,
         secondary_add_icon,
+        fill,
     } = props;
     let padding = size.padding();
+    let (flex_grow, min_height) = section_fill_sizing(fill);
 
     bsn! {
         EditorPanelSection
@@ -121,6 +147,8 @@ pub fn panel_section(props: PanelSectionProps) -> impl Scene {
             row_gap: px(12),
             padding: { padding },
             border: { UiRect::bottom(px(1)) },
+            flex_grow: { flex_grow },
+            min_height: { min_height },
         }
         template_value(BorderColor::all(BORDER_COLOR))
         template_value(PanelSectionState {
@@ -294,5 +322,25 @@ fn on_collapse_click(
         } else {
             Rot2::degrees(180.0)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A filling section must be allowed to shrink as well as grow. Growth
+    /// alone (with `min-height: auto` left in place) is what pushes the
+    /// section below it off the bottom of a short panel.
+    #[test]
+    fn a_filling_section_may_shrink_to_nothing_as_well_as_grow() {
+        assert_eq!(section_fill_sizing(true), (1.0, px(0)));
+    }
+
+    /// Every other section keeps content sizing, so adding `fill` to one
+    /// section cannot change how the rest lay out.
+    #[test]
+    fn a_plain_section_still_takes_only_what_its_content_needs() {
+        assert_eq!(section_fill_sizing(false), (0.0, Val::Auto));
     }
 }

@@ -18,7 +18,7 @@ use bevy::{
 use std::borrow::Cow;
 
 use crate::compute::ParticleComputeLabel;
-use crate::extract::ExtractedParticleSystem;
+use crate::extract::{ExtractedEmitterData, ExtractedParticleSystem};
 use crate::runtime::ParticleData;
 
 const SHADER_ASSET_PATH: &str = "embedded://bevy_sprinkles/shaders/particle_sort.wgsl";
@@ -108,45 +108,32 @@ pub struct ParticleSortBindGroups {
     copy_dispatches: Vec<SortDispatch>,
 }
 
-pub fn prepare_particle_sort_bind_groups(
-    mut commands: Commands,
-    pipeline: Res<ParticleSortPipeline>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    extracted_systems: Res<ExtractedParticleSystem>,
-    gpu_storage_buffers: Res<RenderAssets<GpuShaderBuffer>>,
-) {
+/// Builds the dispatch plan for one frame's worth of emitters, and nothing
+/// else.
+///
+/// Split out of [`prepare_particle_sort_bind_groups`] because everything here
+/// is arithmetic — `DynamicUniformBuffer::push` writes into a plain `Vec<u8>`
+/// scratch and touches no GPU
+/// (`bevy_render-0.19.0/src/render_resource/uniform_buffer.rs:231`), and the
+/// dispatch counts are the only honest measure of this file's cost that a
+/// machine with no adapter can take. The caller keeps the half that does need
+/// a device: resolving buffers and creating bind groups.
+///
+/// `emitters` must already be filtered to those whose three storage buffers
+/// resolved, in the same order as the caller's buffer list, because
+/// `SortDispatch::emitter_index` indexes into that list.
+fn plan_sort_dispatches(
+    emitters: &[&ExtractedEmitterData],
+    dynamic_uniform: &mut DynamicUniformBuffer<SortParams>,
+) -> ParticleSortBindGroups {
     let mut result = ParticleSortBindGroups::default();
-    let mut dynamic_uniform = DynamicUniformBuffer::<SortParams>::default();
-    let mut emitter_buffers: Vec<(Buffer, Buffer, Buffer)> = Vec::new();
 
-    for (_entity, emitter_data) in &extracted_systems.emitters {
-        let Some(particle_buf) = gpu_storage_buffers.get(&emitter_data.particle_buffer_handle)
-        else {
-            continue;
-        };
-        let Some(indices_buf) = gpu_storage_buffers.get(&emitter_data.indices_buffer_handle) else {
-            continue;
-        };
-        let Some(sorted_buf) =
-            gpu_storage_buffers.get(&emitter_data.sorted_particles_buffer_handle)
-        else {
-            continue;
-        };
-
-        let emitter_idx = emitter_buffers.len();
+    for (emitter_idx, emitter_data) in emitters.iter().enumerate() {
         let trail_size = emitter_data.trail_size;
         let total_slots = emitter_data.amount * trail_size;
         let group_count = emitter_data.amount;
         let group_workgroups = (group_count + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
         let total_workgroups = (total_slots + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-
-        emitter_buffers.push((
-            particle_buf.buffer.clone(),
-            indices_buf.buffer.clone(),
-            sorted_buf.buffer.clone(),
-        ));
 
         let base_params = SortParams {
             amount: total_slots,
@@ -171,7 +158,31 @@ pub fn prepare_particle_sort_bind_groups(
             workgroups: group_workgroups,
         });
 
-        if emitter_data.draw_order != 0 {
+        // Two independent reasons to skip the bitonic pass, and both leave a
+        // buffer the draw path can still read: `init_indices` has just written
+        // the identity permutation, and the `copy_sorted` dispatch below
+        // expands it into `sorted_particles_buffer`, which is the buffer the
+        // material binds (`spawning.rs` hands it to
+        // `create_particle_material_from_config`). Dropping the levels alone
+        // therefore costs emission order, not correctness — dropping the init
+        // or the copy with them would hand the renderer stale or uninitialised
+        // indices.
+        //
+        // `draw_order == 0` is `DrawOrder::Index`, whose sort key is the
+        // particle index: the identity the init pass already wrote.
+        //
+        // `!needs_sorting` is the new one. Depth order is only visible through
+        // an order-dependent blend, and most particle effects are not blended
+        // that way — see `DrawPassMaterial::needs_sorting`. **The trade**: an
+        // additive, multiplied, opaque or masked emitter that asks for
+        // `Lifetime`, `ReverseLifetime` or `ViewDepth` no longer gets it, and
+        // draws in emission order instead. For those blends the pixels come
+        // out the same, which is the whole argument — but if a future
+        // per-particle effect ever *reads* draw position (an OIT tail, a
+        // feedback pass, anything order-sensitive that is not the blend
+        // equation), this skip becomes wrong and the predicate, not this
+        // branch, is where that gets fixed.
+        if emitter_data.draw_order != 0 && emitter_data.needs_sorting {
             let n = group_count.next_power_of_two();
             let num_stages = (n as f32).log2().ceil() as u32;
 
@@ -206,6 +217,46 @@ pub fn prepare_particle_sort_bind_groups(
             workgroups: total_workgroups,
         });
     }
+
+    result
+}
+
+pub fn prepare_particle_sort_bind_groups(
+    mut commands: Commands,
+    pipeline: Res<ParticleSortPipeline>,
+    pipeline_cache: Res<PipelineCache>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    extracted_systems: Res<ExtractedParticleSystem>,
+    gpu_storage_buffers: Res<RenderAssets<GpuShaderBuffer>>,
+) {
+    let mut ready: Vec<&ExtractedEmitterData> = Vec::new();
+    let mut emitter_buffers: Vec<(Buffer, Buffer, Buffer)> = Vec::new();
+
+    for (_entity, emitter_data) in &extracted_systems.emitters {
+        let Some(particle_buf) = gpu_storage_buffers.get(&emitter_data.particle_buffer_handle)
+        else {
+            continue;
+        };
+        let Some(indices_buf) = gpu_storage_buffers.get(&emitter_data.indices_buffer_handle) else {
+            continue;
+        };
+        let Some(sorted_buf) =
+            gpu_storage_buffers.get(&emitter_data.sorted_particles_buffer_handle)
+        else {
+            continue;
+        };
+
+        emitter_buffers.push((
+            particle_buf.buffer.clone(),
+            indices_buf.buffer.clone(),
+            sorted_buf.buffer.clone(),
+        ));
+        ready.push(emitter_data);
+    }
+
+    let mut dynamic_uniform = DynamicUniformBuffer::<SortParams>::default();
+    let mut result = plan_sort_dispatches(&ready, &mut dynamic_uniform);
 
     dynamic_uniform.write_buffer(&render_device, &render_queue);
 
@@ -324,5 +375,163 @@ impl Plugin for ParticleSortPlugin {
                     .after(ParticleComputeLabel)
                     .before(camera_driver),
             );
+    }
+}
+
+/// Dispatch-count proof for the blend-mode gate.
+///
+/// [`plan_sort_dispatches`] is the whole of this file's per-frame cost decision
+/// and needs no GPU, so these tests count the real thing rather than a model of
+/// it. What they report is dispatches eliminated — a proxy for frame time, not
+/// a measurement of it; no test here can time a frame.
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::asset::{DrawPassMaterial, SerializableAlphaMode, StandardParticleMaterial};
+
+    /// The pool size the whole file's cost scales with. 160 particles round up
+    /// to 256, so a full bitonic pass is 8 stages and `1+2+...+8 = 36` levels.
+    const POOL: u32 = 160;
+    const FULL_SORT_LEVELS: usize = 36;
+
+    /// One emitter's extracted data, carrying only the fields
+    /// [`plan_sort_dispatches`] reads. Everything else is the cheapest value
+    /// of its type; none of it is looked at here.
+    fn emitter(draw_order: u32, needs_sorting: bool) -> ExtractedEmitterData {
+        ExtractedEmitterData {
+            uniform_steps: Vec::new(),
+            particle_buffer_handle: Handle::default(),
+            indices_buffer_handle: Handle::default(),
+            sorted_particles_buffer_handle: Handle::default(),
+            amount: POOL,
+            draw_order,
+            needs_sorting,
+            camera_position: [0.0; 3],
+            camera_forward: [0.0, 0.0, -1.0],
+            emitter_transform: Mat4::IDENTITY,
+            gradient_texture_handle: None,
+            color_over_lifetime_texture_handle: None,
+            scale_over_lifetime_texture_handle: None,
+            alpha_over_lifetime_texture_handle: None,
+            emission_over_lifetime_texture_handle: None,
+            turbulence_influence_over_lifetime_texture_handle: None,
+            radial_velocity_curve_texture_handle: None,
+            angle_over_lifetime_texture_handle: None,
+            angular_velocity_curve_texture_handle: None,
+            orbit_velocity_curve_texture_handle: None,
+            directional_velocity_curve_texture_handle: None,
+            is_sub_emitter_target: false,
+            emission_buffer_handle: None,
+            source_buffer_handle: None,
+            trail_size: 1,
+            trail_history_buffer_handle: None,
+        }
+    }
+
+    /// `(init dispatches, bitonic level dispatches, copy dispatches)`.
+    fn plan(emitters: &[ExtractedEmitterData]) -> (usize, usize, usize) {
+        let refs: Vec<&ExtractedEmitterData> = emitters.iter().collect();
+        let mut uniform = DynamicUniformBuffer::<SortParams>::default();
+        let planned = plan_sort_dispatches(&refs, &mut uniform);
+        (
+            planned.init_dispatches.len(),
+            planned.sort_levels.iter().map(Vec::len).sum(),
+            planned.copy_dispatches.len(),
+        )
+    }
+
+    fn standard(alpha_mode: SerializableAlphaMode) -> DrawPassMaterial {
+        DrawPassMaterial::Standard(StandardParticleMaterial {
+            alpha_mode,
+            ..StandardParticleMaterial::default()
+        })
+    }
+
+    #[test]
+    fn only_the_blends_whose_equation_is_order_dependent_ask_to_be_sorted() {
+        for mode in [
+            SerializableAlphaMode::Blend,
+            SerializableAlphaMode::Premultiplied,
+            SerializableAlphaMode::AlphaToCoverage,
+        ] {
+            assert!(mode.order_dependent(), "{mode:?} must still be sorted");
+            assert!(standard(mode).needs_sorting());
+        }
+
+        for mode in [
+            SerializableAlphaMode::Opaque,
+            SerializableAlphaMode::Mask { cutoff: 0.5 },
+            SerializableAlphaMode::Add,
+            SerializableAlphaMode::Multiply,
+        ] {
+            assert!(!mode.order_dependent(), "{mode:?} must not be sorted");
+            assert!(!standard(mode).needs_sorting());
+        }
+    }
+
+    #[test]
+    fn a_custom_shaders_unknown_blend_is_sorted_rather_than_guessed_at() {
+        assert!(
+            DrawPassMaterial::CustomShader {
+                vertex_shader: None,
+                fragment_shader: None,
+            }
+            .needs_sorting()
+        );
+    }
+
+    /// The integration hazard, pinned. Skipping the bitonic levels must not
+    /// skip the init that writes the identity permutation or the copy that
+    /// expands it into `sorted_particles_buffer` — that buffer is what the
+    /// material binds, and without those two it would hold uninitialised
+    /// indices or last frame's particles.
+    #[test]
+    fn an_unsorted_emitter_still_gets_the_init_and_copy_the_draw_path_reads() {
+        assert_eq!(plan(&[emitter(3, false)]), (1, 0, 1));
+    }
+
+    #[test]
+    fn an_order_dependent_emitter_still_gets_the_whole_bitonic_pass() {
+        assert_eq!(plan(&[emitter(3, true)]), (1, FULL_SORT_LEVELS, 1));
+    }
+
+    /// `DrawOrder::Index` was already exempt before this change, and stays so
+    /// even when the blend is order-dependent: its sort key is the particle
+    /// index, which is exactly what `init_indices` just wrote.
+    #[test]
+    fn draw_order_index_is_still_exempt_whatever_the_blend_is() {
+        assert_eq!(plan(&[emitter(0, true)]), (1, 0, 1));
+    }
+
+    /// The headline measurement for the blend gate, on a scene shaped like the
+    /// ones that drop frames: ten `ViewDepth` emitters of 160 particles, eight
+    /// of them additive and two alpha-blended.
+    ///
+    /// "Before" is not a remembered number — it is the same planner run with
+    /// every emitter marked order-dependent, which is precisely what this file
+    /// did when its only gate was `draw_order != 0`.
+    #[test]
+    fn eight_additive_emitters_in_ten_drop_the_frames_sort_dispatches_by_288() {
+        let before: Vec<ExtractedEmitterData> =
+            (0..10).map(|_| emitter(3, true)).collect();
+        let after: Vec<ExtractedEmitterData> = (0..10)
+            .map(|i| emitter(3, i >= 8))
+            .collect();
+
+        let (init_before, levels_before, copy_before) = plan(&before);
+        let (init_after, levels_after, copy_after) = plan(&after);
+
+        assert_eq!(
+            (init_before, levels_before, copy_before),
+            (10, 10 * FULL_SORT_LEVELS, 10)
+        );
+        assert_eq!(
+            (init_after, levels_after, copy_after),
+            (10, 2 * FULL_SORT_LEVELS, 10)
+        );
+
+        let total = |(i, l, c): (usize, usize, usize)| i + l + c;
+        assert_eq!(total((init_before, levels_before, copy_before)), 380);
+        assert_eq!(total((init_after, levels_after, copy_after)), 92);
     }
 }

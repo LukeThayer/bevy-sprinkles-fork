@@ -59,6 +59,64 @@ pub enum SerializableAlphaMode {
     AlphaToCoverage,
 }
 
+impl SerializableAlphaMode {
+    /// Whether the pixels this mode produces change when the particles that
+    /// wrote them are drawn in a different order.
+    ///
+    /// This is the question the depth sort exists to answer, and for most
+    /// modes the answer is no — which is why `sort.rs` can skip the whole
+    /// bitonic pass for them. Each arm below is a property of the blend
+    /// equation the pipeline actually ends up with, so each is derived rather
+    /// than asserted. `src` is one particle's fragment, `dst` what is already
+    /// in the target, `a` the fragment's alpha.
+    ///
+    /// **`Blend` — `true`.** `BlendState::ALPHA_BLENDING` is
+    /// `src*a + dst*(1-a)` (`bevy_pbr-0.19.0/src/render/mesh.rs:3394`), with
+    /// depth writes off. Swapping two fragments changes the result; this is
+    /// the classic case the sort is for.
+    ///
+    /// **`Premultiplied` — `true`.** `PREMULTIPLIED_ALPHA_BLENDING` is
+    /// `src + dst*(1-a)` (`mesh.rs:3400`). Still a per-fragment attenuation of
+    /// everything underneath it, so still order-dependent.
+    ///
+    /// **`Add` — `false`.** `Add` shares `Premultiplied`'s pipeline key and
+    /// blend state (`bevy_pbr-0.19.0/src/material.rs:616`) and is separated
+    /// from it inside the shader: `premultiply_alpha` returns
+    /// `vec4(color.rgb * color.a, 0.0)` for the `ADD` flag
+    /// (`bevy_pbr-0.19.0/src/render/pbr_functions.wgsl:963`), and the fork's
+    /// fragment reaches it through `main_pass_post_lighting_processing`
+    /// (`shaders/particle_material.wgsl:1573`). With `src_alpha` forced to
+    /// `0`, `src + dst*(1-0)` collapses to `src + dst`. Addition commutes, so
+    /// order cannot matter.
+    ///
+    /// **`Multiply` — `false`.** The blend is
+    /// `dst*src + dst*(1-a)` = `dst*(src + 1 - a)` (`mesh.rs:3406-3415`):
+    /// every fragment scales what is underneath by its own factor, and a
+    /// product of scale factors does not care about their order. Its alpha
+    /// channel is `BlendComponent::OVER`, which composes to `1 - Π(1-aᵢ)` —
+    /// also independent of order.
+    ///
+    /// **`Opaque` and `Mask` — `false`.** Both land on the opaque pipeline
+    /// with no blending and depth writes on (`mesh.rs:3432-3440`), so the
+    /// nearest fragment wins the depth test whenever it arrives.
+    ///
+    /// **`AlphaToCoverage` — `true`, and this one is a fork-specific
+    /// answer.** Stock Bevy leaves depth writes *on* for it (`mesh.rs:3427`)
+    /// and its own docs say sorting is unnecessary as a result — but
+    /// `ParticleMaterialExtension::specialize` (`material.rs`) counts
+    /// `BLEND_ALPHA_TO_COVERAGE` as transparent and forces
+    /// `depth_write_enabled = false`. With no depth write, each MSAA sample is
+    /// simply taken by whichever covering fragment wrote it last, which is a
+    /// draw-order dependence. Sorted here, therefore, until that override
+    /// changes.
+    pub fn order_dependent(self) -> bool {
+        match self {
+            Self::Blend | Self::Premultiplied | Self::AlphaToCoverage => true,
+            Self::Opaque | Self::Mask { .. } | Self::Add | Self::Multiply => false,
+        }
+    }
+}
+
 impl From<SerializableAlphaMode> for AlphaMode {
     fn from(mode: SerializableAlphaMode) -> Self {
         match mode {
@@ -651,6 +709,21 @@ impl Default for DrawPassMaterial {
 }
 
 impl DrawPassMaterial {
+    /// Whether this draw pass needs its particles sorted before they are drawn.
+    ///
+    /// See [`SerializableAlphaMode::order_dependent`] for the per-mode
+    /// derivation. A [`DrawPassMaterial::CustomShader`] answers `true`
+    /// unconditionally: the fork has no idea what blend state somebody else's
+    /// fragment shader ends up with, and the cost of being wrong in that
+    /// direction is a sort nobody needed, whereas the cost of being wrong the
+    /// other way is a visibly scrambled effect.
+    pub fn needs_sorting(&self) -> bool {
+        match self {
+            Self::Standard(mat) => mat.alpha_mode.order_dependent(),
+            Self::CustomShader { .. } => true,
+        }
+    }
+
     /// Computes a hash key for material caching.
     pub fn cache_key(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();

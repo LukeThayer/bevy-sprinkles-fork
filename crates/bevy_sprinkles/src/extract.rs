@@ -248,6 +248,15 @@ pub struct ExtractedEmitterData {
     pub sorted_particles_buffer_handle: Handle<ShaderBuffer>,
     pub amount: u32,
     pub draw_order: u32,
+    /// Whether this emitter's blend mode makes the drawn result depend on the
+    /// order its particles arrive in — [`DrawPassMaterial::needs_sorting`].
+    ///
+    /// Kept separate from `draw_order` rather than folded into it, because
+    /// `draw_order` is also a simulate-shader uniform: `particle_simulate.wgsl`
+    /// branches on `DRAW_ORDER_INDEX` to decide whether to stamp a spawn index
+    /// into each particle. Rewriting it here to mean "do not sort" would
+    /// silently change what the simulation writes.
+    pub needs_sorting: bool,
     pub camera_position: [f32; 3],
     pub camera_forward: [f32; 3],
     pub emitter_transform: Mat4,
@@ -944,6 +953,7 @@ pub fn extract_particle_systems(
                 sorted_particles_buffer_handle: buffer_handle.sorted_particles_buffer.clone(),
                 amount: emitter.emission.particles_amount,
                 draw_order,
+                needs_sorting: emitter.draw_pass.material.needs_sorting(),
                 camera_position: camera_position.into(),
                 camera_forward: camera_forward.into(),
                 emitter_transform: render_transform,

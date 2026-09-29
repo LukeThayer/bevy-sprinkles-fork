@@ -302,8 +302,20 @@ fn light_name(asset: &ParticlesAsset, index: u8) -> String {
 /// `TransformProp` have no hand-written display name anywhere else, and two
 /// props can share a `Stage` (e.g. `ScrollU`/`ScrollV`, both `Render`), so
 /// stage text alone cannot tell them apart.
+/// One variant is qualified rather than sentence-cased: `EmitterProp::Tint` is
+/// a scalar BRIGHTNESS multiplier applied identically to R, G and B (one drive
+/// resolves to one `f32`, and one render prop owns one uniform slot), so the
+/// bare word "Tint" promises a colour control this cannot be. Qualified here
+/// rather than at each of the four call sites, so the picker, the popover
+/// header and the Drives list all say the same thing. `TransformProp` and
+/// `LightProp` have no `Tint` variant, so matching on the debug string cannot
+/// catch an unrelated one.
 pub(crate) fn prop_label<T: std::fmt::Debug>(prop: T) -> String {
-    name_to_label(&format!("{prop:?}"))
+    let name = format!("{prop:?}");
+    if name == "Tint" {
+        return "Tint (brightness)".to_string();
+    }
+    name_to_label(&name)
 }
 
 /// "Which target" -- rendered once per adjacent run in the flat list.
@@ -1323,5 +1335,27 @@ mod tests {
         assert!(!app.world().resource::<DirtyState>().has_unsaved_changes);
         let asset = app.world().resource::<Assets<ParticlesAsset>>().get(&handle).unwrap();
         assert!(asset.drives.is_empty());
+    }
+
+    /// Minor: the picker used to offer a bare "Tint", which reads as a colour
+    /// control. It is one scalar on R/G/B and cannot shift hue.
+    #[test]
+    fn the_tint_prop_is_labelled_as_the_brightness_multiplier_it_is() {
+        let label = prop_label(EmitterProp::Tint);
+        assert_ne!(label, "Tint", "a bare `Tint` promises a colour control");
+        assert!(
+            label.to_lowercase().contains("bright"),
+            "the label must say what it actually does: {label}"
+        );
+    }
+
+    /// The qualifier must not have leaked into the generic path: every other
+    /// prop still gets plain sentence case, which is what keeps `ScrollU` and
+    /// `ScrollV` distinguishable.
+    #[test]
+    fn every_other_prop_label_is_still_plain_sentence_case() {
+        assert_eq!(prop_label(EmitterProp::SizeMul), "Size mul");
+        assert_eq!(prop_label(TransformProp::ScaleY), "Scale Y");
+        assert_eq!(prop_label(LightProp::Intensity), "Intensity");
     }
 }

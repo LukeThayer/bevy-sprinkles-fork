@@ -1,11 +1,20 @@
 //! The drive affordance beside a drivable inspector field.
 //!
 //! A small button beside a numeric field shows how many [`Drive`]s target
-//! that property (empty when zero) and, on click, opens a popover to author
-//! them: a variable combobox, the existing `curve_edit` widget bound to
-//! [`Drive::curve`], output min/max, an op combobox, a mute toggle and a
-//! delete. This is the whole reason `curve_edit` needs no new machinery --
-//! it is reused exactly as `inspector::colors` opens `gradient_edit`.
+//! that property (empty when zero) and, on click, points the Drives dock at
+//! that drive -- see [`handle_drive_trigger_click`]. It authors nothing
+//! itself.
+//!
+//! **This module used to own a second editor.** The button opened a popover
+//! carrying its own row list (variable combobox, `curve_edit`, output
+//! min/max, op combobox, mute, delete), so one drive could be open in two
+//! surfaces at once, kept in step only by both watching `DirtyState` and
+//! rebuilding wholesale. The dock redesign left one editing surface --
+//! `components::drives`' editor pane -- reachable from two PLACES, and the
+//! popover, its rebuild system and its own "Add drive" button went with the
+//! duplication. What stayed here is everything the dock reuses: the six
+//! row-marker components, [`spawn_drive_row`] that spawns them, every commit
+//! observer behind them, and [`upsert_drive`].
 //!
 //! **A fresh drive must RESPOND.** [`upsert_drive`] appends a rising ramp,
 //! `DriveOp::Multiply`, output `0.0..1.0`: a 0-100% fader on the consumer's
@@ -28,18 +37,21 @@
 //! `0.0`, where the property drops to zero until the variable is scrubbed
 //! up. See the `tests` module for the pin on the new contract.
 //!
-//! **The popover states the target's stage in words**, not as an enum name:
+//! **The dock states the target's stage in words**, not as an enum name:
 //! that is the first question an author asks of a knob ("does this change
 //! what is already in the air?"), and `EmitterProp::stage()` already answers
-//! it -- `stage_label` just spells it out.
+//! it -- [`stage_label`] just spells it out, and `drives.rs` calls it.
 //!
 //! **Rows are addressed by their live index into `ParticlesAsset::drives`**,
 //! not by identity, so every write here re-borrows the asset and re-checks
-//! bounds rather than caching a `&mut Drive`. The popover's row list is
-//! rebuilt wholesale on any dirty edit or emitter-selection change (mirroring
+//! bounds rather than caching a `&mut Drive`. The dock's editor pane is
+//! rebuilt wholesale on any dirty edit, which is what turns a stale index
+//! into a correct one on the next tick (mirroring
 //! `variables::rebuild_variable_list`'s reasoning: simpler and safer than
-//! tracking which specific mutation happened, at the cost of a full rebuild
-//! on any edit -- fine for a list this small).
+//! tracking which specific mutation happened). The one index this module
+//! must fix up rather than rebuild is the dock's SELECTION, because a
+//! selection survives the rebuild that corrects everything else -- see
+//! [`handle_drive_delete_click`].
 //!
 //! **Target resolution is dynamic, not baked in at spawn time.** Every
 //! section in this module (`scale_section`, `colors_section`, ...) is built
@@ -49,21 +61,18 @@
 //! rebuilt per emitter. A `drive_button` therefore stores only the
 //! `EmitterProp` it drives; the emitter `index` half of its `DriveTarget` is
 //! resolved from `InspectedEmitterTracker::current_index` wherever it is
-//! needed (label sync, popover open, row rebuild, add-click), never cached
-//! on the button itself.
+//! needed (label sync, trigger click), never cached on the button itself.
 //!
 //! **Task 21 widened this to `LightProp`.** A button now stores a
 //! [`DrivableProp`] (`Emitter(EmitterProp)` or `Light(LightProp)`) instead of
 //! a bare `EmitterProp`; [`current_target`] resolves the right half against
 //! the right tracker (`InspectedEmitterTracker` or `InspectedLightTracker`)
-//! depending on which variant it holds. `LightProp` has no `Stage` (every
-//! light drive is ECS-stage, per `asset::drive`'s doc), so the popover header
-//! spells that out as fixed text rather than calling `stage_label`, which
-//! stays `EmitterProp`-only. Only two `LightProp` variants get a button at
-//! all -- `Intensity` and `Range`, the two that have an authored field on
-//! `LightData` to hang one off; `Hue`/`Saturation`/`Value` have none (they
-//! are drive-only targets, exactly like `EmitterProp::SpawnProbability`) and
-//! stay reachable only through `drives.rs`'s target picker.
+//! depending on which variant it holds. Only two `LightProp` variants get a
+//! button at all -- `Intensity` and `Range`, the two that have an authored
+//! field on `LightData` to hang one off; `Hue`/`Saturation`/`Value` have none
+//! (they are drive-only targets, exactly like
+//! `EmitterProp::SpawnProbability`) and stay reachable only through
+//! `drives.rs`'s target picker.
 
 use bevy::prelude::*;
 use bevy_sprinkles::asset::{
@@ -72,8 +81,8 @@ use bevy_sprinkles::asset::{
 use bevy_sprinkles::prelude::*;
 
 use crate::state::{DirtyState, EditorState};
-use crate::ui::icons::{ICON_ADD, ICON_CLOSE, ICON_NODE_TREE};
-use crate::ui::tokens::{BORDER_COLOR, TEXT_MUTED_COLOR};
+use crate::ui::icons::{ICON_CLOSE, ICON_NODE_TREE};
+use crate::ui::tokens::BORDER_COLOR;
 use crate::ui::widgets::button::{
     ButtonClickEvent, ButtonProps, ButtonVariant, IconButtonProps, button, icon_button,
 };
@@ -83,14 +92,10 @@ use crate::ui::widgets::combobox::{
 };
 use crate::ui::widgets::curve_edit::{CurveEditCommitEvent, CurveEditProps, curve_edit};
 use crate::ui::widgets::inspector_field::fields_row;
-use crate::ui::widgets::popover::{
-    PopoverHeaderProps, PopoverPlacement, PopoverProps, PopoverTracker, activate_trigger,
-    deactivate_trigger, popover, popover_header,
-};
 use crate::ui::widgets::text_edit::{TextEditCommitEvent, TextEditProps, text_edit};
 use crate::ui::widgets::utils::find_ancestor;
 
-use crate::ui::components::drives::{SelectedDrive, prop_label, selection_after_delete};
+use crate::ui::components::drives::{SelectedDrive, selection_after_delete};
 
 use super::{InspectedEmitterTracker, InspectedLightTracker};
 
@@ -197,7 +202,6 @@ pub fn drive_button(props: DriveButtonProps) -> impl Scene {
     bsn! {
         EditorDriveButton
         template_value(DriveButtonProp(prop))
-        PopoverTracker
         Node {
             flex_shrink: 0.0,
         }
@@ -212,14 +216,9 @@ pub fn plugin(app: &mut App) {
         .add_observer(handle_drive_delete_click)
         .add_observer(handle_drive_curve_commit)
         .add_observer(handle_drive_output_commit)
-        .add_observer(handle_drive_add_click)
         .add_systems(
             Update,
-            (
-                setup_drive_button,
-                sync_drive_button_label,
-                rebuild_drive_rows,
-            )
+            (setup_drive_button, sync_drive_button_label)
                 .after(super::update_inspected_emitter_tracker)
                 .after(super::update_inspected_light_tracker),
         );
@@ -242,12 +241,6 @@ impl Default for DriveButtonProp {
 
 #[derive(Component)]
 struct DriveButtonTrigger(Entity);
-
-#[derive(Component)]
-struct DriveButtonPopoverMarker(Entity);
-
-#[derive(Component)]
-struct DriveRowsContainer(Entity);
 
 #[derive(Component)]
 struct DriveRow;
@@ -286,9 +279,6 @@ pub(crate) struct DriveOutputField {
     pub(crate) bound: OutputBound,
 }
 
-#[derive(Component)]
-struct DriveAddButton(Entity);
-
 fn current_target(
     prop: DrivableProp,
     emitter_tracker: &InspectedEmitterTracker,
@@ -302,45 +292,6 @@ fn current_target(
             .current_index
             .map(|index| DriveTarget::Light { index, prop }),
     }
-}
-
-/// "Does this change what is already in the air" in words, for this
-/// button's popover header. `Emitter` reuses [`stage_label`] (the only
-/// family with a real `Stage`); `Light` targets are always ECS-stage, per
-/// `asset::drive`'s own doc on `DriveTarget::Light`, so they get fixed text
-/// instead of a fabricated `Stage` value. Mirrors `drives.rs`'s
-/// `target_stage_text` wording exactly, so the same target reads the same
-/// way whether it is opened from a field's own button or from the flat list.
-fn drivable_stage_text(prop: DrivableProp) -> &'static str {
-    match prop {
-        DrivableProp::Emitter(prop) => stage_label(prop),
-        DrivableProp::Light(_) => "ECS: applied to the light every frame",
-    }
-}
-
-/// The property's own name, via `drives.rs`'s `prop_label` (reused, not
-/// reimplemented -- see that function's doc).
-fn drivable_prop_label(prop: DrivableProp) -> String {
-    match prop {
-        DrivableProp::Emitter(prop) => prop_label(prop),
-        DrivableProp::Light(prop) => prop_label(prop),
-    }
-}
-
-/// The popover header text: property name first, stage second. Task 22's
-/// fix round -- `drivable_stage_text` alone cannot tell two buttons apart
-/// once they share a `Stage` (`ScrollU`/`ScrollV` are both `Render`), which
-/// is exactly the case that task introduced (two drive buttons on one
-/// field, for the first time in this codebase). Naming the prop in the
-/// header, rather than only labelling the two buttons, generalizes: any
-/// FUTURE field with paired drive targets inherits the disambiguation for
-/// free instead of needing its own button labels.
-fn drivable_header_text(prop: DrivableProp) -> String {
-    format!(
-        "{} \u{2022} {}",
-        drivable_prop_label(prop),
-        drivable_stage_text(prop)
-    )
 }
 
 // --- Trigger button ---------------------------------------------------
@@ -412,175 +363,83 @@ fn sync_drive_button_label(
     }
 }
 
-// --- Popover open/close -------------------------------------------------
+// --- Trigger: one click, one selection in the Drives dock ---------------
 
+/// A field's drive button no longer opens an editor of its own. It points
+/// the Drives dock at the drive for this field's target, and the dock's
+/// editor pane -- the ONE place a drive is edited -- shows it.
+///
+/// This replaced a popover that carried a full row list of its own. Two
+/// surfaces could hold the same drive open at once, kept in step only by
+/// both watching `DirtyState` and rebuilding wholesale; the popover's row
+/// list, its header, its own "Add drive" button and the rebuild system
+/// behind them are all gone with it, along with the coupling they needed.
+///
+/// **A field with no drive yet creates one**, rather than doing nothing
+/// visible. The old flow was click -> popover -> "Add drive"; there is no
+/// popover to hold that second step, and a click that selects nothing would
+/// read as a dead button. It appends through [`upsert_drive`], the one place
+/// a drive is created, and opens it -- so the affordance still reaches
+/// `VariableId(0)` and a `0.0..1.0` fader exactly as before.
+///
+/// **A field with several drives opens the FIRST**, in apply order. Any
+/// choice here is arbitrary; the earliest is the one the dock's own list
+/// prints first, so the two surfaces agree on what "this field's drive"
+/// means, and the dock's row for each of the others is one click away.
 #[allow(clippy::too_many_arguments)]
 fn handle_drive_trigger_click(
     trigger: On<ButtonClickEvent>,
-    mut commands: Commands,
     tracker: Res<InspectedEmitterTracker>,
     light_tracker: Res<InspectedLightTracker>,
     triggers: Query<&DriveButtonTrigger>,
     props: Query<&DriveButtonProp>,
-    mut trackers: Query<&mut PopoverTracker>,
-    existing_popovers: Query<(Entity, &DriveButtonPopoverMarker)>,
-    mut button_styles: Query<(&mut BackgroundColor, &mut BorderColor, &mut ButtonVariant)>,
+    editor_state: Res<EditorState>,
+    mut assets: ResMut<Assets<ParticlesAsset>>,
+    mut dirty_state: ResMut<DirtyState>,
+    mut selected: ResMut<SelectedDrive>,
 ) {
     let Ok(drive_trigger) = triggers.get(trigger.entity) else {
         return;
     };
-    let drive_button_entity = drive_trigger.0;
-    let Ok(mut popover_tracker) = trackers.get_mut(drive_button_entity) else {
+    let Ok(prop) = props.get(drive_trigger.0) else {
         return;
     };
-
-    for (popover_entity, marker) in &existing_popovers {
-        if marker.0 == drive_button_entity {
-            commands.entity(popover_entity).try_despawn();
-            popover_tracker.popover = None;
-            deactivate_trigger(trigger.entity, &mut button_styles);
-            return;
-        }
-    }
-
-    let Ok(prop) = props.get(drive_button_entity) else {
-        return;
-    };
-
     // Nothing to drive without a currently inspected emitter/light -- the
     // button exists on a section that is shared across every emitter (or
     // light) the author selects (see the module doc), so this can
     // legitimately be transient between selections.
-    if current_target(prop.0, &tracker, &light_tracker).is_none() {
+    let Some(target) = current_target(prop.0, &tracker, &light_tracker) else {
         return;
-    }
-
-    activate_trigger(trigger.entity, &mut button_styles);
-
-    let popover_entity = commands
-        .spawn_scene(popover(
-            PopoverProps::new(trigger.entity)
-                .with_placement(PopoverPlacement::Right)
-                .with_padding(0.0)
-                .with_node(Node {
-                    width: px(320.0),
-                    ..default()
-                }),
-        ))
-        .insert(DriveButtonPopoverMarker(drive_button_entity))
-        .id();
-
-    popover_tracker.open(popover_entity, trigger.entity);
-
-    commands
-        .spawn_scene(popover_header(PopoverHeaderProps::new(
-            drivable_header_text(prop.0),
-            popover_entity,
-        )))
-        .insert(ChildOf(popover_entity));
-
-    commands.entity(popover_entity).with_children(|parent| {
-        parent.spawn((
-            DriveRowsContainer(drive_button_entity),
-            Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: px(10.0),
-                padding: UiRect::all(px(12.0)),
-                width: percent(100),
-                ..default()
-            },
-        ));
-    });
-}
-
-// --- Row list: build/rebuild --------------------------------------------
-
-/// Rebuilds every open drive popover's row list wholesale: on first open
-/// (`Added<DriveRowsContainer>`), on any dirty edit (an add/delete/edit
-/// anywhere -- including ones this module itself just committed), or on an
-/// emitter-selection change (the target this button now means has changed).
-///
-/// **`dirty_state.is_changed()` is what keeps this popover and `drives.rs`'s
-/// Drives list agreeing**, and it is load-bearing rather than incidental.
-/// The same drive can be open in both at once, and both spawn their rows
-/// through [`spawn_drive_row`], which reads `drive.output` out of the asset
-/// at rebuild time -- neither holds an edited copy. So an edit committed in
-/// either surface reaches the other for one reason only: the commit
-/// observers flip the dirty flag, and both lists watch it. A commit path
-/// that mutated a drive WITHOUT dirtying would leave whichever surface did
-/// not host it displaying a stale number indefinitely, which is why
-/// `tests::an_output_edit_dirties_so_the_other_surface_rebuilds` pins the
-/// output commit specifically (delete and reorder are already pinned in
-/// `drives.rs`).
-fn rebuild_drive_rows(
-    mut commands: Commands,
-    editor_state: Res<EditorState>,
-    assets: Res<Assets<ParticlesAsset>>,
-    tracker: Res<InspectedEmitterTracker>,
-    light_tracker: Res<InspectedLightTracker>,
-    dirty_state: Res<DirtyState>,
-    props: Query<&DriveButtonProp>,
-    containers: Query<(Entity, &DriveRowsContainer)>,
-    new_containers: Query<Entity, Added<DriveRowsContainer>>,
-    children_query: Query<&Children>,
-) {
-    let should_rebuild = !new_containers.is_empty()
-        || dirty_state.is_changed()
-        || tracker.is_changed()
-        || light_tracker.is_changed();
-    if !should_rebuild {
-        return;
-    }
-
+    };
     let Some(handle) = &editor_state.current_project else {
         return;
     };
-    let Some(asset) = assets.get(handle) else {
+
+    // Read through `get`, not `get_mut`: selecting is not an edit, and
+    // `get_mut` raises an `AssetEvent::Modified` that every `assets
+    // .is_changed()` watcher in the editor would then answer.
+    let existing = {
+        let Some(asset) = assets.get(handle) else {
+            return;
+        };
+        drives_on(asset, &target).first().map(|(index, _)| *index)
+    };
+    if let Some(index) = existing {
+        if selected.0 != Some(index) {
+            selected.0 = Some(index);
+        }
+        return;
+    }
+
+    let Some(mut asset) = assets.get_mut(handle) else {
         return;
     };
-
-    for (container_entity, container) in &containers {
-        let Ok(prop) = props.get(container.0) else {
-            continue;
-        };
-
-        if let Ok(children) = children_query.get(container_entity) {
-            for child in children.iter() {
-                commands.entity(child).despawn();
-            }
-        }
-
-        let Some(target) = current_target(prop.0, &tracker, &light_tracker) else {
-            continue;
-        };
-        let rows = drives_on(asset, &target);
-        let variables = asset.variables.clone();
-        let variable_count = variables.len();
-        let drive_button_entity = container.0;
-
-        commands.entity(container_entity).with_children(|parent| {
-            for (index, drive) in &rows {
-                spawn_drive_row(parent, *index, drive, &variables);
-            }
-            if variable_count == 0 {
-                parent.spawn((
-                    Text::new("Declare a variable to drive this field."),
-                    TextColor(TEXT_MUTED_COLOR.into()),
-                ));
-            } else {
-                let add_target = parent.target_entity();
-                parent
-                    .commands()
-                    .spawn_scene(button(
-                        ButtonProps::new("Add drive")
-                            .align_left()
-                            .with_left_icon(ICON_ADD),
-                    ))
-                    .insert(DriveAddButton(drive_button_entity))
-                    .insert(ChildOf(add_target));
-            }
-        });
+    if asset.variables.is_empty() {
+        return;
     }
+    upsert_drive(&mut asset, target, VariableId(0));
+    selected.0 = Some(asset.drives.len() - 1);
+    dirty_state.has_unsaved_changes = true;
 }
 
 /// `pub(crate)`: reused verbatim by `drives.rs`'s flat list. See the module
@@ -882,40 +741,6 @@ pub(crate) fn handle_drive_output_commit(
         dirty_state.has_unsaved_changes = true;
     }
 }
-
-fn handle_drive_add_click(
-    trigger: On<ButtonClickEvent>,
-    buttons: Query<&DriveAddButton>,
-    props: Query<&DriveButtonProp>,
-    tracker: Res<InspectedEmitterTracker>,
-    light_tracker: Res<InspectedLightTracker>,
-    editor_state: Res<EditorState>,
-    mut assets: ResMut<Assets<ParticlesAsset>>,
-    mut dirty_state: ResMut<DirtyState>,
-) {
-    let Ok(add_button) = buttons.get(trigger.entity) else {
-        return;
-    };
-    let Ok(prop) = props.get(add_button.0) else {
-        return;
-    };
-    let Some(target) = current_target(prop.0, &tracker, &light_tracker) else {
-        return;
-    };
-    let Some(handle) = &editor_state.current_project else {
-        return;
-    };
-    let Some(mut asset) = assets.get_mut(handle) else {
-        return;
-    };
-    if asset.variables.is_empty() {
-        return;
-    }
-
-    upsert_drive(&mut asset, target, VariableId(0));
-    dirty_state.has_unsaved_changes = true;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,19 +877,6 @@ mod tests {
         assert!(stage_label(EmitterProp::SizeMul).starts_with("Render"));
     }
 
-    /// Task 22's fix round: `ScrollU` and `ScrollV` share a `Stage` (both
-    /// `Render`), so `drivable_stage_text` alone cannot tell their two
-    /// popovers apart. Pins that the header text -- what an author actually
-    /// reads when they click one of the two identical trigger icons -- does.
-    #[test]
-    fn the_popover_header_names_the_property_not_just_the_stage() {
-        let u = drivable_header_text(DrivableProp::Emitter(EmitterProp::ScrollU));
-        let v = drivable_header_text(DrivableProp::Emitter(EmitterProp::ScrollV));
-        assert_ne!(u, v, "two props sharing a Stage must not share a header");
-        assert!(u.to_lowercase().contains("scroll"));
-        assert!(v.to_lowercase().contains("scroll"));
-    }
-
     /// A minimal App carrying the REAL commit observer, not a hand-rolled
     /// stand-in for it -- same reasoning as
     /// `inspector::variable::tests::test_app`. Pins the property the brief
@@ -1149,15 +961,16 @@ mod tests {
         );
     }
 
-    // --- The two output editors agreeing ------------------------------
+    // --- The one output editor staying in step -----------------------
     //
-    // `Drive::output` is editable from two surfaces at once: this popover
-    // and `drives.rs`'s Drives list. Both spawn their rows through the one
-    // `spawn_drive_row` and read `drive.output` from the asset at rebuild
-    // time, so neither can hold a stale edited copy -- what they can do is
-    // fail to REBUILD, and both watch exactly one signal for that,
-    // `DirtyState::is_changed()`. These pin the output commit's end of that
-    // contract, which `rebuild_drive_rows`' doc states in full.
+    // There is one editing surface now, the Drives dock's editor pane, and
+    // it holds no edited copy: `spawn_drive_row` reads `drive.output` out of
+    // the asset every time it is rebuilt. What the pane CAN do is fail to
+    // rebuild, and it watches exactly one signal for that,
+    // `DirtyState::is_changed()` -- so a commit path that mutated a drive
+    // without dirtying would leave the pane showing the old number
+    // indefinitely. These pin the output commit's end of that contract
+    // (delete and reorder are pinned in `drives.rs`).
 
     fn app_with_an_output_field(min: f32, max: f32) -> (App, Entity, Handle<ParticlesAsset>) {
         let mut app = App::new();
@@ -1239,5 +1052,145 @@ mod tests {
             !app.world().resource::<DirtyState>().has_unsaved_changes,
             "committing the already-current value must not dirty the project"
         );
+    }
+
+    // --- The field button as a pointer at the dock ----------------------
+    //
+    // The button stopped being an editor and became a selector. These pin
+    // the three answers it can give: open the existing drive, create one
+    // and open it, or do nothing at all because there is no variable to
+    // wire it to.
+
+    fn app_with_a_trigger(asset: ParticlesAsset) -> (App, Entity, Handle<ParticlesAsset>) {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.init_resource::<DirtyState>();
+        app.init_resource::<SelectedDrive>();
+        app.insert_resource(InspectedEmitterTracker {
+            current_index: Some(0),
+        });
+        app.init_resource::<InspectedLightTracker>();
+        app.add_observer(handle_drive_trigger_click);
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(asset)
+        };
+        app.insert_resource(EditorState {
+            current_project: Some(handle.clone()),
+            current_project_path: None,
+            inspecting: None,
+        });
+
+        let button_entity = app
+            .world_mut()
+            .spawn(DriveButtonProp(DrivableProp::Emitter(EmitterProp::SizeMul)))
+            .id();
+        let trigger = app
+            .world_mut()
+            .spawn(DriveButtonTrigger(button_entity))
+            .id();
+        (app, trigger, handle)
+    }
+
+    #[test]
+    fn clicking_a_fields_button_opens_the_first_drive_on_that_field() {
+        // Two drives on the target, and an unrelated one before them, so
+        // "the first drive on this field" and "the first drive in the file"
+        // are different indices.
+        let mut asset = asset_with_one_variable_one_emitter();
+        upsert_drive(
+            &mut asset,
+            DriveTarget::Emitter {
+                index: 0,
+                prop: EmitterProp::Alpha,
+            },
+            VariableId(0),
+        );
+        let target = DriveTarget::Emitter {
+            index: 0,
+            prop: EmitterProp::SizeMul,
+        };
+        upsert_drive(&mut asset, target.clone(), VariableId(0));
+        upsert_drive(&mut asset, target, VariableId(0));
+
+        let (mut app, trigger, _) = app_with_a_trigger(asset);
+        app.world_mut().trigger(ButtonClickEvent { entity: trigger });
+
+        assert_eq!(app.world().resource::<SelectedDrive>().0, Some(1));
+        assert!(
+            !app.world().resource::<DirtyState>().has_unsaved_changes,
+            "opening an existing drive is not an edit"
+        );
+    }
+
+    #[test]
+    fn clicking_a_field_with_no_drive_creates_one_and_opens_it() {
+        // There is no popover left to hold a second "Add drive" step, and a
+        // click that selected nothing would read as a dead button.
+        let (mut app, trigger, handle) =
+            app_with_a_trigger(asset_with_one_variable_one_emitter());
+        app.world_mut().trigger(ButtonClickEvent { entity: trigger });
+
+        assert_eq!(app.world().resource::<SelectedDrive>().0, Some(0));
+        assert!(app.world().resource::<DirtyState>().has_unsaved_changes);
+        let asset = app
+            .world()
+            .resource::<Assets<ParticlesAsset>>()
+            .get(&handle)
+            .unwrap();
+        assert_eq!(
+            asset.drives[0].target,
+            DriveTarget::Emitter {
+                index: 0,
+                prop: EmitterProp::SizeMul
+            },
+        );
+        assert_eq!(
+            asset.drives[0].output,
+            ParticleRange { min: 0.0, max: 1.0 },
+            "still the 0-100% fader `upsert_drive` has always appended"
+        );
+    }
+
+    #[test]
+    fn clicking_a_field_with_no_variables_declared_creates_nothing() {
+        let mut asset = asset_with_one_variable_one_emitter();
+        asset.variables.clear();
+
+        let (mut app, trigger, handle) = app_with_a_trigger(asset);
+        app.world_mut().trigger(ButtonClickEvent { entity: trigger });
+
+        assert_eq!(app.world().resource::<SelectedDrive>().0, None);
+        assert!(!app.world().resource::<DirtyState>().has_unsaved_changes);
+        let asset = app
+            .world()
+            .resource::<Assets<ParticlesAsset>>()
+            .get(&handle)
+            .unwrap();
+        assert!(asset.drives.is_empty());
+    }
+
+    #[test]
+    fn clicking_a_field_with_no_emitter_inspected_does_nothing() {
+        // The sections these buttons live on are shared across every
+        // emitter, so "nothing inspected" is a real transient state rather
+        // than an impossible one.
+        let (mut app, trigger, handle) =
+            app_with_a_trigger(asset_with_one_variable_one_emitter());
+        app.insert_resource(InspectedEmitterTracker {
+            current_index: None,
+        });
+        app.world_mut().trigger(ButtonClickEvent { entity: trigger });
+
+        assert_eq!(app.world().resource::<SelectedDrive>().0, None);
+        let asset = app
+            .world()
+            .resource::<Assets<ParticlesAsset>>()
+            .get(&handle)
+            .unwrap();
+        assert!(asset.drives.is_empty());
     }
 }

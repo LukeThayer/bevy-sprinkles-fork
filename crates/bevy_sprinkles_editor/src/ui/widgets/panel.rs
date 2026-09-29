@@ -23,10 +23,45 @@ pub fn plugin(app: &mut App) {
 #[derive(Component, Default, Clone)]
 pub struct EditorPanel;
 
-#[derive(Component, Default, Clone, Copy, PartialEq, Eq)]
+/// Which edge of the main row a panel is pinned to. Three things have to
+/// agree or the resize handle detaches from the panel it resizes: which side
+/// carries the 1px border, which edge the handle straddles, and which way a
+/// drag widens. Every `match` on this is exhaustive with no wildcard arm, so
+/// a third edge is a compile error until it has answered all three.
+#[derive(Component, Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PanelDirection {
     #[default]
     Left,
+    /// Pinned to the far right -- the Drives dock, and so far only it. Its
+    /// handle sits on its LEFT edge, which is why [`resize_delta`] exists.
+    Right,
+}
+
+/// How far a panel's width grows for a rightwards cursor motion of
+/// `cursor_delta`.
+///
+/// A left panel's handle is on its right edge, so the two agree. A right
+/// panel's handle is on its LEFT edge, so dragging that edge rightwards makes
+/// the panel NARROWER and the sign flips. Pulled out of `handle_resize_drag`
+/// as a pure function because the failure it guards against -- a panel that
+/// shrinks when you pull it open -- is invisible to the type system and
+/// unreachable by a test while the arithmetic sits inside a drag loop.
+pub fn resize_delta(direction: PanelDirection, cursor_delta: f32) -> f32 {
+    match direction {
+        PanelDirection::Left => cursor_delta,
+        PanelDirection::Right => -cursor_delta,
+    }
+}
+
+/// The x of the edge a panel's resize handle straddles, given the panel's
+/// centre and half-width in its parent's space. The other half of
+/// [`resize_delta`]'s pairing: handle placement and drag sign must come from
+/// the same `direction`.
+pub fn panel_handle_edge(direction: PanelDirection, center: f32, half_width: f32) -> f32 {
+    match direction {
+        PanelDirection::Left => center + half_width,
+        PanelDirection::Right => center - half_width,
+    }
 }
 
 #[derive(Component, Default, Clone)]
@@ -100,9 +135,10 @@ pub fn panel(props: PanelProps) -> impl Scene {
 
     let border = match direction {
         PanelDirection::Left => UiRect::right(px(1)),
+        PanelDirection::Right => UiRect::left(px(1)),
     };
     let margin = match direction {
-        PanelDirection::Left => UiRect::ZERO,
+        PanelDirection::Left | PanelDirection::Right => UiRect::ZERO,
     };
 
     bsn! {
@@ -182,9 +218,7 @@ fn sync_resize_handle_positions(
 
         let parent_left = parent_center - parent_half_w;
 
-        let panel_edge = match direction {
-            PanelDirection::Left => panel_center + panel_half_w,
-        };
+        let panel_edge = panel_handle_edge(*direction, panel_center, panel_half_w);
 
         node.left = px(panel_edge - parent_left - half);
         node.top = px(0.0);
@@ -217,9 +251,7 @@ fn handle_resize_drag(
 
         if drag_state.dragging && cursor_delta != 0.0 {
             if let Ok((mut node, mut panel_width)) = panels.get_mut(handle.panel) {
-                let delta = match handle.direction {
-                    PanelDirection::Left => cursor_delta,
-                };
+                let delta = resize_delta(handle.direction, cursor_delta);
 
                 drag_state.accumulated_delta += delta;
                 let new_width = ((panel_width.current as f32) + drag_state.accumulated_delta)
@@ -233,5 +265,28 @@ fn handle_resize_drag(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Drives dock is the first `Right` panel, and its handle is on the
+    /// opposite edge from every other panel's. A flipped sign here makes the
+    /// dock shrink when the author pulls it open, which reads as "the panel
+    /// is broken" rather than as an inverted axis.
+    #[test]
+    fn dragging_a_right_panels_handle_leftwards_widens_it() {
+        assert_eq!(resize_delta(PanelDirection::Right, -10.0), 10.0);
+        assert_eq!(resize_delta(PanelDirection::Left, -10.0), -10.0);
+    }
+
+    /// A right panel's handle straddles its left edge, a left panel's its
+    /// right one -- the placement half of the same pairing.
+    #[test]
+    fn a_right_panels_handle_sits_on_its_left_edge() {
+        assert_eq!(panel_handle_edge(PanelDirection::Right, 100.0, 30.0), 70.0);
+        assert_eq!(panel_handle_edge(PanelDirection::Left, 100.0, 30.0), 130.0);
     }
 }

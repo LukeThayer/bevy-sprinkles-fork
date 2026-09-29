@@ -4,6 +4,7 @@ use bevy::prelude::*;
 use bevy_sprinkles::prelude::*;
 
 use crate::state::{DirtyState, EditorState, Inspectable, Inspecting};
+use crate::ui::icons::ICON_MESH_CYLINDER;
 use crate::ui::widgets::button::{
     ButtonClickEvent, ButtonProps, ButtonVariant, EditorButton, button, set_button_variant,
 };
@@ -12,7 +13,9 @@ use crate::ui::widgets::combobox::{
 };
 use crate::ui::widgets::dialog::{DialogActionEvent, EditorDialog, OpenConfirmationDialogEvent};
 use crate::ui::widgets::panel::{PanelDirection, PanelProps, panel};
-use crate::ui::widgets::panel_section::{PanelSectionProps, panel_section};
+use crate::ui::widgets::panel_section::{
+    PanelSectionProps, SecondaryButtonClickEvent, panel_section,
+};
 use crate::ui::widgets::scroll::scrollbar;
 use crate::ui::widgets::text_edit::{
     EditorTextEdit, TextEditCommitEvent, TextEditProps, text_edit,
@@ -29,6 +32,7 @@ pub fn plugin(app: &mut App) {
         .add_observer(on_rename_commit)
         .add_observer(on_delete_confirmed)
         .add_observer(on_add_emitter)
+        .add_observer(on_add_mesh_fx)
         .add_observer(on_add_collider)
         .add_systems(
             Update,
@@ -91,6 +95,11 @@ struct PendingDelete {
 #[derive(Event)]
 struct AddEmitterEvent;
 
+/// Adds the "Mesh FX" preset -- see `bevy_sprinkles::asset::mesh_fx_emitter`'s
+/// doc comment for why this exists rather than a separate mesh-effect object.
+#[derive(Event)]
+struct AddMeshFxEvent;
+
 #[derive(Event)]
 struct AddColliderEvent;
 
@@ -114,10 +123,13 @@ fn setup_data_panel(mut commands: Commands, panels: Query<Entity, Added<EditorDa
 
         commands
             .spawn_scene(panel_section(
-                PanelSectionProps::new("Emitters").with_add_button(),
+                PanelSectionProps::new("Emitters")
+                    .with_add_button()
+                    .with_secondary_add_button(ICON_MESH_CYLINDER),
             ))
             .insert((EmittersSection, ChildOf(panel_entity)))
-            .observe(on_add_emitter_click);
+            .observe(on_add_emitter_click)
+            .observe(on_add_mesh_fx_click);
 
         commands
             .spawn_scene(panel_section(
@@ -262,6 +274,10 @@ fn on_add_emitter_click(_event: On<ButtonClickEvent>, mut commands: Commands) {
     commands.trigger(AddEmitterEvent);
 }
 
+fn on_add_mesh_fx_click(_event: On<SecondaryButtonClickEvent>, mut commands: Commands) {
+    commands.trigger(AddMeshFxEvent);
+}
+
 fn on_add_collider_click(_event: On<ButtonClickEvent>, mut commands: Commands) {
     commands.trigger(AddColliderEvent);
 }
@@ -288,6 +304,48 @@ fn on_add_emitter(
     asset.emitters.push(EmitterData {
         name,
         ..Default::default()
+    });
+
+    dirty_state.has_unsaved_changes = true;
+
+    editor_state.inspecting = Some(Inspecting {
+        kind: Inspectable::Emitter,
+        index: new_index,
+    });
+
+    commands.trigger(RespawnEmittersEvent);
+    last_project.handle = None;
+}
+
+/// Mirrors `on_add_emitter` exactly, but pushes `mesh_fx_emitter()`'s preset
+/// configuration instead of a bare default. It is a separate emitter kind
+/// only at the level of "which starting values it gets" -- everything past
+/// this push (inspector, drives, save/load) treats it as an ordinary
+/// `EmitterData`, which is the whole point the preset's doc comment makes.
+fn on_add_mesh_fx(
+    _event: On<AddMeshFxEvent>,
+    mut commands: Commands,
+    mut editor_state: ResMut<EditorState>,
+    mut assets: ResMut<Assets<ParticlesAsset>>,
+    mut dirty_state: ResMut<DirtyState>,
+    mut last_project: ResMut<LastLoadedProject>,
+) {
+    let Some(handle) = &editor_state.current_project else {
+        return;
+    };
+    let Some(mut asset) = assets.get_mut(handle) else {
+        return;
+    };
+
+    let existing_names: Vec<&str> = asset.emitters.iter().map(|e| e.name.as_str()).collect();
+    let name = next_unique_name("Mesh FX", &existing_names);
+
+    let new_index = asset.emitters.len() as u8;
+    // Appending, like `on_add_emitter` -- positionally safe, no drive needs
+    // renumbering (see the module's Duplicate-vs-append note elsewhere).
+    asset.emitters.push(EmitterData {
+        name,
+        ..mesh_fx_emitter()
     });
 
     dirty_state.has_unsaved_changes = true;

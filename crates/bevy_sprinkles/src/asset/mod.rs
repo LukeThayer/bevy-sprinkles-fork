@@ -1477,3 +1477,104 @@ impl ParticlesAsset {
         }
     }
 }
+
+/// An emitter configured as a single pinned mesh, rather than a particle spray.
+///
+/// The design originally had a separate `MeshEffectData` object -- a non-particle
+/// mesh with its own transform, material and timing, for cones, rings, beams and
+/// shockwaves. It was cut during brainstorming: an emitter shaped like this
+/// (`particles_amount: 1`, `one_shot: true`, zero velocity and spread,
+/// `use_local_coords: true`, `transform_align: None`) already IS one, and it
+/// arrives with lifetime curves, gradients, timing, sub-emitters and the entire
+/// existing inspector already working. A separate object type would have
+/// re-implemented all of that to reach the same place, and would have made
+/// bursts of N expanding rings *harder* rather than easier.
+///
+/// This function is the convenience that cut bought: one call (one editor click)
+/// instead of five hand-set fields. It configures no new runtime behaviour --
+/// nothing here exists outside `EmitterData`'s ordinary fields.
+pub fn mesh_fx_emitter() -> EmitterData {
+    EmitterData {
+        name: "Mesh FX".to_string(),
+        time: EmitterTime {
+            one_shot: true,
+            ..Default::default()
+        },
+        draw_pass: EmitterDrawPass {
+            use_local_coords: true,
+            transform_align: None,
+            mesh: ParticleMesh::Cylinder {
+                top_radius: 0.0,
+                bottom_radius: 1.0,
+                height: 2.0,
+                radial_segments: 16,
+                rings: 1,
+                cap_top: false,
+                cap_bottom: false,
+            },
+            ..Default::default()
+        },
+        emission: EmitterEmission {
+            particles_amount: 1,
+            ..Default::default()
+        },
+        velocities: EmitterVelocities {
+            initial_velocity: Range::new(0.0, 0.0),
+            spread: 0.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod mesh_fx_tests {
+    use super::*;
+
+    #[test]
+    fn the_mesh_fx_preset_produces_a_single_pinned_mesh_particle() {
+        let e = mesh_fx_emitter();
+        assert_eq!(
+            e.emission.particles_amount, 1,
+            "one particle -- it IS the mesh"
+        );
+        assert!(e.time.one_shot);
+        assert_eq!(
+            e.velocities.initial_velocity,
+            Range::new(0.0, 0.0),
+            "it must not drift"
+        );
+        assert!(e.draw_pass.use_local_coords, "it must follow the effect");
+        assert!(
+            e.draw_pass.transform_align.is_none(),
+            "it must not billboard"
+        );
+    }
+
+    #[test]
+    fn the_mesh_fx_preset_has_zero_spread_and_a_cone_shaped_default_mesh() {
+        let e = mesh_fx_emitter();
+        assert_eq!(
+            e.velocities.spread, 0.0,
+            "spread must not drift the mesh either"
+        );
+        match e.draw_pass.mesh {
+            ParticleMesh::Cylinder {
+                top_radius,
+                bottom_radius,
+                ..
+            } => {
+                assert_eq!(top_radius, 0.0, "a cone: pinched to a point at the top");
+                assert!(bottom_radius > 0.0);
+            }
+            other => panic!("expected a Cylinder mesh (a cone via top_radius 0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_mesh_fx_preset_gets_a_recognisable_default_name() {
+        // Not load-bearing behaviour, but a name of "Emitter" would make it
+        // indistinguishable from a plain `Add Emitter` in the outliner list.
+        assert_eq!(mesh_fx_emitter().name, "Mesh FX");
+    }
+}

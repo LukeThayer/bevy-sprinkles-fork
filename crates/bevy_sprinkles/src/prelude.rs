@@ -10,6 +10,7 @@ pub use crate::asset::{
     ParticlesDimension, QuadOrientation, Range as ParticleRange, RibbonTrailShape,
     SerializableAlphaMode, SerializableFace, SolidOrGradientColor, SprinklesEditorData,
     StandardParticleMaterial, SubEmitterConfig, SubEmitterMode, TransformAlign, VisibilityAabb,
+    mesh_fx_emitter,
 };
 #[cfg(feature = "preset-textures")]
 pub use crate::textures::preset::PresetTexture;

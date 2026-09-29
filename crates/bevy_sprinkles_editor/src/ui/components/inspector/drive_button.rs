@@ -75,6 +75,8 @@ use crate::ui::widgets::popover::{
 use crate::ui::widgets::text_edit::{TextEditCommitEvent, TextEditProps, text_edit};
 use crate::ui::widgets::utils::find_ancestor;
 
+use crate::ui::components::drives::prop_label;
+
 use super::{InspectedEmitterTracker, InspectedLightTracker};
 
 // --- Pure data operations -----------------------------------------------
@@ -285,6 +287,31 @@ fn drivable_stage_text(prop: DrivableProp) -> &'static str {
     }
 }
 
+/// The property's own name, via `drives.rs`'s `prop_label` (reused, not
+/// reimplemented -- see that function's doc).
+fn drivable_prop_label(prop: DrivableProp) -> String {
+    match prop {
+        DrivableProp::Emitter(prop) => prop_label(prop),
+        DrivableProp::Light(prop) => prop_label(prop),
+    }
+}
+
+/// The popover header text: property name first, stage second. Task 22's
+/// fix round -- `drivable_stage_text` alone cannot tell two buttons apart
+/// once they share a `Stage` (`ScrollU`/`ScrollV` are both `Render`), which
+/// is exactly the case that task introduced (two drive buttons on one
+/// field, for the first time in this codebase). Naming the prop in the
+/// header, rather than only labelling the two buttons, generalizes: any
+/// FUTURE field with paired drive targets inherits the disambiguation for
+/// free instead of needing its own button labels.
+fn drivable_header_text(prop: DrivableProp) -> String {
+    format!(
+        "{} \u{2022} {}",
+        drivable_prop_label(prop),
+        drivable_stage_text(prop)
+    )
+}
+
 // --- Trigger button ---------------------------------------------------
 
 fn setup_drive_button(mut commands: Commands, buttons: Query<Entity, Added<EditorDriveButton>>) {
@@ -416,7 +443,7 @@ fn handle_drive_trigger_click(
 
     commands
         .spawn_scene(popover_header(PopoverHeaderProps::new(
-            drivable_stage_text(prop.0),
+            drivable_header_text(prop.0),
             popover_entity,
         )))
         .insert(ChildOf(popover_entity));
@@ -947,6 +974,19 @@ mod tests {
         assert!(stage_label(EmitterProp::SpawnSize).starts_with("Spawn"));
         assert!(stage_label(EmitterProp::Gravity).starts_with("Sim"));
         assert!(stage_label(EmitterProp::SizeMul).starts_with("Render"));
+    }
+
+    /// Task 22's fix round: `ScrollU` and `ScrollV` share a `Stage` (both
+    /// `Render`), so `drivable_stage_text` alone cannot tell their two
+    /// popovers apart. Pins that the header text -- what an author actually
+    /// reads when they click one of the two identical trigger icons -- does.
+    #[test]
+    fn the_popover_header_names_the_property_not_just_the_stage() {
+        let u = drivable_header_text(DrivableProp::Emitter(EmitterProp::ScrollU));
+        let v = drivable_header_text(DrivableProp::Emitter(EmitterProp::ScrollV));
+        assert_ne!(u, v, "two props sharing a Stage must not share a header");
+        assert!(u.to_lowercase().contains("scroll"));
+        assert!(v.to_lowercase().contains("scroll"));
     }
 
     /// A minimal App carrying the REAL commit observer, not a hand-rolled

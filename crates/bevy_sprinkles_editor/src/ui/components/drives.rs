@@ -296,7 +296,13 @@ fn light_name(asset: &ParticlesAsset, index: u8) -> String {
         .unwrap_or_else(|| format!("Light {index}"))
 }
 
-fn prop_label<T: std::fmt::Debug>(prop: T) -> String {
+/// `pub(crate)`: `inspector::drive_button` (Task 22's fix round) reuses this
+/// verbatim to name a driven property in its own popover header, for the
+/// same reason this module needs it -- `EmitterProp`/`LightProp`/
+/// `TransformProp` have no hand-written display name anywhere else, and two
+/// props can share a `Stage` (e.g. `ScrollU`/`ScrollV`, both `Render`), so
+/// stage text alone cannot tell them apart.
+pub(crate) fn prop_label<T: std::fmt::Debug>(prop: T) -> String {
     name_to_label(&format!("{prop:?}"))
 }
 

@@ -7,11 +7,26 @@
 //! delete. This is the whole reason `curve_edit` needs no new machinery --
 //! it is reused exactly as `inspector::colors` opens `gradient_edit`.
 //!
-//! **A fresh drive must be a no-op.** [`upsert_drive`] appends an identity
-//! curve, `DriveOp::Multiply`, output pinned `1.0..1.0`: resolving it
-//! multiplies the consumer's authored value by exactly one. Wiring a drive
-//! must never itself change the look -- only shaping the curve or widening
-//! the output range does. See the `tests` module for the pin.
+//! **A fresh drive must RESPOND.** [`upsert_drive`] appends a rising ramp,
+//! `DriveOp::Multiply`, output `0.0..1.0`: a 0-100% fader on the consumer's
+//! authored value, moving with the variable from the moment it is wired.
+//!
+//! That reverses this module's original rule, "a fresh drive must be a
+//! no-op", and the reversal is deliberate. The old default was a constant
+//! curve with the output pinned to `1.0..1.0`, which bought "wiring a drive
+//! never changes the look" at the price of a drive that could not change it
+//! LATER either: `sample` computes `lo + (hi - lo) * unit`, so a `min ==
+//! max` output resolves to the same number for every value of the variable.
+//! The wire appeared in the list, drew its curve, and was mathematically
+//! incapable of doing anything until its output range was widened by hand,
+//! with nothing on screen saying so -- and an author who does not already
+//! know that formula has no way to find out. A jolt is cheap and visible;
+//! a dead wire is neither.
+//!
+//! The accepted cost, stated rather than hidden: adding a drive CAN change
+//! the look immediately. Most sharply when the target variable's default is
+//! `0.0`, where the property drops to zero until the variable is scrubbed
+//! up. See the `tests` module for the pin on the new contract.
 //!
 //! **The popover states the target's stage in words**, not as an enum name:
 //! that is the first question an author asks of a knob ("does this change
@@ -92,14 +107,30 @@ pub fn drives_on<'a>(asset: &'a ParticlesAsset, target: &DriveTarget) -> Vec<(us
         .collect()
 }
 
-/// Appends a drive that is deliberately a NO-OP until shaped: identity curve,
-/// Multiply, output pinned to 1..1. Adding a wire must never change the look.
+/// Appends a drive that WORKS the moment it is wired: a rising ramp,
+/// Multiply, output `0.0..1.0` -- a 0-100% fader on the consumer's authored
+/// value, at `1.0` (authored value untouched) when the variable sits at the
+/// top of its declared range and `0.0` at the bottom.
+///
+/// Both halves of that are load-bearing and neither works alone. `sample`
+/// computes `lo + (hi - lo) * unit`, so the old `1.0..1.0` output collapsed
+/// every variable value to one number; and `CurveTexture::default()` is the
+/// CONSTANT curve (`Curve::default`'s two points are `(0, 1)` and `(1, 1)`,
+/// named "Constant"), so `unit` is `1.0` whatever the variable does. Widening
+/// the output alone would have left the drive just as dead -- `0.0 + 1.0 *
+/// 1.0` -- which is why this builds its own ramp rather than taking the
+/// shared default. The crate-wide `CurveTexture::default()` is deliberately
+/// left alone: it is the right default for a curve that is not a fader.
+///
+/// This is the one place a drive is created. Both authoring routes -- the
+/// per-field drive button's "Add drive" and `drives.rs`'s target picker --
+/// call it, so the default lives here and only here.
 pub fn upsert_drive(asset: &mut ParticlesAsset, target: DriveTarget, variable: VariableId) {
     asset.drives.push(Drive {
         variable,
         target,
-        curve: CurveTexture::default(),
-        output: ParticleRange { min: 1.0, max: 1.0 },
+        curve: CurveTexture::new(vec![CurvePoint::new(0.0, 0.0), CurvePoint::new(1.0, 1.0)]),
+        output: ParticleRange { min: 0.0, max: 1.0 },
         op: DriveOp::Multiply,
         muted: false,
     });
@@ -935,10 +966,11 @@ mod tests {
     }
 
     #[test]
-    fn a_new_drive_defaults_to_an_identity_curve_and_multiply() {
-        // Adding a drive must not change the look until the author shapes it.
-        // A drive that immediately altered the effect would make "what did I
-        // just do?" unanswerable.
+    fn a_new_drive_defaults_to_a_zero_to_one_fader_on_multiply() {
+        // Replaces the old `..._defaults_to_an_identity_curve_and_multiply`,
+        // which pinned `1.0..1.0` -- the value that made a fresh drive
+        // incapable of responding to its variable at all. See the module
+        // doc for why that guarantee was traded away.
         let mut asset = asset_with_one_variable_one_emitter();
         upsert_drive(
             &mut asset,
@@ -950,25 +982,41 @@ mod tests {
         );
         let d = &asset.drives[0];
         assert_eq!(d.op, DriveOp::Multiply);
-        assert_eq!(d.output, ParticleRange { min: 1.0, max: 1.0 });
+        assert_eq!(d.output, ParticleRange { min: 0.0, max: 1.0 });
     }
 
     #[test]
-    fn resolving_a_freshly_added_drive_leaves_the_render_target_at_the_identity_multiplier() {
-        // The property above ("must not change the look") verified end to
-        // end: run the real resolver a host would run, and check the
-        // resolved render slot is exactly 1.0 -- multiplying the consumer's
-        // authored value by one, not replacing or nudging it.
+    fn resolving_a_freshly_added_drive_tracks_its_variable_end_to_end() {
+        // The property verified through the real resolver a host would run,
+        // at BOTH ends of the declared range. One end alone would pass for
+        // the old constant-curve default too: that resolved to 1.0
+        // everywhere, which is indistinguishable from this at the top of
+        // the range and nothing like it at the bottom.
         let mut asset = asset_with_one_variable_one_emitter();
         let target = DriveTarget::Emitter {
             index: 0,
             prop: EmitterProp::SizeMul,
         };
         upsert_drive(&mut asset, target, VariableId(0));
+        let slot = EmitterProp::SizeMul
+            .slot()
+            .expect("SizeMul is a Render prop");
 
-        let resolved = resolve_drives(&[0.5], &asset);
-        let slot = EmitterProp::SizeMul.slot().expect("SizeMul is a Render prop");
-        assert_eq!(resolved.emitters[0].render[slot], Some(1.0));
+        // `temperature` is declared over the default range, 0.0..=1.0.
+        let top = resolve_drives(&[1.0], &asset);
+        assert_eq!(
+            top.emitters[0].render[slot],
+            Some(1.0),
+            "at the top of the range the authored value is passed through"
+        );
+
+        let bottom = resolve_drives(&[0.0], &asset);
+        assert_eq!(
+            bottom.emitters[0].render[slot],
+            Some(0.0),
+            "and at the bottom it is faded out -- a wire that MOVES, which \
+             is the whole point of the new default"
+        );
     }
 
     #[test]

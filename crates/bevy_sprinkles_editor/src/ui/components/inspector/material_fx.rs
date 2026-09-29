@@ -352,7 +352,13 @@ fn clear_erosion(fx: &mut FxSettings) {
 
 fn clear_fresnel(fx: &mut FxSettings) {
     fx.fresnel_power = 0.0;
-    fx.fresnel_boost = 0.0;
+    // `0.0` is NOT the default here: `fresnel_boost` defaults to the neutral
+    // `1.0`, because it is a multiplier inside a feature `fresnel_power`
+    // already gates off. Hardcoding zero would leave residue that silently
+    // cancels the next fresnel the author switches on -- exactly the defect
+    // this branch's I8 fixed. Same shape as `clear_erosion`'s edge-colour
+    // line, for the same reason.
+    fx.fresnel_boost = FxSettings::default().fresnel_boost;
 }
 
 fn clear_soft(fx: &mut FxSettings) {

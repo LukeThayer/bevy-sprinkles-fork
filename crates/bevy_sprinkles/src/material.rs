@@ -230,6 +230,68 @@ mod tests {
         );
     }
 
+    /// `FxUniform`'s Rust and WGSL declarations share one GPU buffer, and its
+    /// four `vec4`s carry unrelated quantities packed by POSITION -- `scroll`
+    /// in `scroll_tiling.xy`, `fresnel_power` in `flow_fresnel.w`,
+    /// `fresnel_boost` in `erosion_soft.z`. Reorder or rename one side and
+    /// every lane after it reads someone else's number: no compile error, no
+    /// validation error, just an effect whose fresnel is driven by its soft
+    /// fade. Both declarations carried a "LAYOUT-LOCKSTEP" comment and nothing
+    /// checked it -- the only one of the three struct pairs here in that state.
+    ///
+    /// The Rust side comes from `#[derive(Reflect)]`'s own field metadata,
+    /// generated from the struct definition, so this compares WGSL against the
+    /// struct ITSELF rather than against a second hand-written list that could
+    /// drift alongside it. Same mechanism as
+    /// `asset::drive::tests::emitter_prop_all_matches_the_reflected_enum_exactly`.
+    #[test]
+    fn the_wgsl_fx_uniform_declares_the_same_fields_in_the_same_order() {
+        let bevy::reflect::TypeInfo::Struct(info) =
+            <FxUniform as bevy::reflect::Typed>::type_info()
+        else {
+            panic!("FxUniform must be a reflected struct");
+        };
+        let rust: Vec<&str> = (0..info.field_len())
+            .filter_map(|i| info.field_at(i))
+            .map(|f| f.name())
+            .collect();
+
+        let src = include_str!("shaders/common.wgsl");
+        let body = src
+            .split_once("struct FxUniform {")
+            .expect("common.wgsl must declare struct FxUniform")
+            .1
+            .split_once('}')
+            .expect("the FxUniform declaration must be closed")
+            .0;
+        let wgsl: Vec<(&str, &str)> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .map(|l| {
+                let l = l.trim_end_matches(',');
+                let (name, ty) = l.split_once(':').expect("a WGSL field is `name: type`");
+                (name.trim(), ty.trim())
+            })
+            .collect();
+
+        let wgsl_names: Vec<&str> = wgsl.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            wgsl_names, rust,
+            "common.wgsl's FxUniform must declare exactly the Rust struct's \
+             fields, in the same ORDER -- they are the same GPU buffer, and \
+             every field is a vec4, so a reorder mismatches silently"
+        );
+        for (name, ty) in wgsl {
+            assert_eq!(
+                ty, "vec4<f32>",
+                "FxUniform packs everything into vec4s so the WGSL struct needs \
+                 no padding fields; `{name}` is declared `{ty}`, and a non-vec4 \
+                 field here changes the layout on one side only"
+            );
+        }
+    }
+
     /// `particle_material.wgsl` has two fragment functions -- the deferred-
     /// prepass fragment and the forward fragment -- which must stay
     /// byte-identical wherever a drive or texture read matters: a feature

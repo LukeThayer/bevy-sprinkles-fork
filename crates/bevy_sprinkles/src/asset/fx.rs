@@ -7,9 +7,18 @@ use crate::TextureRef;
 /// The stylized-FX half of a particle material: everything that makes a
 /// scrolled, eroded, rim-lit sheet read as volumetric rather than as a sprite.
 ///
-/// Every field defaults to inert. That is load-bearing: this struct is added to
-/// an existing serialized type, so any default that changed a pixel would
+/// Every FEATURE defaults to inert. That is load-bearing: this struct is added
+/// to an existing serialized type, so any default that changed a pixel would
 /// silently restyle every effect already authored.
+///
+/// Note the level that promise is pitched at. Each feature is gated by one
+/// field -- `fresnel_power`, `erosion_threshold`, `soft_fade`, and so on -- and
+/// it is THAT field that defaults to off. A field inside an off feature is free
+/// to default to the value that makes the feature work once it is switched on,
+/// and `fresnel_boost` does exactly that: defaulting it to zero made Fresnel
+/// Power alone compile the shader block, pay its fill rate, and contribute
+/// mathematically nothing, while the tooltip sent the author off to blame their
+/// geometry.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Reflect)]
 #[serde(default)]
 pub struct FxSettings {
@@ -39,9 +48,12 @@ pub struct FxSettings {
     pub erosion_edge: f32,
     /// Color of the erosion rim.
     pub erosion_edge_color: [f32; 4],
-    /// Rim brightening exponent. `0` disables.
+    /// Rim brightening exponent. `0` disables the whole fresnel block.
     pub fresnel_power: f32,
-    /// Rim brightening intensity multiplier.
+    /// Rim brightening intensity multiplier, applied to the rim term the
+    /// exponent shapes (`base.rgb * fresnel_rim * fresnel_boost` in
+    /// `particle_material.wgsl`). Defaults to `1.0` -- neutral, not off --
+    /// because zero here silently cancels a fresnel the author just enabled.
     pub fresnel_boost: f32,
     /// Depth-fade distance in world units. `0` disables. Removes the hard
     /// intersection line where a quad clips the floor.
@@ -71,7 +83,7 @@ impl Default for FxSettings {
             erosion_edge: 0.0,
             erosion_edge_color: [1.0, 0.5, 0.1, 1.0],
             fresnel_power: 0.0,
-            fresnel_boost: 0.0,
+            fresnel_boost: 1.0,
             soft_fade: 0.0,
             gradient_remap: None,
         }
@@ -199,9 +211,15 @@ impl From<&FxSettings> for FxUniform {
                 finite(f.fresnel_boost, 0.0),
                 finite(f.soft_fade, 0.0).max(0.0),
             ),
-            erosion_edge_color: Vec4::from_array(
-                f.erosion_edge_color.map(|v| finite(v, 1.0)),
-            ),
+            erosion_edge_color: {
+                // The alpha lane is a `mix` WEIGHT, not a colour channel: the
+                // shader blends the rim in with `erosion_rim * edge_color.a`.
+                // An authored 4.0 there overshoots the mix past the rim colour
+                // into extrapolation, and a negative one past the base colour
+                // the other way -- both of which read as "the rim broke".
+                let c = f.erosion_edge_color.map(|v| finite(v, 1.0));
+                Vec4::new(c[0], c[1], c[2], c[3].clamp(0.0, 1.0))
+            },
         }
     }
 }
@@ -270,5 +288,49 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a.cache_key(), b.cache_key());
+    }
+
+    /// I8: `fresnel_power` alone used to switch on a shader block that
+    /// multiplied its rim term by a zero boost -- compiled, paid fill rate,
+    /// contributed exactly nothing. Asserts the uniform lane the shader reads
+    /// (`erosion_soft.z`), not pixels.
+    #[test]
+    fn fresnel_power_alone_actually_contributes() {
+        let fx = FxSettings {
+            fresnel_power: 2.0,
+            ..Default::default()
+        };
+        assert!(fx.fresnel_enabled(), "power alone must switch the feature on");
+        let u = FxUniform::from(&fx);
+        assert_ne!(
+            u.erosion_soft.z, 0.0,
+            "the boost the shader multiplies the rim by must not be zero when \
+             the author has only set the power"
+        );
+    }
+
+    #[test]
+    fn a_default_fresnel_boost_is_neutral_rather_than_off() {
+        assert_eq!(FxSettings::default().fresnel_boost, 1.0);
+    }
+
+    /// Minor (deferred, now fixed): `erosion_edge_color.a` is a `mix` WEIGHT
+    /// (`erosion_rim * edge_color.a`), so out-of-range values extrapolate the
+    /// blend past both endpoints instead of interpolating between them. The
+    /// rgb lanes are colour and stay unclamped -- HDR rims are the point.
+    #[test]
+    fn an_out_of_range_erosion_edge_alpha_is_clamped_to_a_valid_mix_weight() {
+        let hot = FxUniform::from(&FxSettings {
+            erosion_edge_color: [8.0, 0.0, 0.0, 4.0],
+            ..Default::default()
+        });
+        assert_eq!(hot.erosion_edge_color.w, 1.0);
+        assert_eq!(hot.erosion_edge_color.x, 8.0, "rgb stays HDR");
+
+        let cold = FxUniform::from(&FxSettings {
+            erosion_edge_color: [1.0, 1.0, 1.0, -2.0],
+            ..Default::default()
+        });
+        assert_eq!(cold.erosion_edge_color.w, 0.0);
     }
 }

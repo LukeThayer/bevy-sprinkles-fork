@@ -105,8 +105,36 @@ pub enum EmitterProp {
     SpawnSize,
     /// Angular spread of the initial spawn direction.
     Spread,
-    /// Radius of the emission volume.
+    /// Scales the sphere/ring RADIUS fields of the emission shape, and nothing
+    /// else: `emission_sphere_radius`, `emission_ring_radius` and
+    /// `emission_ring_inner_radius` (`extract.rs::apply_sim_drives`).
+    ///
+    /// NOT the same knob as [`Self::EmissionScaleX`]/`Y`/`Z`, and the two are
+    /// easy to conflate. This one reaches only the radius of a sphere or ring
+    /// emitter and does nothing whatever to a box one; those three multiply
+    /// `emission.scale`, which the shader applies to EVERY emission shape's
+    /// sampled position (`particle_simulate.wgsl:571`), box included.
     EmissionRadius,
+    /// Per-axis scale of the emission VOLUME along X: multiplies
+    /// `emitter.emission.scale.x`, which reaches the GPU as
+    /// `EmitterUniforms::emission_scale[0]` (`extract.rs`) and there scales the
+    /// sampled spawn position of every emission shape
+    /// (`particle_simulate.wgsl:571`). The authored default is `Vec3::ONE`, so
+    /// a drive resolving to `1.0` means "the volume as authored".
+    ///
+    /// MULTIPLIES, like every `Emitter` prop but the three `Dir` channels below
+    /// -- so an authored `scale.x` of exactly `0.0` stays zero whatever op the
+    /// drive uses ([`DriveOp`] explains why no op can reach that step).
+    ///
+    /// NOT [`Self::EmissionRadius`]: see that variant for the distinction.
+    EmissionScaleX,
+    /// Per-axis scale of the emission volume along Y. See
+    /// [`Self::EmissionScaleX`] -- same multiply, and the same distinction from
+    /// [`Self::EmissionRadius`].
+    EmissionScaleY,
+    /// Per-axis scale of the emission volume along Z. See
+    /// [`Self::EmissionScaleX`].
+    EmissionScaleZ,
     /// X component of the initial spawn direction, REPLACING the authored
     /// `velocities.initial_direction.x` (`EmitterUniforms::direction[0]`,
     /// `extract.rs`; the authored default is `Vec3::X`).
@@ -182,9 +210,10 @@ impl EmitterProp {
     /// `tests::emitter_prop_all_matches_the_reflected_enum_exactly`, which
     /// compares this list against the enum's own `#[derive(Reflect)]`
     /// variant metadata rather than against itself.
-    pub const ALL: [EmitterProp; 20] = [
+    pub const ALL: [EmitterProp; 23] = [
         Self::SpawnProbability, Self::Lifetime, Self::InitialSpeed, Self::SpawnSize,
         Self::Spread, Self::EmissionRadius,
+        Self::EmissionScaleX, Self::EmissionScaleY, Self::EmissionScaleZ,
         Self::DirX, Self::DirY, Self::DirZ,
         Self::Gravity, Self::TurbulenceStrength,
         Self::Tint, Self::Alpha, Self::SizeMul, Self::EmissiveIntensity,
@@ -198,6 +227,7 @@ impl EmitterProp {
         match self {
             Self::SpawnProbability | Self::Lifetime | Self::InitialSpeed
             | Self::SpawnSize | Self::Spread | Self::EmissionRadius
+            | Self::EmissionScaleX | Self::EmissionScaleY | Self::EmissionScaleZ
             | Self::DirX | Self::DirY | Self::DirZ => Stage::Spawn,
 
             Self::Gravity | Self::TurbulenceStrength => Stage::Sim,
@@ -428,13 +458,21 @@ mod tests {
     }
 
     #[test]
-    fn the_direction_components_are_spawn_stage_and_claim_no_render_slot() {
-        // The whole reason this addition needs no `.wgsl` edit: a Spawn prop
-        // rides the simulation uniform's existing `direction` field and takes
-        // no `drive_slots` entry, so `common.wgsl`'s `array<f32, 9>` -- which
-        // nothing in this repo links to `DRIVE_SLOT_COUNT` and no naga run has
-        // ever validated -- stays exactly as it is.
-        for p in [EmitterProp::DirX, EmitterProp::DirY, EmitterProp::DirZ] {
+    fn the_per_axis_props_are_spawn_stage_and_claim_no_render_slot() {
+        // The whole reason these additions need no `.wgsl` edit: a Spawn prop
+        // rides a field the simulation uniform already carries (`direction`,
+        // `emission_scale`) and takes no `drive_slots` entry, so
+        // `common.wgsl`'s `array<f32, 9>` -- which nothing in this repo links
+        // to `DRIVE_SLOT_COUNT` and no naga run has ever validated -- stays
+        // exactly as it is.
+        for p in [
+            EmitterProp::DirX,
+            EmitterProp::DirY,
+            EmitterProp::DirZ,
+            EmitterProp::EmissionScaleX,
+            EmitterProp::EmissionScaleY,
+            EmitterProp::EmissionScaleZ,
+        ] {
             assert_eq!(p.stage(), Stage::Spawn, "{p:?} must be read at birth");
             assert!(p.slot().is_none(), "{p:?} must not consume a render slot");
         }

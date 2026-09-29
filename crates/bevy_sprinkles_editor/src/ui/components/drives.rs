@@ -1373,9 +1373,12 @@ mod tests {
     /// blank or as an unreadable run-on; these three axis suffixes survive it
     /// only because "x"/"y"/"z" are in `UPPERCASE_ACRONYMS`.
     #[test]
-    fn the_direction_component_props_label_legibly_in_the_picker() {
+    fn the_per_axis_props_label_legibly_in_the_picker() {
         assert_eq!(prop_label(EmitterProp::DirX), "Dir X");
         assert_eq!(prop_label(EmitterProp::DirY), "Dir Y");
         assert_eq!(prop_label(EmitterProp::DirZ), "Dir Z");
+        assert_eq!(prop_label(EmitterProp::EmissionScaleX), "Emission scale X");
+        assert_eq!(prop_label(EmitterProp::EmissionScaleY), "Emission scale Y");
+        assert_eq!(prop_label(EmitterProp::EmissionScaleZ), "Emission scale Z");
     }
 }

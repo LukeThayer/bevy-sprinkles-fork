@@ -432,6 +432,20 @@ pub(crate) fn apply_sim_drives(u: &mut EmitterUniforms, r: &crate::drives::Emitt
         u.emission_ring_radius *= v;
         u.emission_ring_inner_radius *= v;
     }
+    // A separate knob from `EmissionRadius` above, which only reaches those
+    // three radius fields: this one scales `emission_scale`, which the shader
+    // applies to the sampled spawn position of EVERY emission shape
+    // (`shaders/particle_simulate.wgsl:571`), a box emitter included. Ordinary
+    // multiplies, against an authored default of `Vec3::ONE`.
+    if let Some(v) = r.spawn.get(&P::EmissionScaleX) {
+        u.emission_scale[0] *= v;
+    }
+    if let Some(v) = r.spawn.get(&P::EmissionScaleY) {
+        u.emission_scale[1] *= v;
+    }
+    if let Some(v) = r.spawn.get(&P::EmissionScaleZ) {
+        u.emission_scale[2] *= v;
+    }
     // The three direction components REPLACE rather than multiply, which is
     // the one place an `Emitter` drive does. `get_emission_velocity` does
     // `normalize(params.direction)` (`shaders/particle_simulate.wgsl:600`), so
@@ -1070,12 +1084,58 @@ mod drive_tests {
             emission_sphere_radius: 1.0,
             emission_ring_radius: 2.0,
             emission_ring_inner_radius: 4.0,
+            emission_scale: [2.0, 3.0, 5.0],
             ..Default::default()
         };
         apply_sim_drives(&mut u, &resolved(&[(EmitterProp::EmissionRadius, 0.5)]));
         assert_eq!(u.emission_sphere_radius, 0.5);
         assert_eq!(u.emission_ring_radius, 1.0);
         assert_eq!(u.emission_ring_inner_radius, 2.0);
+        // And NOT `emission_scale`: these are two different knobs, and the
+        // similar names invite an edit that collapses them. `EmissionRadius`
+        // does nothing at all to a box emitter, which has no radius field.
+        assert_eq!(
+            u.emission_scale, [2.0, 3.0, 5.0],
+            "EmissionRadius must leave the per-axis emission scale alone -- \
+             that is EmissionScaleX/Y/Z's job",
+        );
+    }
+
+    #[test]
+    fn each_emission_scale_axis_multiplies_its_own_uniform_lane() {
+        // Distinct authored values AND distinct factors per axis, so a swapped
+        // or duplicated index cannot land on the right product by accident.
+        let mut u = EmitterUniforms {
+            emission_scale: [1.0, 2.0, 4.0],
+            emission_sphere_radius: 3.0,
+            ..Default::default()
+        };
+        apply_sim_drives(
+            &mut u,
+            &resolved(&[
+                (EmitterProp::EmissionScaleX, 0.5),
+                (EmitterProp::EmissionScaleY, 3.0),
+                (EmitterProp::EmissionScaleZ, 0.25),
+            ]),
+        );
+        assert_eq!(u.emission_scale, [0.5, 6.0, 1.0]);
+        // The converse of the assertion in the EmissionRadius test above.
+        assert_eq!(
+            u.emission_sphere_radius, 3.0,
+            "EmissionScale* must not reach the radius fields",
+        );
+    }
+
+    #[test]
+    fn an_emission_scale_drive_on_one_axis_leaves_the_other_two_as_authored() {
+        // A non-uniform emission volume is the whole point of splitting this
+        // into three props rather than reusing one scalar.
+        let mut u = EmitterUniforms {
+            emission_scale: [1.0, 1.0, 1.0],
+            ..Default::default()
+        };
+        apply_sim_drives(&mut u, &resolved(&[(EmitterProp::EmissionScaleX, 4.0)]));
+        assert_eq!(u.emission_scale, [4.0, 1.0, 1.0]);
     }
 
     #[test]

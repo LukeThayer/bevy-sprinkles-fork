@@ -9,6 +9,23 @@
 //! does this; every deletion path (the list's delete button, and the
 //! generic outliner delete-confirmation flow in `data_panel.rs`, kept
 //! exhaustive but otherwise unreachable for variables) routes through it.
+//!
+//! **The scrub control sits on every row of this list**, not in the
+//! inspector. It was a "Preview value" field inside
+//! `inspector::variable`'s section, which meant selecting a variable before
+//! its knob could be turned -- and turning knobs is what a preview is FOR,
+//! so the one interaction the feature exists to support was the one behind
+//! an extra click. It is the same widget, moved: a plain numeric
+//! `text_edit` (this codebase has no general-purpose slider; the only one
+//! is the bespoke shader-backed hue/alpha strip in `widgets::color_picker`),
+//! writing only to [`VariableScrub`] and never to the asset.
+//!
+//! There is deliberately only ONE of it. The inspector's copy is gone
+//! rather than kept in sync, because two live editors of one value is the
+//! desync class the range-clamp fix next door was about -- and unlike the
+//! Drives list and its popover, which agree by both rebuilding from the
+//! asset, the scrub value lives in a resource that nothing dirties, so a
+//! second editor would have no rebuild signal to share.
 
 use std::collections::HashMap;
 
@@ -23,6 +40,8 @@ use crate::ui::widgets::button::{
     ButtonClickEvent, ButtonProps, ButtonVariant, IconButtonProps, button, icon_button,
 };
 use crate::ui::widgets::panel_section::{PanelSectionProps, panel_section};
+use crate::ui::widgets::text_edit::{TextEditCommitEvent, TextEditProps, text_edit};
+use crate::ui::widgets::utils::find_ancestor;
 use crate::viewport::EditorParticlePreview;
 
 pub fn plugin(app: &mut App) {
@@ -30,6 +49,7 @@ pub fn plugin(app: &mut App) {
         .add_observer(on_add_variable)
         .add_observer(on_select_variable_click)
         .add_observer(on_delete_variable_click)
+        .add_observer(on_row_scrub_commit)
         .add_systems(
             Update,
             (
@@ -144,8 +164,70 @@ struct VariableSelectButton(u8);
 #[derive(Component, Clone, Copy)]
 struct VariableDeleteButton(u8);
 
+/// Marks one row's scrub field with the variable it previews.
+///
+/// The NAME is all it stores, on purpose: [`VariableScrub`] is keyed by
+/// name, and a row's index would go stale the moment a variable above it
+/// was deleted. It is deliberately not a `FieldBinding` either -- that is
+/// the component `binding::propagate_bindings` walks up to find, and
+/// carrying one would route this commit through `handle_text_commit`,
+/// which dirties the project. Scrubbing is a viewing state; see
+/// [`VariableScrub`]'s own doc.
+#[derive(Component)]
+struct VariableScrubRow {
+    name: String,
+}
+
 #[derive(Event)]
 struct AddVariableEvent;
+
+/// Width of a row's scrub field. Wide enough for a signed three-decimal
+/// value without the name button beside it collapsing; the name has the
+/// row's remaining space and shrinks, the scrub does not.
+const SCRUB_FIELD_WIDTH: f32 = 84.0;
+
+/// Renders a scrub value the way the numeric `text_edit` expects to parse
+/// it back -- an integral float keeps its `.0` rather than reading as an
+/// integer field.
+fn format_f32(v: f32) -> String {
+    let mut text = v.to_string();
+    if !text.contains('.') {
+        text.push_str(".0");
+    }
+    text
+}
+
+/// A row's scrub commit: clamp to the variable's CURRENT declared range and
+/// store it in [`VariableScrub`], touching neither the asset nor
+/// `DirtyState`.
+///
+/// It walks up from the text input to its `VariableScrubRow` ancestor the
+/// same way `binding::propagate_bindings` walks up to a `FieldBinding` --
+/// deliberately outside that system, so scrubbing can never dirty the
+/// project.
+fn on_row_scrub_commit(
+    trigger: On<TextEditCommitEvent>,
+    rows: Query<&VariableScrubRow>,
+    parents: Query<&ChildOf>,
+    editor_state: Res<EditorState>,
+    assets: Res<Assets<ParticlesAsset>>,
+    mut scrub: ResMut<VariableScrub>,
+) {
+    let Some((_, row)) = find_ancestor(trigger.entity, &rows, &parents) else {
+        return;
+    };
+    let Ok(value) = trigger.text.trim().parse::<f32>() else {
+        return;
+    };
+    let Some(asset) = editor_state
+        .current_project
+        .as_ref()
+        .and_then(|h| assets.get(h))
+    else {
+        return;
+    };
+    scrub.set_clamped(&row.name, value, &asset.variables);
+}
 
 fn setup_variables_section(mut commands: Commands, panels: Query<Entity, Added<EditorDataPanel>>) {
     for panel_entity in &panels {
@@ -268,11 +350,25 @@ fn on_delete_variable_click(
 /// sets). This is simpler and safer than tracking which specific mutation
 /// happened, at the cost of a full rebuild on any edit -- fine for a list
 /// this small.
+///
+/// That rebuild is also what keeps each row's scrub field honest: the
+/// widget clamps typed input against a `NumericRange` component captured
+/// when it was spawned (`widgets::text_edit`), so a range widened in the
+/// inspector would otherwise leave the field refusing the new maximum even
+/// though [`VariableScrub::set_clamped`] would accept it. Editing a range
+/// dirties, a dirty rebuilds this list, and the respawned field carries
+/// the new bounds.
+///
+/// [`VariableScrub`] is read but NOT watched for change. It is rewritten
+/// every frame by `apply_variable_scrub` (`retain_declared` takes `&mut
+/// self` unconditionally), so watching it would rebuild this list on every
+/// frame -- and would tear down the very field the author is typing into.
 fn rebuild_variable_list(
     mut commands: Commands,
     editor_state: Res<EditorState>,
     dirty_state: Res<DirtyState>,
     assets: Res<Assets<ParticlesAsset>>,
+    scrub: Res<VariableScrub>,
     section: Query<Entity, With<VariablesSection>>,
     new_sections: Query<Entity, Added<VariablesSection>>,
     existing_rows: Query<Entity, With<VariableRowList>>,
@@ -354,6 +450,34 @@ fn rebuild_variable_list(
             .id();
         commands.entity(select_wrapper).add_child(select_entity);
 
+        // The scrub field, on the row rather than behind a selection. Its
+        // bounds and its shown value are both read from the asset and the
+        // resource right here, every rebuild -- nothing is cached on the
+        // row itself but the name.
+        let scrub_wrapper = commands
+            .spawn(Node {
+                width: px(SCRUB_FIELD_WIDTH),
+                flex_shrink: 0.0,
+                ..default()
+            })
+            .id();
+        commands.entity(row).add_child(scrub_wrapper);
+
+        let scrub_value = scrub.value_or_default(&variable.name, &asset.variables);
+        let scrub_entity = commands
+            .spawn_scene(text_edit(
+                TextEditProps::default()
+                    .with_default_value(format_f32(scrub_value))
+                    .numeric_f32()
+                    .with_min(variable.range.min as f64)
+                    .with_max(variable.range.max as f64),
+            ))
+            .insert(VariableScrubRow {
+                name: variable.name.clone(),
+            })
+            .id();
+        commands.entity(scrub_wrapper).add_child(scrub_entity);
+
         let delete_entity = commands
             .spawn_scene(icon_button(
                 IconButtonProps::new(ICON_CLOSE).variant(ButtonVariant::Ghost),
@@ -368,8 +492,10 @@ fn rebuild_variable_list(
 
 /// Every frame: drops stale scrub entries (a renamed/deleted variable) and
 /// pushes the surviving ones onto the previewed entity's `ParticleVariables`,
-/// inserting the component if it is not there yet. The slider IS the
-/// preview mechanism -- there is no separate preview concept.
+/// inserting the component if it is not there yet. The row's scrub field IS
+/// the preview mechanism -- there is no separate preview concept, and no
+/// second surface driving these values since the inspector's copy was
+/// folded into the list (see the module doc).
 fn apply_variable_scrub(
     mut commands: Commands,
     editor_state: Res<EditorState>,
@@ -407,8 +533,9 @@ mod tests {
 
     #[test]
     fn scrubbing_a_variable_reaches_the_previewed_entitys_particle_variables() {
-        // The slider IS the preview mechanism -- there is no separate preview
-        // concept -- so this wiring is the feature, not a convenience.
+        // The row's scrub field IS the preview mechanism -- there is no
+        // separate preview concept -- so this wiring is the feature, not a
+        // convenience.
         let mut scrub = VariableScrub::default();
         scrub.set("temperature", 0.75);
         let mut vars = ParticleVariables::default();
@@ -512,5 +639,236 @@ mod tests {
         let mut asset = asset_with(vec![var("a")], vec![]);
         remove_variable(&mut asset, 5);
         assert_eq!(asset.variables.len(), 1);
+    }
+
+    // --- The row's scrub control -------------------------------------
+    //
+    // These moved here with the control itself, from
+    // `inspector::variable`. Its `editing_a_bound_field_still_dirties_the_
+    // project` stayed behind on purpose and is the other half of the first
+    // test below: without it, "a scrub never dirties" could pass because
+    // commits are broken outright rather than because scrub rows are
+    // excluded from the binding graph.
+
+    /// A minimal App carrying the REAL commit path
+    /// (`binding::plugin` -- `propagate_bindings` finding a `FieldBinding`
+    /// ancestor, then `commit::handle_text_commit` dirtying on a change),
+    /// not a hand-rolled stand-in for it. `inspector::variable`'s copy of
+    /// this harness carries the full explanation of why
+    /// `CheckerboardMaterial`/`GradientMaterial` are registered in a test
+    /// about variables (short version: `binding::plugin` is the only
+    /// reachable entry point and it drags the swatch systems in, which
+    /// take those `Assets<T>` unconditionally).
+    fn scrub_app(range: ParticleRange) -> (App, Handle<ParticlesAsset>) {
+        use crate::io::EditorData;
+        use crate::ui::components::inspector::{
+            InspectedEmitterTracker, update_inspected_emitter_tracker,
+        };
+        use crate::ui::widgets::color_picker::CheckerboardMaterial;
+        use crate::ui::widgets::gradient_edit::GradientMaterial;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::asset::AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.init_asset::<CheckerboardMaterial>();
+        app.init_asset::<GradientMaterial>();
+        app.init_resource::<DirtyState>();
+        app.init_resource::<VariableScrub>();
+        app.insert_resource(EditorData::default());
+        app.init_resource::<InspectedEmitterTracker>();
+        app.add_systems(Update, update_inspected_emitter_tracker);
+        crate::ui::components::binding::plugin(&mut app);
+        app.add_observer(on_row_scrub_commit);
+
+        let mut asset = ParticlesAsset::new(
+            "t".into(),
+            ParticlesDimension::D3,
+            Default::default(),
+            vec![EmitterData::default()],
+            vec![],
+            false,
+            ParticlesAuthors::default(),
+        );
+        asset.variables = vec![VariableDecl {
+            name: "temperature".into(),
+            range,
+            ..Default::default()
+        }];
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(asset)
+        };
+        app.insert_resource(EditorState {
+            current_project: Some(handle.clone()),
+            current_project_path: None,
+            inspecting: None,
+        });
+        (app, handle)
+    }
+
+    /// Drives a commit through the row marker the way a typed value does:
+    /// the text input is a DESCENDANT, so this also exercises the
+    /// `find_ancestor` walk rather than triggering on the marker itself.
+    fn commit_scrub(app: &mut App, text: &str) {
+        use crate::ui::widgets::text_edit::EditorTextEdit;
+
+        let root = app
+            .world_mut()
+            .spawn(VariableScrubRow {
+                name: "temperature".into(),
+            })
+            .id();
+        let leaf = app.world_mut().spawn((EditorTextEdit, ChildOf(root))).id();
+        // Let `propagate_bindings` process the `Added<EditorTextEdit>` leaf
+        // first -- it walks up to `root`, finds no `FieldBinding` there
+        // (only `VariableScrubRow`), and attaches no `BoundTo`.
+        app.update();
+        app.world_mut().trigger(TextEditCommitEvent {
+            entity: leaf,
+            text: text.into(),
+        });
+        app.update();
+    }
+
+    /// The property the whole `VariableScrubRow`/`FieldBinding` split
+    /// exists for: a scrub commit must never reach
+    /// `commit::handle_text_commit`, because that system is what dirties
+    /// the project. It drives the real chain end to end, so a future change
+    /// to either (`propagate_bindings` widening its ancestor search, or
+    /// this row accidentally growing a `FieldBinding`) is caught here
+    /// rather than reported as the editor silently marking sessions dirty.
+    #[test]
+    fn scrubbing_a_preview_value_never_dirties_the_project() {
+        let (mut app, _) = scrub_app(ParticleRange { min: 0.0, max: 1.0 });
+        commit_scrub(&mut app, "0.5");
+        assert!(
+            !app.world().resource::<DirtyState>().has_unsaved_changes,
+            "a scrub commit must never dirty the project"
+        );
+        assert_eq!(
+            app.world().resource::<VariableScrub>().get("temperature"),
+            Some(0.5),
+            "and it must still have reached the scrub, or the test above is \
+             passing because nothing happened at all"
+        );
+    }
+
+    /// Editing a variable's range must move what the scrub accepts. The
+    /// control used to clamp against a copy of `decl.range` captured when
+    /// it was built, so widening the range did nothing: it went on refusing
+    /// anything past the old maximum with nothing on screen to blame.
+    ///
+    /// The two commits are the same text against two different ranges. The
+    /// first pins that clamping still happens at all, so the second cannot
+    /// pass merely because the clamp was deleted.
+    #[test]
+    fn widening_a_variables_range_widens_what_the_scrub_accepts() {
+        let (mut app, handle) = scrub_app(ParticleRange { min: 0.0, max: 1.0 });
+
+        commit_scrub(&mut app, "5.0");
+        assert_eq!(
+            app.world().resource::<VariableScrub>().get("temperature"),
+            Some(1.0),
+            "5.0 must clamp to the declared maximum of 1.0"
+        );
+
+        {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut asset = assets.get_mut(&handle).unwrap();
+            asset.variables[0].range = ParticleRange {
+                min: 0.0,
+                max: 10.0,
+            };
+        }
+
+        commit_scrub(&mut app, "5.0");
+        assert_eq!(
+            app.world().resource::<VariableScrub>().get("temperature"),
+            Some(5.0),
+            "the clamp must follow the range the asset declares NOW, not the \
+             one captured when the control was built"
+        );
+    }
+
+    /// The point of moving the control: EVERY declared variable carries
+    /// one, with nothing selected. Before this, the scrub lived in the
+    /// inspector's Variable section, so it existed only for whatever
+    /// variable happened to be inspected -- exactly one, and only after a
+    /// click.
+    ///
+    /// This drives the real `rebuild_variable_list`, scene spawning and
+    /// all, rather than asserting about the code that calls it.
+    #[test]
+    fn every_row_carries_a_scrub_field_with_nothing_selected() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .add_plugins(bevy::scene::ScenePlugin);
+        app.init_asset::<ParticlesAsset>();
+        app.init_asset::<Image>();
+        app.init_asset::<bevy::text::Font>();
+        app.init_resource::<DirtyState>();
+        app.init_resource::<VariableScrub>();
+        app.add_systems(Update, rebuild_variable_list);
+
+        let mut asset = ParticlesAsset::new(
+            "t".into(),
+            ParticlesDimension::D3,
+            Default::default(),
+            vec![EmitterData::default()],
+            vec![],
+            false,
+            ParticlesAuthors::default(),
+        );
+        asset.variables = vec![var("heat"), var("wind"), var("wetness")];
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(asset)
+        };
+        app.insert_resource(EditorState {
+            current_project: Some(handle),
+            current_project_path: None,
+            inspecting: None,
+        });
+        app.world_mut().spawn(VariablesSection);
+
+        app.update();
+        app.update();
+
+        let mut names: Vec<String> = app
+            .world_mut()
+            .query::<&VariableScrubRow>()
+            .iter(app.world())
+            .map(|row| row.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "heat".to_string(),
+                "wetness".to_string(),
+                "wind".to_string()
+            ],
+            "one scrub field per declared variable, addressed by name"
+        );
+    }
+
+    /// A scrub on a name the asset no longer declares is dropped rather
+    /// than stored unclamped -- `retain_declared` would evict it on the
+    /// next frame anyway, and storing it flashes a ghost value in between.
+    #[test]
+    fn a_scrub_on_an_undeclared_variable_stores_nothing() {
+        let (mut app, handle) = scrub_app(ParticleRange { min: 0.0, max: 1.0 });
+        {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.get_mut(&handle).unwrap().variables.clear();
+        }
+        commit_scrub(&mut app, "0.5");
+        assert_eq!(
+            app.world().resource::<VariableScrub>().get("temperature"),
+            None
+        );
     }
 }

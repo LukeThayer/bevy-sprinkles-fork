@@ -4,8 +4,8 @@ use bevy::{
 
 use crate::{
     asset::{
-        DrawPassMaterial, EmitterData, EmitterTrail, FxSettings, FxUniform, ParticlesAsset,
-        DRIVE_SLOT_COUNT,
+        DRIVE_SLOT_COUNT, DrawPassMaterial, EmitterData, EmitterTrail, FxSettings, FxUniform,
+        ParticlesAsset,
     },
     drives::{EffectDrives, EmitterResolved},
     material::{
@@ -853,7 +853,6 @@ pub fn sync_particle_material(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,7 +925,10 @@ mod tests {
         let mut cache = GradientTextureCache::default();
         let mut images = Assets::<Image>::default();
         let handle = resolve_gradient_texture(&fx, &mut cache, &mut images);
-        assert!(handle.is_none(), "an unauthored effect must not bake anything");
+        assert!(
+            handle.is_none(),
+            "an unauthored effect must not bake anything"
+        );
     }
 
     #[test]

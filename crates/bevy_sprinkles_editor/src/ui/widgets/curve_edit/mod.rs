@@ -3,7 +3,6 @@ mod presets;
 
 use bevy::color::palettes::tailwind;
 use bevy::input_focus::InputFocus;
-use bevy::picking::events::{Press, Release};
 use bevy::picking::hover::Hovered;
 use bevy::picking::pointer::PointerButton;
 use bevy::picking::prelude::Pickable;
@@ -84,6 +83,10 @@ const CONTENT_PADDING: f32 = 12.0;
 const POINT_HANDLE_SIZE: f32 = 12.0;
 const TENSION_HANDLE_SIZE: f32 = 10.0;
 const HANDLE_BORDER: f32 = 1.0;
+/// The grid a drag snaps to. Applied directly to the quantities that are
+/// already normalized -- a point's 0..1 position, a tension's -1..1 -- and as
+/// a FRACTION OF THE SPAN to a point's value, which is in the curve's own
+/// units; see [`snap_to_span`].
 const DRAG_SNAP_STEP: f64 = 0.01;
 const CURVE_ALPHA: f32 = 0.8;
 const FILL_ALPHA: f32 = 0.2;
@@ -307,11 +310,104 @@ struct PointModeMenu;
 #[derive(Component, Default)]
 struct Dragging;
 
+/// Where inside the control the cursor landed when the drag began, in
+/// normalized canvas space (`cursor - control`).
+///
+/// [`PointHandle::update_state`] reads the cursor AS the point's new
+/// position. Without this correction, pressing anywhere but a handle's exact
+/// centre pixel snapped the point to the cursor before the pointer had moved
+/// at all -- on a twelve-pixel handle, essentially every grab jumped. The
+/// grip is taken once at `DragStart` and subtracted from every later cursor
+/// reading, so the point keeps the grip it was picked up by.
+///
+/// It lives on the control entity rather than in a resource because several
+/// curve editors can be open at once (the Drives dock's editor pane and any
+/// inspector curve field), and two grips must not share one slot.
+#[derive(Component, Clone, Copy)]
+struct GrabOffset(Vec2);
+
+impl GrabOffset {
+    /// The grip a cursor at `cursor` takes on `control`. A control with no
+    /// position of its own -- the canvas, or a tension handle, which reads
+    /// `delta` rather than the cursor -- has nothing to be off-centre from,
+    /// so its grip is zero and the correction below is the identity.
+    fn take<C: CurveControl>(control: &C, state: &CurveEditState, cursor: Vec2) -> Self {
+        Self(
+            control
+                .normalized_position(state)
+                .map_or(Vec2::ZERO, |position| cursor - position),
+        )
+    }
+
+    /// Where the control should sit for a cursor now at `cursor`.
+    fn correct(self, cursor: Vec2) -> Vec2 {
+        cursor - self.0
+    }
+}
+
+/// Snaps a dragged value to one hundred steps across the curve's own range.
+///
+/// [`DRAG_SNAP_STEP`] used to be applied to the raw value, so the grid the
+/// author felt depended on what the curve drove: a hundred steps on a 0..1
+/// alpha curve, four hundred on a 0..4 bbox curve, and none at all on a
+/// 0..900000 light intensity, where a hundredth of a unit is far below one
+/// pixel of canvas. Taking the step from the span makes the feel the same on
+/// every curve.
+///
+/// A range that cannot yield a usable step -- degenerate, or non-finite,
+/// which the Range fields accept because `f32::from_str` parses `inf` and
+/// `NaN` as readily as a number -- snaps nothing, rather than dividing by
+/// zero.
+fn snap_to_span(raw: f64, span: f64) -> f64 {
+    let step = span.abs() * DRAG_SNAP_STEP;
+    if !raw.is_finite() || !step.is_finite() || step <= 0.0 {
+        return raw;
+    }
+    (raw / step).round() * step
+}
+
+/// `value` held between `a` and `b`, in whichever order they arrive.
+///
+/// Both of the point drag's bounds can cross. The Range fields take any two
+/// numbers typed into them, max below min included; and the drag keeps 0.001
+/// clear of each neighbour, which crosses as soon as two neighbours sit
+/// closer together than 0.002 -- reachable, because a right-click adds a
+/// point at the unsnapped cursor. `clamp` panics on crossed bounds, so
+/// either one crashed the editor mid-drag.
+fn clamp_ordered(value: f64, a: f64, b: f64) -> f64 {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    if !lo.is_finite() || !hi.is_finite() {
+        return value;
+    }
+    value.clamp(lo, hi)
+}
+
 trait CurveControl: Component {
     fn curve_edit_entity(&self) -> Entity;
     fn canvas_entity(&self) -> Entity;
     fn active_cursor(&self) -> SystemCursorIcon;
-    fn update_state(&self, state: &mut CurveEditState, normalized: Vec2, delta: Option<Vec2>);
+
+    /// Where this control sits in normalized canvas space right now -- the
+    /// inverse of the reading [`Self::update_state`] takes, and the only
+    /// thing a grip can be measured against. `None` means there is nothing
+    /// to measure; see [`GrabOffset::take`].
+    fn normalized_position(&self, state: &CurveEditState) -> Option<Vec2> {
+        let _ = state;
+        None
+    }
+
+    /// Applies a drag, returning whether the curve actually changed.
+    ///
+    /// A drag that lands a point back on the value it already holds must
+    /// report `false`: the change event it would otherwise raise commits the
+    /// curve and marks the project unsaved, so reporting every jiggle
+    /// dirties a file nobody edited.
+    fn update_state(
+        &self,
+        state: &mut CurveEditState,
+        normalized: Vec2,
+        delta: Option<Vec2>,
+    ) -> bool;
 }
 
 impl CurveControl for CurveCanvas {
@@ -327,7 +423,14 @@ impl CurveControl for CurveCanvas {
         SystemCursorIcon::Default
     }
 
-    fn update_state(&self, _state: &mut CurveEditState, _normalized: Vec2, _delta: Option<Vec2>) {}
+    fn update_state(
+        &self,
+        _state: &mut CurveEditState,
+        _normalized: Vec2,
+        _delta: Option<Vec2>,
+    ) -> bool {
+        false
+    }
 }
 
 impl CurveControl for PointHandle {
@@ -343,10 +446,22 @@ impl CurveControl for PointHandle {
         SystemCursorIcon::Grabbing
     }
 
-    fn update_state(&self, state: &mut CurveEditState, normalized: Vec2, _delta: Option<Vec2>) {
+    fn normalized_position(&self, state: &CurveEditState) -> Option<Vec2> {
+        let curve = state.active_curve();
+        let point = curve.points.get(self.index)?;
+        let normalized_value = (point.value as f32 - curve.range.min) / curve.range.span();
+        Some(Vec2::new(point.position - 0.5, 0.5 - normalized_value))
+    }
+
+    fn update_state(
+        &self,
+        state: &mut CurveEditState,
+        normalized: Vec2,
+        _delta: Option<Vec2>,
+    ) -> bool {
         let curve = state.active_curve_mut();
         if self.index >= curve.points.len() {
-            return;
+            return false;
         }
 
         let new_pos = (normalized.x + 0.5).clamp(0.0, 1.0);
@@ -361,20 +476,44 @@ impl CurveControl for PointHandle {
         } else {
             1.0
         };
-        let clamped_pos = (snapped_pos as f32).clamp(prev_pos, next_pos);
+        let clamped_pos = clamp_ordered(snapped_pos, prev_pos as f64, next_pos as f64) as f32;
 
         let range_min = curve.range.min as f64;
         let range_max = curve.range.max as f64;
         let range_span = curve.range.span() as f64;
         let normalized_value = 0.5 - normalized.y;
-        let raw_value =
-            (range_min + normalized_value as f64 * range_span).clamp(range_min, range_max);
-        let snapped_value = (raw_value / DRAG_SNAP_STEP).round() * DRAG_SNAP_STEP;
+        let raw_value = clamp_ordered(
+            range_min + normalized_value as f64 * range_span,
+            range_min,
+            range_max,
+        );
+        // Snapping can step off the end of the range, so the bounds go on
+        // after it as well as before it.
+        let snapped_value = clamp_ordered(snap_to_span(raw_value, range_span), range_min, range_max);
 
-        curve.points[self.index].position = clamped_pos;
-        curve.points[self.index].value = snapped_value;
+        let point = &mut curve.points[self.index];
+        // A reading that is not finite writes nothing, rather than poisoning
+        // the asset with a `NaN` the curve then bakes into its texture: a
+        // crossed or non-finite range makes the value unusable, a degenerate
+        // cursor the position.
+        let position = if clamped_pos.is_finite() {
+            clamped_pos
+        } else {
+            point.position
+        };
+        let value = if snapped_value.is_finite() {
+            snapped_value
+        } else {
+            point.value
+        };
+        if point.position == position && point.value == value {
+            return false;
+        }
+        point.position = position;
+        point.value = value;
 
         state.mark_custom();
+        true
     }
 }
 
@@ -391,14 +530,19 @@ impl CurveControl for TensionHandle {
         SystemCursorIcon::ColResize
     }
 
-    fn update_state(&self, state: &mut CurveEditState, _normalized: Vec2, delta: Option<Vec2>) {
+    fn update_state(
+        &self,
+        state: &mut CurveEditState,
+        _normalized: Vec2,
+        delta: Option<Vec2>,
+    ) -> bool {
         let curve = state.active_curve_mut();
         if self.index == 0 || self.index >= curve.points.len() {
-            return;
+            return false;
         }
 
         let Some(delta) = delta else {
-            return;
+            return false;
         };
 
         let p1 = &curve.points[self.index];
@@ -407,90 +551,45 @@ impl CurveControl for TensionHandle {
 
         const TENSION_SENSITIVITY: f64 = 0.005;
 
-        match mode {
-            CurveMode::SingleCurve | CurveMode::DoubleCurve => {
-                let tension_delta = -delta.y as f64 * TENSION_SENSITIVITY;
-                let raw_tension = (current_tension + tension_delta).clamp(-1.0, 1.0);
-                let snapped_tension = (raw_tension / DRAG_SNAP_STEP).round() * DRAG_SNAP_STEP;
-                curve.points[self.index].tension = snapped_tension;
-            }
-            CurveMode::Stairs | CurveMode::SmoothStairs => {
-                let tension_delta = -delta.y as f64 * TENSION_SENSITIVITY;
-                let raw_tension = (current_tension + tension_delta).clamp(0.0, 1.0);
-                let snapped_tension = (raw_tension / DRAG_SNAP_STEP).round() * DRAG_SNAP_STEP;
-                curve.points[self.index].tension = snapped_tension;
-            }
-            CurveMode::Hold => {}
+        // Tension is unitless and bounded either side of zero, so it keeps
+        // the flat `DRAG_SNAP_STEP` -- unlike a point's value, which is in
+        // the curve's own units and snaps on a fraction of the span.
+        let (min_tension, max_tension) = match mode {
+            CurveMode::SingleCurve | CurveMode::DoubleCurve => (-1.0, 1.0),
+            CurveMode::Stairs | CurveMode::SmoothStairs => (0.0, 1.0),
+            CurveMode::Hold => return false,
+        };
+
+        let tension_delta = -delta.y as f64 * TENSION_SENSITIVITY;
+        let raw_tension = (current_tension + tension_delta).clamp(min_tension, max_tension);
+        let snapped_tension = (raw_tension / DRAG_SNAP_STEP).round() * DRAG_SNAP_STEP;
+        if !snapped_tension.is_finite() || snapped_tension == current_tension {
+            return false;
         }
+        curve.points[self.index].tension = snapped_tension;
 
         state.mark_custom();
+        true
     }
 }
 
-fn on_control_press<C: CurveControl>(
-    event: On<Pointer<Press>>,
-    mut commands: Commands,
-    controls: Query<&C>,
-    canvases: Query<(&ComputedNode, &UiGlobalTransform), With<CurveCanvas>>,
-    mut states: Query<&mut CurveEditState>,
-) {
-    if event.button != PointerButton::Primary {
-        return;
-    }
-    let Ok(control) = controls.get(event.event_target()) else {
-        return;
-    };
-    let curve_edit_entity = control.curve_edit_entity();
-    let canvas_entity = control.canvas_entity();
-
-    let Ok((computed, ui_transform)) = canvases.get(canvas_entity) else {
-        return;
-    };
-
-    let cursor_pos = event.pointer_location.position / computed.inverse_scale_factor;
-    let Some(normalized) = computed.normalize_point(*ui_transform, cursor_pos) else {
-        return;
-    };
-
-    let Ok(mut state) = states.get_mut(curve_edit_entity) else {
-        return;
-    };
-
-    control.update_state(&mut state, normalized, None);
-
-    commands.trigger(CurveEditChangeEvent {
-        entity: curve_edit_entity,
-    });
-}
-
-fn on_control_release<C: CurveControl>(
-    event: On<Pointer<Release>>,
-    mut commands: Commands,
-    controls: Query<&C, Without<Dragging>>,
-    states: Query<&CurveEditState>,
-) {
-    if event.button != PointerButton::Primary {
-        return;
-    }
-    let Ok(control) = controls.get(event.event_target()) else {
-        return;
-    };
-    let curve_edit_entity = control.curve_edit_entity();
-
-    if let Ok(state) = states.get(curve_edit_entity) {
-        commands.trigger(CurveEditCommitEvent {
-            entity: curve_edit_entity,
-            curve: state.curve.clone(),
-        });
-    }
-}
-
+/// A drag begins: take the grip, and write nothing.
+///
+/// Nothing is written here because writing here WAS the teleport -- the old
+/// `update_state(normalized, None)` moved the point to the cursor before the
+/// pointer had travelled at all. The grip is measured from exactly where the
+/// author grabbed: `DragStart` carries the PRESS location, not the moved-to
+/// one (`bevy_picking-0.19.0` `src/events.rs:1061-1082` builds the event from
+/// the pointer's `state.pressing` entry).
+///
+/// There is no `Pointer<Press>` observer beside this one any more, for the
+/// same reason: its whole body was that teleport, taken one event earlier.
 fn on_control_drag_start<C: CurveControl>(
     event: On<Pointer<DragStart>>,
     mut commands: Commands,
     controls: Query<&C>,
     canvases: Query<(&ComputedNode, &UiGlobalTransform), With<CurveCanvas>>,
-    mut states: Query<&mut CurveEditState>,
+    states: Query<&CurveEditState>,
 ) {
     if event.button != PointerButton::Primary {
         return;
@@ -514,28 +613,26 @@ fn on_control_drag_start<C: CurveControl>(
         return;
     };
 
-    let Ok(mut state) = states.get_mut(curve_edit_entity) else {
+    let Ok(state) = states.get(curve_edit_entity) else {
         return;
     };
 
-    control.update_state(&mut state, normalized, None);
-
-    commands.trigger(CurveEditChangeEvent {
-        entity: curve_edit_entity,
-    });
+    commands
+        .entity(event.event_target())
+        .insert(GrabOffset::take(control, state, normalized));
 }
 
 fn on_control_drag<C: CurveControl>(
     event: On<Pointer<Drag>>,
     mut commands: Commands,
-    controls: Query<&C, With<Dragging>>,
+    controls: Query<(&C, Option<&GrabOffset>)>,
     canvases: Query<(&ComputedNode, &UiGlobalTransform), With<CurveCanvas>>,
     mut states: Query<&mut CurveEditState>,
 ) {
     if event.button != PointerButton::Primary {
         return;
     }
-    let Ok(control) = controls.get(event.event_target()) else {
+    let Ok((control, grab)) = controls.get(event.event_target()) else {
         return;
     };
     let curve_edit_entity = control.curve_edit_entity();
@@ -554,14 +651,41 @@ fn on_control_drag<C: CurveControl>(
         return;
     };
 
-    let delta = event.delta / computed.inverse_scale_factor;
-    control.update_state(&mut state, normalized, Some(delta));
+    let grab = match grab {
+        Some(grab) => *grab,
+        // The first `Drag` of a gesture reaches this observer BEFORE the
+        // `GrabOffset` that `on_control_drag_start` inserted exists: both
+        // events are triggered from one `pointer_events` run, and an
+        // observer's own commands are queued for a later drain than the one
+        // in progress (`bevy_ecs-0.19.0` `src/observer/runner.rs:122` queues
+        // them onto the world; `src/world/command_queue.rs:239-247` snapshots
+        // `stop` before draining, so anything appended waits). Nothing has
+        // moved the control yet, so the grip is still recoverable from the
+        // event: `distance` is the whole travel since the press.
+        None => {
+            let press_pos = cursor_pos - event.distance / computed.inverse_scale_factor;
+            let Some(press) = computed.normalize_point(*ui_transform, press_pos) else {
+                return;
+            };
+            GrabOffset::take(control, &state, press)
+        }
+    };
 
-    commands.trigger(CurveEditChangeEvent {
-        entity: curve_edit_entity,
-    });
+    let delta = event.delta / computed.inverse_scale_factor;
+    if control.update_state(&mut state, grab.correct(normalized), Some(delta)) {
+        commands.trigger(CurveEditChangeEvent {
+            entity: curve_edit_entity,
+        });
+    }
 }
 
+/// Ends the drag and commits. Deliberately unfiltered by `With<Dragging>`,
+/// unlike `on_control_drag`: a press, a move and a release can land in one
+/// `pointer_events` run, and then `DragEnd` runs before the `DragStart`
+/// observer's insert has been applied (same queue ordering as the note
+/// above). Filtering on the marker would skip the commit AND strand
+/// `Dragging`, `ActiveCursor` and `GrabOffset` on the handle for good,
+/// because the removal is queued after the insert and would never run.
 fn on_control_drag_end<C: CurveControl>(
     event: On<Pointer<DragEnd>>,
     mut commands: Commands,
@@ -578,7 +702,7 @@ fn on_control_drag_end<C: CurveControl>(
 
     commands
         .entity(event.event_target())
-        .remove::<(Dragging, ActiveCursor)>();
+        .remove::<(Dragging, ActiveCursor, GrabOffset)>();
 
     if let Ok(state) = states.get(curve_edit_entity) {
         commands.trigger(CurveEditCommitEvent {
@@ -916,8 +1040,6 @@ fn spawn_point_handles(
                 HoverCursor(SystemCursorIcon::Grab),
                 handle_style(x, y, POINT_HANDLE_SIZE, handle_color),
             ))
-            .observe(on_control_press::<PointHandle>)
-            .observe(on_control_release::<PointHandle>)
             .observe(on_control_drag_start::<PointHandle>)
             .observe(on_control_drag::<PointHandle>)
             .observe(on_control_drag_end::<PointHandle>);
@@ -958,8 +1080,6 @@ fn spawn_tension_handles(
                 HoverCursor(SystemCursorIcon::ColResize),
                 handle_style(mid_x, y, TENSION_HANDLE_SIZE, handle_color),
             ))
-            .observe(on_control_press::<TensionHandle>)
-            .observe(on_control_release::<TensionHandle>)
             .observe(on_control_drag_start::<TensionHandle>)
             .observe(on_control_drag::<TensionHandle>)
             .observe(on_control_drag_end::<TensionHandle>);
@@ -1941,5 +2061,203 @@ fn handle_tension_right_click(
         }
 
         break;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_sprinkles::prelude::ParticleRange;
+
+    /// Three points, so index 1 has a neighbour either side and the drag's
+    /// clamps actually bite.
+    fn state(points: Vec<CurvePoint>, range: ParticleRange) -> CurveEditState {
+        CurveEditState::from_curve(CurveTexture {
+            name: Some("Linear".into()),
+            x: Curve::new(points).with_range(range),
+            y: None,
+            z: None,
+        })
+    }
+
+    fn ramp(range: ParticleRange) -> CurveEditState {
+        state(
+            vec![
+                CurvePoint::new(0.0, 0.0),
+                CurvePoint::new(0.5, 0.5),
+                CurvePoint::new(1.0, 1.0),
+            ],
+            range,
+        )
+    }
+
+    fn middle_point() -> PointHandle {
+        PointHandle {
+            curve_edit: Entity::PLACEHOLDER,
+            canvas: Entity::PLACEHOLDER,
+            index: 1,
+        }
+    }
+
+    /// The bug the grip exists to kill. A handle is twelve pixels across on
+    /// a 232-pixel canvas, so a grab lands on its exact centre about never,
+    /// and the absolute read snapped the point to the cursor before the
+    /// pointer had travelled at all.
+    #[test]
+    fn a_grab_off_the_handles_centre_that_does_not_move_leaves_the_curve_identical() {
+        let mut edit = ramp(ParticleRange::new(0.0, 1.0));
+        let handle = middle_point();
+        let before = edit.curve.clone();
+
+        let cursor = handle.normalized_position(&edit).unwrap() + Vec2::new(0.023, -0.019);
+        let grab = GrabOffset::take(&handle, &edit, cursor);
+
+        assert!(
+            !handle.update_state(&mut edit, grab.correct(cursor), Some(Vec2::ZERO)),
+            "a grab that moved nothing reported a change"
+        );
+        assert_eq!(edit.curve, before, "a grab that moved nothing rewrote the curve");
+    }
+
+    /// The other half of the same fix: the point tracks how far the cursor
+    /// travelled, not where it ended up.
+    #[test]
+    fn a_dragged_point_follows_the_cursors_travel_rather_than_jumping_to_it() {
+        let mut edit = ramp(ParticleRange::new(0.0, 1.0));
+        let handle = middle_point();
+
+        let cursor = handle.normalized_position(&edit).unwrap() + Vec2::new(0.023, -0.019);
+        let grab = GrabOffset::take(&handle, &edit, cursor);
+        let travel = Vec2::new(0.1, 0.0);
+
+        assert!(handle.update_state(&mut edit, grab.correct(cursor + travel), Some(travel)));
+
+        let moved = edit.curve.x.points[1];
+        assert!(
+            (moved.position - 0.6).abs() < 1e-5,
+            "0.5 + 0.1 of travel should be 0.6, got {}",
+            moved.position
+        );
+        assert!(
+            (moved.value - 0.5).abs() < 1e-9,
+            "a horizontal drag moved the value to {}",
+            moved.value
+        );
+    }
+
+    /// `normalize_point` keeps reporting past the canvas edges, so a drag
+    /// that leaves the canvas has to pin rather than fly -- on both axes.
+    #[test]
+    fn a_drag_off_the_canvas_pins_the_point_to_the_edges() {
+        let mut edit = ramp(ParticleRange::new(0.0, 1.0));
+        let handle = middle_point();
+
+        handle.update_state(&mut edit, Vec2::new(5.0, -5.0), Some(Vec2::ZERO));
+        let pinned = edit.curve.x.points[1];
+        assert!(
+            (pinned.position - 0.999).abs() < 1e-4,
+            "position flew to {}",
+            pinned.position
+        );
+        assert!((pinned.value - 1.0).abs() < 1e-9, "value flew to {}", pinned.value);
+
+        handle.update_state(&mut edit, Vec2::new(-5.0, 5.0), Some(Vec2::ZERO));
+        let pinned = edit.curve.x.points[1];
+        assert!(
+            (pinned.position - 0.001).abs() < 1e-4,
+            "position flew to {}",
+            pinned.position
+        );
+        assert!((pinned.value - 0.0).abs() < 1e-9, "value flew to {}", pinned.value);
+    }
+
+    /// One snap step is a hundredth of the SPAN, not a hundredth of a unit:
+    /// the same feel on an alpha curve and on a light intensity.
+    #[test]
+    fn the_value_snap_is_a_hundred_steps_of_the_curves_own_range() {
+        // Half a thousandth of the canvas above centre. Under the old
+        // absolute snap the wide curve kept all of 450449.97, because a
+        // hundredth of a unit there is a thousandth of a pixel.
+        let cursor = Vec2::new(0.0, -0.0005);
+        let flat = vec![
+            CurvePoint::new(0.0, 0.0),
+            CurvePoint::new(0.5, 0.0),
+            CurvePoint::new(1.0, 0.0),
+        ];
+
+        let mut wide = state(flat.clone(), ParticleRange::new(0.0, 900_000.0));
+        assert!(middle_point().update_state(&mut wide, cursor, Some(Vec2::ZERO)));
+        assert_eq!(wide.curve.x.points[1].value, 450_000.0);
+
+        let mut unit = state(flat, ParticleRange::new(0.0, 1.0));
+        assert!(middle_point().update_state(&mut unit, cursor, Some(Vec2::ZERO)));
+        assert_eq!(unit.curve.x.points[1].value, 0.5);
+    }
+
+    /// The Range fields parse `NaN` as readily as a number, and a `NaN`
+    /// written here reaches the baked curve texture. The drag declines
+    /// instead.
+    #[test]
+    fn a_range_that_is_not_a_number_leaves_the_point_alone() {
+        let mut edit = ramp(ParticleRange::new(f32::NAN, 1.0));
+        let before = edit.curve.x.points.clone();
+
+        assert!(!middle_point().update_state(&mut edit, Vec2::new(0.0, -0.2), Some(Vec2::ZERO)));
+        assert_eq!(edit.curve.x.points, before);
+        assert!(edit.curve.x.points[1].value.is_finite());
+    }
+
+    /// A right-click adds a point at the unsnapped cursor, so three points
+    /// can sit closer together than the 0.001 the drag keeps clear of each
+    /// neighbour -- and `clamp` panics on crossed bounds.
+    #[test]
+    fn neighbours_closer_together_than_the_drags_own_gap_do_not_panic() {
+        let mut edit = state(
+            vec![
+                CurvePoint::new(0.3, 0.0),
+                CurvePoint::new(0.3005, 0.5),
+                CurvePoint::new(0.301, 1.0),
+            ],
+            ParticleRange::new(0.0, 1.0),
+        );
+
+        middle_point().update_state(&mut edit, Vec2::ZERO, Some(Vec2::ZERO));
+
+        let position = edit.curve.x.points[1].position;
+        assert!(
+            (0.3..=0.301).contains(&position),
+            "{position} left the bracket its neighbours make"
+        );
+    }
+
+    /// The same crossed-bounds crash from the other direction: nothing stops
+    /// a Range being typed max-below-min.
+    #[test]
+    fn a_range_typed_max_below_min_does_not_panic() {
+        let mut edit = ramp(ParticleRange::new(1.0, 0.0));
+
+        middle_point().update_state(&mut edit, Vec2::new(0.0, -0.4), Some(Vec2::ZERO));
+
+        let value = edit.curve.x.points[1].value;
+        assert!(
+            (0.0..=1.0).contains(&value),
+            "{value} left the range that was typed"
+        );
+    }
+
+    /// A tension handle reads `delta`, never the cursor, so it has no grip
+    /// to take and the correction must be the identity -- otherwise the
+    /// point-handle fix would drag tension sideways.
+    #[test]
+    fn a_tension_handle_has_no_grip_to_take() {
+        let edit = ramp(ParticleRange::new(0.0, 1.0));
+        let handle = TensionHandle {
+            curve_edit: Entity::PLACEHOLDER,
+            canvas: Entity::PLACEHOLDER,
+            index: 1,
+        };
+        let cursor = Vec2::new(0.13, -0.2);
+
+        assert_eq!(GrabOffset::take(&handle, &edit, cursor).correct(cursor), cursor);
     }
 }

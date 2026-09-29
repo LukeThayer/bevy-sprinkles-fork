@@ -90,7 +90,7 @@ use crate::ui::widgets::popover::{
 use crate::ui::widgets::text_edit::{TextEditCommitEvent, TextEditProps, text_edit};
 use crate::ui::widgets::utils::find_ancestor;
 
-use crate::ui::components::drives::prop_label;
+use crate::ui::components::drives::{SelectedDrive, prop_label, selection_after_delete};
 
 use super::{InspectedEmitterTracker, InspectedLightTracker};
 
@@ -783,12 +783,17 @@ pub(crate) fn handle_drive_mute_commit(
     }
 }
 
+/// Deleting shifts every later drive down one, so the dock's selection --
+/// an index like every other drive address here -- has to move with it or
+/// the editor pane below silently becomes a different drive's. See
+/// `drives::selection_after_delete` for which way each case lands.
 pub(crate) fn handle_drive_delete_click(
     trigger: On<ButtonClickEvent>,
     buttons: Query<&DriveDeleteButton>,
     editor_state: Res<EditorState>,
     mut assets: ResMut<Assets<ParticlesAsset>>,
     mut dirty_state: ResMut<DirtyState>,
+    mut selected: ResMut<SelectedDrive>,
 ) {
     let Ok(delete_button) = buttons.get(trigger.entity) else {
         return;
@@ -803,6 +808,7 @@ pub(crate) fn handle_drive_delete_click(
         return;
     }
     asset.drives.remove(delete_button.0);
+    selected.0 = selection_after_delete(selected.0, delete_button.0);
     dirty_state.has_unsaved_changes = true;
 }
 

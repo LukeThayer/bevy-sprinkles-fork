@@ -7,6 +7,7 @@ use bevy::asset::{load_internal_asset, uuid_handle};
 use bevy::prelude::*;
 
 use components::data_panel::data_panel;
+use components::drives::drives_dock;
 use components::inspector::inspector_panel;
 use components::sidebar::sidebar;
 use components::topbar::spawn_topbar;
@@ -88,9 +89,16 @@ fn setup_ui(mut commands: Commands) {
     let data_panel_entity = commands.spawn_scene(data_panel()).id();
     let inspector_panel_entity = commands.spawn_scene(inspector_panel()).id();
     let viewport = commands.spawn_scene(viewport_container()).id();
-    commands
-        .entity(main_row)
-        .add_children(&[data_panel_entity, inspector_panel_entity, viewport]);
+    // The Drives dock is pinned to the far right, past the viewport: it is
+    // the only panel whose content spans the whole effect rather than the
+    // one thing currently inspected, so it sits opposite the two that do.
+    let drives_dock_entity = commands.spawn_scene(drives_dock()).id();
+    commands.entity(main_row).add_children(&[
+        data_panel_entity,
+        inspector_panel_entity,
+        viewport,
+        drives_dock_entity,
+    ]);
 
     let sidebar = commands.spawn_scene(sidebar()).id();
     commands.entity(main_row).insert_children(0, &[sidebar]);

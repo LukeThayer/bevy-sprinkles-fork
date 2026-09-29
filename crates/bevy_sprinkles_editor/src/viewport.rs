@@ -419,6 +419,7 @@ pub fn handle_playback_reset_event(
         With<EditorParticlePreview>,
     >,
     mut emitter_query: Query<(&EmitterEntity, &mut EmitterRuntime)>,
+    mut light_query: Query<(&LightEntity, &mut LightRuntime)>,
 ) {
     for (system_entity, particle_system, mut system_runtime) in system_query.iter_mut() {
         let Some(asset) = assets.get(particle_system) else {
@@ -435,6 +436,11 @@ pub fn handle_playback_reset_event(
                 runtime.stop(fixed_seed);
             }
         }
+        for (light, mut runtime) in light_query.iter_mut() {
+            if light.parent_system == system_entity {
+                *runtime = LightRuntime::new();
+            }
+        }
     }
 }
 
@@ -446,6 +452,7 @@ pub fn handle_playback_play_event(
         With<EditorParticlePreview>,
     >,
     mut emitter_query: Query<(&EmitterEntity, &mut EmitterRuntime)>,
+    mut light_query: Query<(&LightEntity, &mut LightRuntime)>,
 ) {
     for (system_entity, particle_system, mut system_runtime) in system_query.iter_mut() {
         let Some(asset) = assets.get(particle_system) else {
@@ -487,6 +494,11 @@ pub fn handle_playback_play_event(
                     runtime.restart(None);
                 }
             }
+            for (light, mut runtime) in light_query.iter_mut() {
+                if light.parent_system == system_entity {
+                    *runtime = LightRuntime::new();
+                }
+            }
             system_runtime.resume();
         }
     }
@@ -496,6 +508,7 @@ pub fn handle_playback_seek_event(
     trigger: On<PlaybackSeekEvent>,
     system_query: Query<Entity, With<EditorParticlePreview>>,
     mut emitter_query: Query<(&EmitterEntity, &mut EmitterRuntime)>,
+    mut light_query: Query<(&LightEntity, &mut LightRuntime)>,
 ) {
     let seek_time = trigger.0;
 
@@ -503,6 +516,12 @@ pub fn handle_playback_seek_event(
         for (emitter, mut runtime) in emitter_query.iter_mut() {
             if emitter.parent_system == system_entity {
                 runtime.seek(seek_time);
+            }
+        }
+        for (light, mut runtime) in light_query.iter_mut() {
+            if light.parent_system == system_entity {
+                runtime.system_time = seek_time;
+                runtime.prev_system_time = seek_time;
             }
         }
     }
@@ -989,5 +1008,119 @@ pub fn sync_viewport_settings(
         commands.entity(entity).remove::<NoFrustumCulling>();
     } else {
         commands.entity(entity).insert(NoFrustumCulling);
+    }
+}
+
+#[cfg(test)]
+mod playback_light_tests {
+    use super::*;
+    use bevy::asset::AssetPlugin;
+    use bevy::time::TimeUpdateStrategy;
+    use bevy_sprinkles::asset::{
+        CurvePoint, CurveTexture, EmitterTime, LightData, ParticlesAsset, ParticlesAuthors,
+        ParticlesDimension,
+    };
+    use bevy_sprinkles::lights::{advance_light_clocks, setup_effect_lights, sync_effect_lights};
+    use std::time::Duration;
+
+    /// Builds a preview effect with a single one-shot light and the full
+    /// light pipeline (`setup_effect_lights` -> `advance_light_clocks` ->
+    /// `sync_effect_lights`) plus [`handle_playback_reset_event`] wired as a
+    /// real observer, the same way `plugin.rs` wires it in the app.
+    ///
+    /// The envelope curve is flat at 1.0 (not a ramp) so any intensity above
+    /// zero unambiguously means "lit", mirroring `lights.rs`'s own
+    /// `app_with_flash` fixture.
+    fn app_with_one_shot_preview_light() -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.add_observer(handle_playback_reset_event);
+        app.add_systems(
+            Update,
+            (setup_effect_lights, advance_light_clocks, sync_effect_lights).chain(),
+        );
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                100,
+            )));
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut a = ParticlesAsset::new(
+                "t".into(),
+                ParticlesDimension::D3,
+                Default::default(),
+                vec![],
+                vec![],
+                false,
+                ParticlesAuthors::default(),
+            );
+            a.lights = vec![LightData {
+                intensity: 1000.0,
+                intensity_over_life: Some(CurveTexture::new(vec![
+                    CurvePoint::new(0.0, 1.0),
+                    CurvePoint::new(1.0, 1.0),
+                ])),
+                time: EmitterTime {
+                    lifetime: 0.3,
+                    delay: 0.0,
+                    one_shot: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }];
+            assets.add(a)
+        };
+        let effect = app
+            .world_mut()
+            .spawn((
+                Particles3d(handle),
+                Transform::default(),
+                ParticleSystemRuntime::default(),
+                EditorParticlePreview,
+            ))
+            .id();
+        app.update();
+        (app, effect)
+    }
+
+    fn light_intensity(app: &App, effect: Entity) -> f32 {
+        app.world()
+            .iter_entities()
+            .find(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .and_then(|e| e.get::<PointLight>())
+            .expect("light child must exist")
+            .intensity
+    }
+
+    /// The bug this pins: `handle_playback_reset_event` used to reset only
+    /// `EmitterRuntime`, never `LightRuntime`. A one-shot light that had
+    /// already spent its cycle (the muzzle-flash case) stayed dark forever
+    /// after Stop, because nothing put its clock -- or its `cycle` counter,
+    /// which `one_shot_is_spent` reads -- back to zero.
+    #[test]
+    fn resetting_playback_relights_a_spent_one_shot_light() {
+        let (mut app, effect) = app_with_one_shot_preview_light();
+
+        // 6 frames of 100ms = 600ms, twice the 300ms one-shot cycle: plenty
+        // of margin for the light to have fired and gone dark.
+        for _ in 0..6 {
+            app.update();
+        }
+        assert_eq!(
+            light_intensity(&app, effect),
+            0.0,
+            "sanity: the one-shot light must have spent its cycle and gone dark"
+        );
+
+        app.world_mut().trigger(PlaybackResetEvent);
+        app.update();
+
+        assert!(
+            light_intensity(&app, effect) > 0.0,
+            "a reset must relight a spent one-shot light, not leave it dark forever"
+        );
     }
 }

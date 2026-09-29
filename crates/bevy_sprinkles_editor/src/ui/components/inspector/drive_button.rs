@@ -623,8 +623,17 @@ pub(crate) fn spawn_drive_row(
             });
 
             row.spawn(fields_row()).with_children(|line| {
+                // "Replace" is qualified at the point of CHOICE, because the
+                // bare word promises something no op can deliver: these three
+                // fold drives onto each other, and the result is applied to
+                // the emitter's authored value downstream by multiplication
+                // (see `asset::drive::DriveOp`). An author reading plain
+                // "Replace" reasonably expects the authored value to be
+                // overridden, wires one up, and watches it get multiplied
+                // anyway. The label is the only place that misunderstanding
+                // can be headed off before it happens.
                 let op_options = vec![
-                    ComboBoxOptionData::new("Replace"),
+                    ComboBoxOptionData::new("Replace earlier drives"),
                     ComboBoxOptionData::new("Multiply"),
                     ComboBoxOptionData::new("Add"),
                 ];

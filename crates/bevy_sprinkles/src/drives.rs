@@ -1,3 +1,38 @@
+//! Effect variables and the drive-resolution spine: the host sets a named
+//! knob, a curve shapes it, and the result reaches an emitter property, an
+//! emitter `Transform` channel or an effect-owned light.
+//!
+//! **What a drive does to the authored value.** `fold` accumulates drives
+//! onto EACH OTHER; the single number that falls out is applied to the
+//! authored value downstream, by the consumer, and for every `Emitter` target
+//! that application is a multiplication. No [`DriveOp`] reaches that step --
+//! see its doc, and note the practical trap: a property whose authored
+//! baseline is `0.0` multiplies to zero whichever op the drive uses.
+//!
+//! **What this replaced, honestly.** Drives took over from `ParticleOverride`
+//! (removed in `0fe2cc1`), a fixed seven-field per-instance struct set from
+//! host code and not authorable anywhere. The replacement is NOT a superset,
+//! and the spec's "its seven hardcoded fields become ordinary drives an author
+//! wires up" overstates it. The real inventory:
+//!
+//! | `ParticleOverride` field | Drive equivalent |
+//! |---|---|
+//! | `size_mul: f32` | [`EmitterProp::SizeMul`] -- exact |
+//! | `lifetime_mul: f32` | [`EmitterProp::Lifetime`] -- exact |
+//! | `speed_mul: f32` | [`EmitterProp::InitialSpeed`] -- exact |
+//! | `tint: LinearRgba` | [`EmitterProp::Tint`] -- **degraded**: one scalar applied identically to R/G/B, so per-channel tinting is gone |
+//! | `emissive: LinearRgba` | [`EmitterProp::EmissiveIntensity`] -- **degraded**, the same way |
+//! | `color_keys: Gradient` | **none** -- per-instance replacement of a whole gradient |
+//! | `size_keys: CurveTexture` | **none** -- per-instance replacement of a whole curve |
+//!
+//! The two colour cases are degraded for a structural reason, not an
+//! oversight: a drive resolves to one `f32` and a render prop owns one slot in
+//! `ParticleEmitterUniforms::drive_slots`. Restoring per-instance colour means
+//! making [`EmitterProp::Tint`] three slots or a vec4 slot FIRST -- worth
+//! settling before any migration that assumed a superset. The two `*_keys`
+//! cases are a different shape of thing entirely (a per-instance curve, not a
+//! per-instance scalar) and would return as their own feature.
+
 use std::collections::HashMap;
 
 use bevy::prelude::*;
@@ -189,9 +224,20 @@ fn sample(drive: &Drive, values: &[f32], decls: &[VariableDecl]) -> Option<f32> 
 
 /// Folds one contribution onto whatever earlier drives left behind.
 ///
-/// `Replace` discards the accumulator entirely, including the consumer's
-/// authored value — which is why a `Replace` after a `Multiply` wipes it, and
-/// why the Drives list in the editor is reorderable rather than a set.
+/// `Replace` discards the accumulator entirely — which is why a `Replace`
+/// after a `Multiply` wipes it, and why the Drives list in the editor is
+/// reorderable rather than a set.
+///
+/// **The accumulator holds drives only; the consumer's authored value is never
+/// in it.** This doc used to claim `Replace` discarded that too, and it does
+/// not and cannot: `resolve_drives` is handed `values` and an `asset`, folds
+/// drives against each other, and hands one number to a consumer that then
+/// applies it to the authored value by MULTIPLICATION (`u.lifetime *= v` in
+/// `spawning.rs`; `fx.erosion_soft.x * drive_slots[..]` in the shader; and so
+/// on for every `Emitter` target). Nothing in this function can reach that
+/// step. `DriveTarget::Transform`'s `Pos*`/`Rot*` are the one genuine
+/// exception, and they replace under EVERY op, not just `Replace`, because
+/// `apply_transform_drives` writes rather than scales.
 fn fold(acc: Option<f32>, value: f32, op: DriveOp) -> Option<f32> {
     let next = match (op, acc) {
         (DriveOp::Replace, _) => value,

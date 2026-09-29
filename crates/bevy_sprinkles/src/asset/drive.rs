@@ -20,16 +20,39 @@ pub enum Stage {
     Render,
 }
 
-/// How a resolved value combines with the emitter's authored value, and with
-/// any earlier drive on the same target.
+/// How a resolved value combines with any EARLIER DRIVE on the same target.
+///
+/// Read that scope literally: these ops fold drives onto each other, and the
+/// single number that falls out is then handed to the consumer, which applies
+/// it to the authored value in whatever way that property demands. For every
+/// `Emitter` target that means MULTIPLICATION, downstream and unconditional --
+/// `u.lifetime *= v` in `spawning.rs`, `fx.erosion_soft.x * drive_slots[..]`
+/// in the shader, and so on. No `DriveOp` can change that step, because the
+/// authored value is never in the accumulator to begin with.
+///
+/// The practical consequence, which the drive an author actually writes turns
+/// on: a property whose authored baseline is `0.0` multiplies to zero no
+/// matter which op the drive uses. A drivable property needs a non-zero
+/// baseline (see [`super::FxSettings::erosion_threshold`], which defaults to
+/// zero precisely because zero means "feature off").
+///
+/// `DriveTarget::Transform`'s `Pos*` and `Rot*` channels are the one genuine
+/// exception: `drives::apply_transform_drives` WRITES the resolved value into
+/// the `Transform` rather than scaling the authored one, so there the
+/// authored value really is replaced -- by any op, not just `Replace`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, Reflect)]
 pub enum DriveOp {
-    /// Discard everything contributed so far, including the authored value.
+    /// Discard what EARLIER DRIVES on this target contributed, and start from
+    /// this value.
+    ///
+    /// It does not discard the authored value: see the enum's own doc for why
+    /// no op can. A single `Replace` drive on a target is therefore
+    /// indistinguishable from a single `Multiply` one.
     Replace,
-    /// Multiply into whatever has been contributed so far.
+    /// Multiply into whatever earlier drives have contributed so far.
     #[default]
     Multiply,
-    /// Add to whatever has been contributed so far.
+    /// Add to whatever earlier drives have contributed so far.
     Add,
 }
 
@@ -81,11 +104,20 @@ pub enum EmitterProp {
     // field to route to. A drive target with no effect is worse than a
     // missing one — an author wires a curve to it and sees nothing, with
     // nothing to search for. Re-add alongside damping itself, not before.
-    /// Strength of the per-step turbulence displacement.
+    /// Scales [`EmitterTurbulence::noise_strength`](super::EmitterTurbulence::noise_strength)
+    /// (`extract.rs`: `u.turbulence_noise_strength *= v`), which is the curl-
+    /// noise CONTRAST / direction-blend parameter -- how sharply the flow
+    /// pattern varies, not how far a particle is pushed. Amplitude is
+    /// `turbulence.influence`, which no drive targets; driving this makes the
+    /// flow busier, not bigger.
     TurbulenceStrength,
 
     // --- Render: re-read every frame for all live particles ---
-    /// Color tint.
+    /// Scalar BRIGHTNESS multiplier, applied identically to R, G and B
+    /// (`particle_material.wgsl` multiplies all three lanes by the same
+    /// `drive_slots[DRIVE_SLOT_TINT]`). It cannot shift hue: a drive resolves
+    /// to one `f32`, and there is one slot. Per-channel colour would need this
+    /// to become three slots or a vec4 slot.
     Tint,
     /// Opacity multiplier.
     Alpha,
@@ -249,10 +281,12 @@ pub enum DriveTarget {
 
 /// One wire: a variable, shaped by a curve, written to a property.
 ///
-/// Several drives may share a target; they apply in declaration order onto the
-/// emitter's authored value, and `DriveOp::Replace` discards everything
-/// contributed before it. Order is therefore observable, which is why the
-/// editor's Drives list is reorderable.
+/// Several drives may share a target; they fold onto EACH OTHER in
+/// declaration order, and `DriveOp::Replace` discards what the earlier ones
+/// contributed. Order is therefore observable, which is why the editor's
+/// Drives list is reorderable. The one number that falls out is applied to the
+/// authored value downstream, by the consumer — see [`DriveOp`] for why no op
+/// reaches that step.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Reflect)]
 pub struct Drive {
     /// The variable that drives this wire.
@@ -264,10 +298,16 @@ pub struct Drive {
     pub curve: CurveTexture,
     /// The curve's 0..1 output remapped to these bounds.
     pub output: Range,
-    /// How the resolved value combines with what came before it.
+    /// How the resolved value combines with what EARLIER DRIVES on this target
+    /// left behind. See [`DriveOp`].
     pub op: DriveOp,
-    /// Muted drives resolve to the identity for their op. The editor's A/B
-    /// toggle; persisted so a half-built effect survives a save.
+    /// A muted drive contributes NOTHING -- `drives::sample` returns `None`
+    /// before it reaches `fold`, so the accumulator is left exactly as the
+    /// previous drive left it, and a target whose every drive is muted is
+    /// indistinguishable from one with no drives at all. (Not "resolves to
+    /// the identity for its op", as this said before: `Replace` has no
+    /// identity to resolve to.) The editor's A/B toggle; persisted so a
+    /// half-built effect survives a save.
     #[serde(default)]
     pub muted: bool,
 }

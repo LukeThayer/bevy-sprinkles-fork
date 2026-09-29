@@ -1203,6 +1203,20 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 #ifdef PREPASS_PIPELINE
 #ifndef PREPASS_FRAGMENT
 #ifdef MAY_DISCARD
+// The DEPTH-ONLY prepass fragment. It discards inactive and fully transparent
+// particles and nothing else -- notably NOT FX_EROSION, whose discard lives
+// only in the two fragments below.
+//
+// That asymmetry is deliberate but worth stating, because it would be a real
+// bug under a different alpha mode: an Opaque or Mask material runs this
+// prepass and writes depth, so a fragment erosion later discards in the
+// forward pass would already have stamped depth here and would occlude
+// whatever is behind it -- a hole in the world shaped like the dissolving
+// particle. It is unreachable for Blend and Additive, which every stylized
+// erosion case uses and which do not write depth in the prepass at all. Left
+// as a note rather than a fix for exactly that reason; sampling the erosion
+// texture here would cost every depth-prepass fragment a texture read to
+// guard a combination nothing authors.
 @fragment
 fn fragment(
     in: VertexOutput,

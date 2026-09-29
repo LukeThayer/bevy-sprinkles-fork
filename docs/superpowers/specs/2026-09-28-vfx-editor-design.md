@@ -143,10 +143,33 @@ Names are resolved to `VariableId` indices once per asset load and cached; the
 per-frame path is index lookups, not string hashing. A name in
 `ParticleVariables` that no `VariableDecl` declares warns once and is ignored.
 
-**`ParticleOverride` is replaced and removed.** Its seven hardcoded fields become
-ordinary drives an author wires up. That is a breaking change to the crate's
-public API, taken deliberately: keeping both would leave two ways to say the same
-thing, one of them undiscoverable from the editor.
+**`ParticleOverride` is replaced and removed.** That is a breaking change to the
+crate's public API, taken deliberately: keeping both would leave two ways to say
+the same thing, one of them undiscoverable from the editor.
+
+**The replacement is not a superset.** An earlier draft of this paragraph said
+its seven hardcoded fields "become ordinary drives an author wires up"; that is
+true of three of them, degraded for two, and false for two. Corrected during
+the final review of the implementation, so the downstream migration
+sub-project starts from the real inventory:
+
+| `ParticleOverride` field | Drive equivalent |
+|---|---|
+| `size_mul: f32` | `EmitterProp::SizeMul` — exact |
+| `lifetime_mul: f32` | `EmitterProp::Lifetime` — exact |
+| `speed_mul: f32` | `EmitterProp::InitialSpeed` — exact |
+| `tint: LinearRgba` | `EmitterProp::Tint` — **degraded**: one scalar applied identically to R/G/B, so per-channel tinting is gone |
+| `emissive: LinearRgba` | `EmitterProp::EmissiveIntensity` — **degraded**, the same way |
+| `color_keys: Gradient` | **none** — per-instance replacement of a whole gradient |
+| `size_keys: CurveTexture` | **none** — per-instance replacement of a whole curve |
+
+The two colour cases are degraded structurally, not by oversight: a drive
+resolves to one `f32`, and a render prop owns one slot in
+`ParticleEmitterUniforms::drive_slots`. **Restoring per-instance colour means
+making `EmitterProp::Tint` three slots or a vec4 slot FIRST**, which is worth
+settling before a migration that assumed a superset. The two `*_keys` cases are
+a different shape of thing entirely — a per-instance curve, not a per-instance
+scalar — and would return as their own feature.
 
 ## Drives
 
@@ -256,13 +279,31 @@ than new routing.
 
 ### Several drives on one target
 
-Drives sharing a target apply **in declaration order**, starting from the value
-authored on the emitter. `Multiply` and `Add` accumulate onto the running value;
-`Replace` discards everything contributed so far, including the authored value.
-Order is therefore observable, and the Drives list view is the place it is
-edited. Two `Replace` drives on one target is legal and the last one wins — the
-editor warns rather than forbids, since it is a normal intermediate state while
-re-wiring.
+Drives sharing a target fold onto **each other**, in declaration order.
+`Multiply` and `Add` accumulate onto the running value; `Replace` discards what
+the earlier drives contributed and starts from its own. Order is therefore
+observable, and the Drives list view is the place it is edited. Two `Replace`
+drives on one target is legal and the last one wins — the editor warns rather
+than forbids, since it is a normal intermediate state while re-wiring.
+
+**No op reaches the authored value.** An earlier draft of this section said
+`Replace` discarded "everything contributed so far, including the authored
+value". It does not, and cannot: the fold runs over drives alone, and the one
+number that falls out is applied to the authored value downstream by the
+consumer — by MULTIPLICATION for every `Emitter` target (`u.lifetime *= v`,
+`fx.erosion_soft.x * drive_slots[..]`, and so on). A lone `Replace` drive is
+therefore indistinguishable from a lone `Multiply` one. Corrected during the
+final review of the implementation.
+
+Two consequences an author needs. First, `DriveTarget::Transform`'s `Pos*` and
+`Rot*` channels are the one genuine exception — `apply_transform_drives` writes
+the resolved value into the `Transform` rather than scaling the authored one,
+under every op, not just `Replace`. Second, **a property whose authored
+baseline is `0.0` multiplies to zero whichever op the drive uses**, so a
+drivable property needs a non-zero baseline; `FxSettings::erosion_threshold` is
+the trap, since zero there also means "feature off". Making `Replace` truly
+replace would need a second sentinel carried through `EmitterResolved` and a
+change to every consumer: a real design change, and its own task.
 
 > **Assumption, flagged.** The original ruling was "both stages, declared per
 > binding". This derives the stage from the target instead, and in the course of
@@ -423,7 +464,11 @@ pub enum LightProp { Intensity, Range, Hue, Saturation, Value }
 Each `LightData` spawns a child entity carrying a `PointLight` or `SpotLight`,
 parented to the effect. Reusing `EmitterTime` gives a light the same delay /
 lifetime / one-shot / loop vocabulary an emitter has, so a muzzle flash is
-authored the way everything else is.
+authored the way everything else is. Only those three of `EmitterTime`'s fields
+are live for a light: `lifetime_randomness`, `spawn_time_randomness`,
+`explosiveness`, `fixed_fps` and `fixed_seed` describe per-particle spawning and
+simulation stepping, which a light has neither of, so nothing reads them and the
+inspector does not paint them.
 
 Driving `LightProp::Intensity` from a variable through a curve is the "flicker
 frequency from temperature" case from the original brief.

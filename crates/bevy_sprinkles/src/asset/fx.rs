@@ -42,6 +42,17 @@ pub struct FxSettings {
     pub erosion_texture: Option<TextureRef>,
     /// Noise value below which a fragment is discarded. `0` disables erosion
     /// regardless of whether a texture is set.
+    ///
+    /// **A zero baseline cannot be driven up.** The shader multiplies this by
+    /// the resolved drive slot (`fx.erosion_soft.x *
+    /// drive_slots[DRIVE_SLOT_EROSION]`), and no
+    /// [`DriveOp`](super::DriveOp) changes that — the authored value is
+    /// applied downstream of the fold, never inside it. So an effect that
+    /// wants `EmitterProp::ErosionThreshold` to dissolve it on command must
+    /// author a non-zero threshold here and let the drive scale that, rather
+    /// than leaving this at its default and expecting the drive to supply the
+    /// whole value. The same holds for every drivable property whose authored
+    /// default is `0.0`.
     pub erosion_threshold: f32,
     /// Width, in noise units, of the emissive rim painted just above the
     /// erosion cut.

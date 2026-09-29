@@ -87,6 +87,17 @@
 //! }
 //! ```
 //!
+//! # Host requirements
+//!
+//! One feature needs something from the consuming app's CAMERA rather than
+//! from this crate: an effect whose material sets
+//! [`FxSettings::soft_fade`](asset::FxSettings::soft_fade) above zero reads the
+//! view's depth texture, which only exists on a camera carrying bevy's
+//! [`DepthPrepass`](bevy::core_pipeline::prepass::DepthPrepass). Without it the
+//! fragment shader fails to COMPILE — an error that names a missing binding
+//! rather than the effect that asked for it, so it is worth knowing before
+//! meeting it.
+//!
 //! # Feature flags
 //!
 //! - `preset-textures` - Bundles a library of built-in particle
@@ -158,7 +169,6 @@
 /// Particle system asset definitions, emitter data, and serialization types.
 pub mod asset;
 mod compute;
-/// Effect variables and the drive-resolution spine.
 pub mod drives;
 mod extract;
 /// Effect-owned scene lights, driven by their own clock and by drives.

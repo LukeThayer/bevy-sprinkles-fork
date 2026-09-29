@@ -142,7 +142,7 @@ pub fn setup_effect_lights(
 /// Honors [`EmitterTime::one_shot`](crate::asset::EmitterTime::one_shot) too:
 /// once a one-shot light has completed a cycle its clock STOPS, pinned at
 /// `total_duration`, instead of wrapping back to the start. Freezing it rather
-/// than letting it run on keeps [`light_is_off`]'s answer a pure function of
+/// than letting it run on keeps `light_is_off`'s answer a pure function of
 /// the stored clock, so the recompute-never-accumulate property survives —
 /// `sync_effect_lights` reaches the same (dark) result on frame 10 and frame
 /// 10,000. Until this existed, `one_shot` was never consulted anywhere and a

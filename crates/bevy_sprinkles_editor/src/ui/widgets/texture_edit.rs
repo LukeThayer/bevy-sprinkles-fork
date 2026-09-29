@@ -12,7 +12,7 @@ use bevy_sprinkles::textures::preset::{PresetTexture, TextureRef};
 
 use crate::state::EditorState;
 use crate::ui::components::binding::{
-    FieldBinding, get_inspecting_emitter, resolve_variant_field_ref,
+    FieldBinding, get_inspecting_emitter, resolve_chained_variant_field_ref,
 };
 use crate::ui::tokens::{
     BORDER_COLOR, CORNER_RADIUS, FONT_PATH, TEXT_BODY_COLOR, TEXT_MUTED_COLOR, TEXT_SIZE_SM,
@@ -149,7 +149,7 @@ fn setup_texture_content(
         };
 
         let current_texture =
-            read_current_texture_ref(variant_edit, &editor_state, &p_assets, &bindings, &configs);
+            read_current_texture_ref(variant_edit, &editor_state, &p_assets, &bindings);
 
         let variant = TextureVariant::from(config.selected_index);
 
@@ -191,7 +191,6 @@ fn respawn_texture_content_on_switch(
         Option<&Children>,
     )>,
     bindings: Query<&FieldBinding>,
-    configs: Query<&VariantEditConfig, With<EditorVariantEdit>>,
 ) {
     for (variant_edit, config) in &changed_configs {
         if !is_texture_ref_variant_edit(variant_edit, &bindings) {
@@ -217,13 +216,8 @@ fn respawn_texture_content_on_switch(
 
             content.current_variant = variant;
 
-            let current_texture = read_current_texture_ref(
-                variant_edit,
-                &editor_state,
-                &p_assets,
-                &bindings,
-                &configs,
-            );
+            let current_texture =
+                read_current_texture_ref(variant_edit, &editor_state, &p_assets, &bindings);
 
             let assets_folders = editor_state
                 .current_project
@@ -810,19 +804,28 @@ fn poll_texture_file_pick(
     }
 }
 
+/// Reads the `TextureRef` this texture field's `FieldBinding` currently
+/// points at, straight off `binding.path()`/`binding.field_name()` rather
+/// than (as before Task 22) detouring through a PARENT `variant_edit`'s own
+/// `VariantEditConfig.path` -- `binding.path()` already holds that exact
+/// string (`spawn_field_widget`'s `TextureRef` arm clones the same binding
+/// it was handed onto this entity), so the detour was redundant, and it
+/// could not resolve a texture field name with a dot in it (`fx.flow_texture`,
+/// two hops into `FxSettings`) because it called the un-chained
+/// `resolve_variant_field_ref` directly. `resolve_chained_variant_field_ref`
+/// splits on '.', so this now works for a bare field name too (the old
+/// `base_color_texture` case) as well as a dotted one.
 fn read_current_texture_ref(
     variant_edit: Entity,
     editor_state: &EditorState,
     assets: &Assets<ParticlesAsset>,
     bindings: &Query<&FieldBinding>,
-    configs: &Query<&VariantEditConfig, With<EditorVariantEdit>>,
 ) -> Option<TextureRef> {
     let binding = bindings.get(variant_edit).ok()?;
-    let parent_config = configs.get(binding.variant_edit?).ok()?;
     let (_, emitter) = get_inspecting_emitter(editor_state, assets)?;
-    let path = format!(".{}", parent_config.path);
+    let path = format!(".{}", binding.path());
     let target = emitter.reflect_path(path.as_str()).ok()?;
-    let field = resolve_variant_field_ref(target, binding.field_name()?)?;
+    let field = resolve_chained_variant_field_ref(target, binding.field_name()?)?;
     extract_texture_ref_from_reflect(field)
 }
 

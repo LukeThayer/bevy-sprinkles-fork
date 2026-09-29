@@ -129,6 +129,12 @@ pub(super) fn bind_widget_values(
         };
         if let Some(gradient) = reflected.try_downcast_ref::<ParticleGradient>() {
             state.gradient = gradient.clone();
+        } else if let Some(opt) = reflected.try_downcast_ref::<Option<ParticleGradient>>() {
+            // `FxSettings::gradient_remap` (Task 22) is `Option<Gradient>`,
+            // unlike every gradient field before it -- mirrors the curve
+            // loop just above, which already forks on bare-vs-`Option` for
+            // the same reason.
+            state.gradient = opt.clone().unwrap_or_default();
         }
     }
 

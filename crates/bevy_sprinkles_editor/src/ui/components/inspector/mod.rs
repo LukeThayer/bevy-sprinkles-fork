@@ -10,6 +10,7 @@ mod draw_pass;
 pub(crate) mod drive_button;
 mod emission;
 mod light;
+mod material_fx;
 mod particle_flags;
 mod project_properties;
 mod scale;
@@ -43,7 +44,7 @@ use crate::ui::widgets::inspector_field::{InspectorFieldProps, fields_row, spawn
 use crate::ui::widgets::panel::{PanelDirection, PanelProps, panel};
 use crate::ui::widgets::panel_section::{PanelSectionProps, PanelSectionSize, panel_section};
 use crate::ui::widgets::scroll::scrollbar;
-use crate::ui::widgets::variant_edit::{VariantEditProps, variant_edit};
+use crate::ui::widgets::variant_edit::{VariantEditProps, spawn_field_widget, variant_edit};
 
 use super::binding::FieldBinding;
 
@@ -73,6 +74,7 @@ pub fn plugin(app: &mut App) {
         .add_plugins(project_properties::plugin)
         .add_plugins(visibility_aabb::plugin)
         .add_plugins(drive_button::plugin)
+        .add_plugins(material_fx::plugin)
         .add_systems(
             Update,
             (
@@ -234,6 +236,15 @@ fn setup_inspector_panel(
                             .with_children(|emitter_content| {
                                 spawn_section(emitter_content, time::time_section());
                                 spawn_section(emitter_content, draw_pass::draw_pass_section());
+                                spawn_section(emitter_content, material_fx::scroll_section());
+                                spawn_section(emitter_content, material_fx::flow_section());
+                                spawn_section(emitter_content, material_fx::erosion_section());
+                                spawn_section(emitter_content, material_fx::fresnel_section());
+                                spawn_section(emitter_content, material_fx::soft_section());
+                                spawn_section(
+                                    emitter_content,
+                                    material_fx::gradient_remap_section(),
+                                );
                                 spawn_section(
                                     emitter_content,
                                     visibility_aabb::visibility_aabb_section(),
@@ -484,6 +495,23 @@ pub enum InspectorItem {
         field: InspectorFieldProps,
         prop: EmitterProp,
     },
+    /// A field reached through the enclosing draw-pass material's own
+    /// `VariantField` accessor rather than a bare emitter path -- Task 22's
+    /// `FxSettings` fields, which live at `draw_pass.material.fx.<name>`,
+    /// two hops inside the `StandardParticleMaterial` a
+    /// `DrawPassMaterial::Standard` tuple variant carries. Dispatches
+    /// through `variant_edit::spawn_field_widget` (Task 19/20's per-
+    /// `FieldKind` widget picker), the same dispatch every OTHER variant-
+    /// carried field in this inspector already goes through, rather than
+    /// re-deriving a widget per `FieldKind` here. `drives` lists the
+    /// `EmitterProp`s (zero, one, or -- for a vector field whose components
+    /// are driven independently, like `fx.scroll`'s `ScrollU`/`ScrollV` --
+    /// two) that get a drive button appended after the field.
+    MaterialField {
+        base_path: &'static str,
+        field: VariantField,
+        drives: Vec<EmitterProp>,
+    },
 }
 
 impl From<InspectorFieldProps> for InspectorItem {
@@ -601,6 +629,34 @@ fn setup_inspector_section_fields(
                                         drive_button::DriveButtonProps::new(prop),
                                     ))
                                     .insert(ChildOf(row_target));
+                            }
+                            InspectorItem::MaterialField {
+                                base_path,
+                                field,
+                                drives,
+                            } => {
+                                let row_target = row.target_entity();
+                                let binding = FieldBinding::emitter_variant_field(
+                                    base_path,
+                                    &field.name,
+                                    field.kind.clone(),
+                                );
+                                let label = path_to_label(&field.name);
+                                let mut cmds = row.commands();
+                                let widget_entity = spawn_field_widget(
+                                    &mut cmds,
+                                    &asset_server,
+                                    &field,
+                                    label,
+                                    binding,
+                                );
+                                cmds.entity(widget_entity).insert(ChildOf(row_target));
+                                for prop in drives {
+                                    cmds.spawn_scene(drive_button::drive_button(
+                                        drive_button::DriveButtonProps::new(prop),
+                                    ))
+                                    .insert(ChildOf(row_target));
+                                }
                             }
                         }
                     }

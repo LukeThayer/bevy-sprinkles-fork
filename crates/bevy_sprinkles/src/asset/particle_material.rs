@@ -720,4 +720,29 @@ mod tests {
         assert!(!lit.to_standard_material(asset_server, &[]).unlit);
         assert!(unlit.to_standard_material(asset_server, &[]).unlit);
     }
+
+    /// Task 22's material-rebuild question, pinned at the exact seam
+    /// `sync_particle_material` (`spawning.rs`) reads: it compares
+    /// `StandardParticleMaterial::cache_key()`, not `FxSettings::cache_key()`
+    /// directly, every frame, for every emitter, unconditionally (no
+    /// `Changed<>` filter -- it re-derives `new_material` from the asset
+    /// fresh each tick and only SKIPS the rebuild when the two keys already
+    /// match). `FxSettings`'s own tests already pin that ITS `cache_key`
+    /// changes with a field; this test pins that the fold at line ~628
+    /// (`self.fx.cache_key().hash(&mut hasher)`) actually carries that
+    /// change up into the key `sync_particle_material` looks at, so an
+    /// fx-only edit is never mistaken for "nothing changed" the way Task
+    /// 21's light bug mistook a spawn-only read for a live one.
+    #[test]
+    fn an_fx_only_difference_changes_the_materials_own_cache_key() {
+        let a = StandardParticleMaterial::default();
+        let b = StandardParticleMaterial {
+            fx: FxSettings {
+                scroll: bevy::math::Vec2::new(0.0, 0.4),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
 }

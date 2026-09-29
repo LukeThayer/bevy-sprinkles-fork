@@ -264,7 +264,19 @@ pub(super) fn handle_curve_commit(trigger: On<CurveEditCommitEvent>, mut ctx: Co
 pub(super) fn handle_gradient_commit(trigger: On<GradientEditCommitEvent>, mut ctx: CommitContext) {
     let gradient = trigger.gradient.clone();
     ctx.commit_reflected(trigger.entity, |target| {
-        target.apply(&gradient);
+        // Mirrors `handle_curve_commit`'s bare-or-`Option` fork just above:
+        // every gradient field until Task 22 was a bare `ParticleGradient`
+        // (`colors.color_over_lifetime`), so a plain `target.apply` never
+        // needed to consider the `Option` case. `FxSettings::gradient_remap`
+        // is the first `Option<ParticleGradient>` target -- `apply`ing a
+        // bare gradient onto an `Option` (a different `ReflectKind`) is not
+        // a supported conversion, so it needs its own arm rather than
+        // falling through to a generic `apply`.
+        if let Some(g) = target.try_downcast_mut::<ParticleGradient>() {
+            *g = gradient.clone();
+        } else if let Some(opt) = target.try_downcast_mut::<Option<ParticleGradient>>() {
+            *opt = Some(gradient.clone());
+        }
     });
 }
 

@@ -22,9 +22,10 @@
 //!
 //! There is deliberately only ONE of it. The inspector's copy is gone
 //! rather than kept in sync, because two live editors of one value is the
-//! desync class the range-clamp fix next door was about -- and unlike the
-//! Drives list and its popover, which agree by both rebuilding from the
-//! asset, the scrub value lives in a resource that nothing dirties, so a
+//! desync class the range-clamp fix next door was about. The Drives dock
+//! settled the same question the same way -- one editor pane, reachable from
+//! the list and from a field's drive button -- and here it is even more
+//! forced: the scrub value lives in a resource that nothing dirties, so a
 //! second editor would have no rebuild signal to share.
 
 use std::collections::HashMap;

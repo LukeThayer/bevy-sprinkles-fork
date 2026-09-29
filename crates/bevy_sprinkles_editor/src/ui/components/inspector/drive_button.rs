@@ -145,8 +145,9 @@ pub fn upsert_drive(asset: &mut ParticlesAsset, target: DriveTarget, variable: V
 /// asks, rather than the enum name. Exhaustive on `Stage`, no wildcard arm --
 /// a new stage is a compile error here until it says what it means.
 ///
-/// `pub(crate)`: reused verbatim by `drives.rs`'s flat list, which states the
-/// same stage next to every row regardless of which kind of target it is.
+/// `pub(crate)`: reused verbatim by the Drives dock, which states the same
+/// stage under the editor pane's header regardless of which kind of target
+/// the selected drive has.
 pub(crate) fn stage_label(prop: EmitterProp) -> &'static str {
     match prop.stage() {
         Stage::Spawn => "Spawn: affects only new particles",
@@ -246,12 +247,12 @@ struct DriveButtonTrigger(Entity);
 struct DriveRow;
 
 // The six row-marker types below, and `spawn_drive_row` that spawns them,
-// are `pub(crate)`: `drives.rs`'s flat list reuses this ENTIRE row (variable
-// combo, curve edit, output min/max, op combo, mute checkbox, delete button)
-// verbatim rather than reimplementing it, which means it also reuses every
-// observer below unchanged -- those observers query by component type, not
-// by which module spawned the entity, so a `drives.rs` row wired with these
-// same markers is handled by the exact same code path as a popover row.
+// are `pub(crate)`: the Drives dock's editor pane reuses this ENTIRE row
+// (variable combo, curve edit, output min/max, op combo, mute checkbox,
+// delete button) verbatim rather than reimplementing it, which means it also
+// reuses every observer below unchanged -- those observers query by component
+// type, not by which module spawned the entity. That is what made deleting
+// this module's own popover a subtraction rather than a rewrite.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct DriveVariableCombo(pub(crate) usize);
 
@@ -442,7 +443,7 @@ fn handle_drive_trigger_click(
     dirty_state.has_unsaved_changes = true;
 }
 
-/// `pub(crate)`: reused verbatim by `drives.rs`'s flat list. See the module
+/// `pub(crate)`: reused verbatim by the Drives dock's editor pane. See the module
 /// doc's note above `DriveVariableCombo` for why reusing this wholesale, and
 /// letting the existing observers below handle the results, is safe -- they
 /// dispatch on component type, not on which module spawned the row.
@@ -947,7 +948,7 @@ mod tests {
     fn re_committing_the_same_mute_state_does_not_spuriously_dirty() {
         // The read-compare-write half of the same property: a checkbox
         // commit that changes nothing must not still flip the dirty flag,
-        // or every popover repaint would look like an edit.
+        // or every repaint of the editor pane would look like an edit.
         let (mut app, checkbox_entity) = test_app_with_one_drive();
 
         app.world_mut().trigger(CheckboxCommitEvent {
@@ -1013,10 +1014,10 @@ mod tests {
 
     #[test]
     fn an_output_edit_dirties_so_the_other_surface_rebuilds() {
-        // One row's commit is the only thing that tells the OTHER surface
-        // its copy of this number is out of date. Drop the dirty flip and
-        // the popover and the Drives list disagree until something else
-        // happens to dirty the project.
+        // The commit is the only thing that tells the editor pane its copy of
+        // this number is out of date. Drop the dirty flip and the pane keeps
+        // showing the old value until something else happens to dirty the
+        // project.
         let (mut app, field, handle) = app_with_an_output_field(1.0, 1.0);
 
         app.world_mut().trigger(TextEditCommitEvent {

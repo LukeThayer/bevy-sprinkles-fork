@@ -119,22 +119,63 @@ pub struct LightResolved {
     pub props: HashMap<LightProp, f32>,
 }
 
+/// Maps a host value from its variable's declared range onto the curve's own
+/// `0..1` domain.
+///
+/// [`VariableDecl::range`](crate::asset::VariableDecl::range) used to be read
+/// by nothing at all: the host's raw value went straight into
+/// `curve.sample(t.clamp(0.0, 1.0))`, so a variable declared `range: (0, 100)`
+/// got a slider of which 99% was dead, and the field's own doc — "NOT a clamp
+/// on what the host may set, because a host legitimately overshoots for punch"
+/// — described something that could not happen.
+///
+/// A non-positive span (`max <= min`, including the degenerate `min == max`)
+/// has no interior to map onto, so it reads the curve at its start rather than
+/// dividing by zero. `min == max` is not an authorable state the editor
+/// produces; this exists because a hand-written `.ron` can say it.
+///
+/// **Overshoot is passed through, not clamped here** — a value past `max`
+/// yields `t > 1.0`. It is [`CurveTexture::sample`] that then holds at the
+/// curve's endpoint (`asset/curve.rs`'s `sample_points` clamps `t` itself,
+/// and that sampler is shared with the GPU-baked lifetime curves), so
+/// overshoot saturates rather than extrapolating. Overshooting is therefore
+/// USED rather than rejected, which is what `range` not being a clamp means;
+/// making it extrapolate past the endpoint is a change to that shared sampler
+/// and a design question of its own.
+fn normalize_to_curve_domain(raw: f32, range: crate::asset::Range) -> f32 {
+    let span = range.max - range.min;
+    if !span.is_finite() || span <= 0.0 {
+        return 0.0;
+    }
+    (raw - range.min) / span
+}
+
 /// Samples one drive to a finite scalar, or `None` if it contributes nothing.
 ///
-/// `values` is indexed by `VariableId`, so this never does a string lookup.
-/// Every arithmetic result is checked for finiteness at the boundary rather
-/// than trusting the inputs: the curve's control points, the output bounds and
-/// the host's variable are three independent places a NaN can enter, and only
-/// one of them (the host's) is guarded upstream.
-fn sample(drive: &Drive, values: &[f32]) -> Option<f32> {
+/// `values` and `decls` are both indexed by `VariableId`, so this never does a
+/// string lookup. Every arithmetic result is checked for finiteness at the
+/// boundary rather than trusting the inputs: the curve's control points, the
+/// output bounds and the host's variable are three independent places a NaN can
+/// enter, and only one of them (the host's) is guarded upstream.
+fn sample(drive: &Drive, values: &[f32], decls: &[VariableDecl]) -> Option<f32> {
     if drive.muted {
         return None;
     }
-    let t = *values.get(drive.variable.0 as usize)?;
+    let index = drive.variable.0 as usize;
+    let raw = *values.get(index)?;
+    if !raw.is_finite() {
+        return None;
+    }
+    // A missing declaration cannot happen for a validated asset (`validate_
+    // drives` rejects a drive naming an undeclared variable), but `values` and
+    // `decls` are two separate slices here, so the default range keeps this a
+    // total function rather than a panic if they ever disagree.
+    let range = decls.get(index).map(|d| d.range).unwrap_or_default();
+    let t = normalize_to_curve_domain(raw, range);
     if !t.is_finite() {
         return None;
     }
-    let unit = drive.curve.sample(t.clamp(0.0, 1.0));
+    let unit = drive.curve.sample(t);
     if !unit.is_finite() {
         return None;
     }
@@ -175,7 +216,7 @@ pub fn resolve_drives(values: &[f32], asset: &ParticlesAsset) -> ResolvedDrives 
     };
 
     for drive in &asset.drives {
-        let Some(value) = sample(drive, values) else { continue };
+        let Some(value) = sample(drive, values, &asset.variables) else { continue };
         match &drive.target {
             DriveTarget::Emitter { index, prop } => {
                 let Some(e) = out.emitters.get_mut(*index as usize) else { continue };
@@ -826,5 +867,104 @@ mod tests {
             "Y: ScaleY overrides on top of its OWN authored axis (2.0 * 5.0 = 10.0), not the uniform result (6.0 * 5.0 = 30.0)"
         );
         assert_eq!(t.scale.z, 3.0, "Z: only ScaleUniform touches Z -- authored 1.0 * 3.0");
+    }
+
+    // --- I4: `VariableDecl::range` is the curve's domain ------------------
+    //
+    // Before this, `range` was read by nothing in the crate: the host's raw
+    // value went straight into the curve. So `range: (0, 100)` produced a
+    // slider of which 99% was dead, and `range`'s own doc described behaviour
+    // that could not happen. These use the identity `ramp()` curve and a
+    // `0..1` output range, so the resolved value IS the normalized `t` and
+    // the mapping is observed directly.
+
+    fn asset_with_range(range: Range, drives: Vec<Drive>) -> ParticlesAsset {
+        let mut a = asset_with_drives(drives);
+        a.variables[0].range = range;
+        a
+    }
+
+    fn resolved_t(range: Range, host_value: f32) -> f32 {
+        let a = asset_with_range(
+            range,
+            vec![d(
+                EmitterProp::SizeMul,
+                ramp(),
+                Range { min: 0.0, max: 1.0 },
+                DriveOp::Replace,
+            )],
+        );
+        let slot = EmitterProp::SizeMul.slot().unwrap();
+        resolve_drives(&[host_value], &a).emitters[0].render[slot]
+            .expect("a live drive must resolve")
+    }
+
+    #[test]
+    fn a_zero_to_one_hundred_variable_at_fifty_samples_the_curves_midpoint() {
+        let t = resolved_t(Range { min: 0.0, max: 100.0 }, 50.0);
+        assert!(
+            (t - 0.5).abs() < 1e-4,
+            "50 of 0..100 must land mid-curve, got {t}"
+        );
+    }
+
+    #[test]
+    fn the_declared_minimum_is_the_start_of_the_curve_not_zero() {
+        // An offset range is the case a bare `/ max` would get wrong: 20 of
+        // 20..120 is the START of the curve, not a fifth of the way in.
+        let t = resolved_t(Range { min: 20.0, max: 120.0 }, 20.0);
+        assert!(t.abs() < 1e-4, "the declared min must map to 0.0, got {t}");
+        let mid = resolved_t(Range { min: 20.0, max: 120.0 }, 70.0);
+        assert!((mid - 0.5).abs() < 1e-4, "70 of 20..120 is mid-curve, got {mid}");
+    }
+
+    #[test]
+    fn the_default_zero_to_one_range_is_the_identity_it_always_was() {
+        // Everything authored so far uses the default range, so normalization
+        // must be a no-op for it -- otherwise this is a silent behaviour
+        // change to every existing effect rather than a new capability.
+        let t = resolved_t(Range { min: 0.0, max: 1.0 }, 0.3);
+        assert!((t - 0.3).abs() < 1e-4, "got {t}");
+    }
+
+    #[test]
+    fn a_zero_span_range_does_not_divide_by_zero() {
+        let t = resolved_t(Range { min: 5.0, max: 5.0 }, 5.0);
+        assert!(t.is_finite(), "a degenerate range must not produce NaN or inf");
+        assert_eq!(t, 0.0, "a range with no interior reads the curve at its start");
+    }
+
+    #[test]
+    fn an_inverted_range_does_not_produce_a_backwards_curve_or_a_nan() {
+        let t = resolved_t(Range { min: 10.0, max: 2.0 }, 6.0);
+        assert!(t.is_finite());
+        assert_eq!(t, 0.0);
+    }
+
+    /// The documented overshoot contract: a value past `max` is USED, not
+    /// rejected, wrapped, or swapped for the default. `normalize_to_curve_
+    /// domain` passes `t > 1.0` through; `CurveTexture::sample` then holds at
+    /// the curve's endpoint (`asset/curve.rs`'s `sample_points` clamps `t`
+    /// itself, and that sampler is shared with the GPU-baked lifetime curves),
+    /// so overshoot SATURATES rather than extrapolating. Asserted as saturation
+    /// rather than as extrapolation deliberately -- a test claiming
+    /// extrapolation would be asserting something the code does not do.
+    #[test]
+    fn overshooting_the_declared_maximum_is_used_and_saturates_at_the_curves_end() {
+        let range = Range { min: 0.0, max: 100.0 };
+        let at_max = resolved_t(range, 100.0);
+        let over = resolved_t(range, 150.0);
+        assert!((at_max - 1.0).abs() < 1e-4, "100 of 0..100 is the curve's end, got {at_max}");
+        assert_eq!(
+            over, at_max,
+            "an overshoot must reach the curve's endpoint, not fall back to the \
+             default, wrap to the start, or drop the drive"
+        );
+    }
+
+    #[test]
+    fn undershooting_the_declared_minimum_saturates_at_the_curves_start() {
+        let range = Range { min: 20.0, max: 120.0 };
+        assert_eq!(resolved_t(range, -5.0), resolved_t(range, 20.0));
     }
 }

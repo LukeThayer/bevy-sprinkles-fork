@@ -18,8 +18,16 @@ pub struct VariableDecl {
     pub name: String,
     /// The value used when the host sets nothing.
     pub default: f32,
-    /// Authored bounds. Drives the editor slider's range; NOT a clamp on what
-    /// the host may set, because a host legitimately overshoots for punch.
+    /// Authored bounds, and the domain every drive's curve is read over: a host
+    /// value is mapped `(v - min) / span` before it samples a curve
+    /// (`crate::drives`'s `normalize_to_curve_domain`), so declaring
+    /// `(0, 100)` gives a curve that spans all hundred rather than one living
+    /// inside its first percent. Also the editor slider's range.
+    ///
+    /// NOT a clamp on what the host may set, because a host legitimately
+    /// overshoots for punch: a value past `max` maps past `1.0` and is USED --
+    /// never rejected, wrapped, or swapped for the default -- where the curve
+    /// holds at its endpoint.
     pub range: Range,
 }
 

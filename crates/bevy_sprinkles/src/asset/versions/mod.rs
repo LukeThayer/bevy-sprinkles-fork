@@ -42,10 +42,25 @@ pub struct MigrationResult {
 }
 
 /// Runs [`validate_drives`](crate::asset::drive::validate_drives) on every
-/// successful parse and packages the result, so no arm of [`migrate`] can
-/// forget to validate before handing an asset back to the loader.
-fn finish(asset: ParticlesAsset, was_migrated: bool) -> Result<MigrationResult, MigrationError> {
+/// successful parse, STAMPS the current format version, and packages the
+/// result -- so no arm of [`migrate`] can forget either step before handing an
+/// asset back to the loader.
+///
+/// The stamp matters because a migrated asset gets re-serialized the next time
+/// the editor saves it. Without it, a `"0.3"` file edited and saved went back
+/// to disk as 0.4 content still LABELLED `"0.3"`, and the next load ran the
+/// 0.3 arm over it. That is harmless only for as long as the 0.3 and 0.4 arms
+/// stay identical, which is exactly why nobody noticed -- and it stops being
+/// harmless the moment either arm gains a real transformation.
+///
+/// `sprinkles_version` is private to `super`; `versions` is a child module, so
+/// the write is reachable here and nowhere outside `asset`.
+fn finish(
+    mut asset: ParticlesAsset,
+    was_migrated: bool,
+) -> Result<MigrationResult, MigrationError> {
     crate::asset::drive::validate_drives(&asset).map_err(MigrationError::Invalid)?;
+    asset.sprinkles_version = current_format_version().to_string();
     Ok(MigrationResult { asset, was_migrated })
 }
 
@@ -134,5 +149,53 @@ mod tests {
 
         let err = migrate_str(&ron).expect_err("must not load");
         assert!(matches!(err, MigrationError::Invalid(_)), "got {err:?}");
+    }
+
+    /// I7: the editor re-serializes whatever `migrate` handed it, so an
+    /// unstamped migration writes new-format content under an old version
+    /// label. Round-trips through `ron::ser` rather than reading the field
+    /// directly, because the FILE's label is the thing that misleads the next
+    /// load -- reading the in-memory field would pass even if serialization
+    /// dropped it.
+    #[test]
+    fn a_migrated_asset_is_reserialized_carrying_the_current_version() {
+        let ron = r#"(
+            sprinkles_version: "0.3",
+            name: "old",
+            dimension: D3,
+            emitters: [],
+        )"#;
+        let r = migrate_str(ron).expect("a 0.3 file must keep loading");
+        assert!(r.was_migrated);
+
+        let written = ron::ser::to_string(&r.asset).expect("serialize");
+        let probe: VersionProbe = ron::de::from_bytes(written.as_bytes()).expect("reprobe");
+        assert_eq!(
+            probe.sprinkles_version,
+            current_format_version(),
+            "a migrated asset saved back out must not claim the version it came from"
+        );
+    }
+
+    /// The stamp must not be limited to the migrating arms: an asset already
+    /// at the current version passes through `finish` too, and must come out
+    /// labelled the same way it went in.
+    #[test]
+    fn a_current_version_file_keeps_its_version() {
+        let ron = format!(
+            r#"(
+                sprinkles_version: "{}",
+                name: "new",
+                dimension: D3,
+                emitters: [],
+            )"#,
+            current_format_version()
+        );
+        let r = migrate_str(&ron).expect("a current-version file must load");
+        assert!(!r.was_migrated);
+
+        let written = ron::ser::to_string(&r.asset).expect("serialize");
+        let probe: VersionProbe = ron::de::from_bytes(written.as_bytes()).expect("reprobe");
+        assert_eq!(probe.sprinkles_version, current_format_version());
     }
 }

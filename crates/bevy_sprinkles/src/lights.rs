@@ -138,6 +138,15 @@ pub fn setup_effect_lights(
 /// button (`playback_controls.rs`) sets exactly this flag, so without this
 /// guard, pausing the preview would freeze particle motion while leaving any
 /// effect light still flashing through its curve underneath it.
+///
+/// Honors [`EmitterTime::one_shot`](crate::asset::EmitterTime::one_shot) too:
+/// once a one-shot light has completed a cycle its clock STOPS, pinned at
+/// `total_duration`, instead of wrapping back to the start. Freezing it rather
+/// than letting it run on keeps [`light_is_off`]'s answer a pure function of
+/// the stored clock, so the recompute-never-accumulate property survives —
+/// `sync_effect_lights` reaches the same (dark) result on frame 10 and frame
+/// 10,000. Until this existed, `one_shot` was never consulted anywhere and a
+/// "one-shot" light looped forever.
 pub fn advance_light_clocks(
     time: Res<Time>,
     assets: Res<Assets<ParticlesAsset>>,
@@ -161,14 +170,51 @@ pub fn advance_light_clocks(
 
         let total_duration = data.time.total_duration();
 
+        // A spent one-shot's clock is parked, not wrapped: nothing further to
+        // advance, and `light_is_off` reads `cycle` to keep it dark.
+        if one_shot_is_spent(&data.time, runtime.cycle) {
+            continue;
+        }
+
         runtime.prev_system_time = runtime.system_time;
         runtime.system_time += delta;
 
         if total_duration > 0.0 && runtime.system_time >= total_duration {
-            runtime.system_time %= total_duration;
-            runtime.cycle += 1;
+            if data.time.one_shot {
+                runtime.system_time = total_duration;
+                runtime.cycle = 1;
+            } else {
+                runtime.system_time %= total_duration;
+                runtime.cycle += 1;
+            }
         }
     }
+}
+
+/// Whether a one-shot light has already run its single cycle.
+fn one_shot_is_spent(time: &crate::asset::EmitterTime, cycle: u32) -> bool {
+    time.one_shot && cycle >= 1
+}
+
+/// Whether a light resolves to zero intensity this frame, regardless of its
+/// authored intensity, its envelope curve and its drives.
+///
+/// Two cases, both of which `compute_phase` alone cannot express, because it
+/// returns `0.0` for "not started yet" and `0.0` for "at the very start" alike:
+///
+/// - **Before `delay` elapses within a cycle.** A flash authored to begin
+///   bright (an envelope curve starting at 1, or no curve at all, whose
+///   envelope is 1) otherwise sat at FULL brightness for the whole delay
+///   window — the opposite of what `delay` means, and the reason a strobing
+///   muzzle flash could not be authored the way the spec promises.
+/// - **After a one-shot's single cycle.** `one_shot` was read nowhere at all
+///   before this, so a "one-shot" light looped forever.
+///
+/// Derived fresh from the stored clock every frame rather than latched, so it
+/// cannot go stale and running it twice gives the same answer once.
+fn light_is_off(time: &crate::asset::EmitterTime, runtime: &LightRuntime) -> bool {
+    one_shot_is_spent(time, runtime.cycle)
+        || !crate::runtime::is_past_delay(runtime.system_time, time)
 }
 
 /// Applies hue/saturation/value drives to an authored colour.
@@ -204,12 +250,15 @@ pub(crate) fn apply_hsv(base: Color, hue: Option<f32>, sat: Option<f32>, val: Op
     Color::from(hsva)
 }
 
-/// Applies each light's own-clock intensity curve and its ECS-stage drives.
+/// Applies each light's own-clock intensity curve, its `delay`/`one_shot`
+/// gating, and its ECS-stage drives.
 ///
-/// Intensity and range are recomputed from the authored value every frame
-/// rather than accumulated, so this is idempotent: running it twice in a row
-/// (or after any number of frames) gives the same answer as running it once
-/// for the same clock and drive state.
+/// Intensity, range AND colour are recomputed from the authored values every
+/// frame rather than accumulated, so this is idempotent: running it twice in a
+/// row (or after any number of frames) gives the same answer as running it once
+/// for the same clock and drive state. Colour is equally derived — `apply_hsv`
+/// starts from `data.color` every time and multiplies, it never reads back the
+/// colour it wrote last frame.
 pub fn sync_effect_lights(
     assets: Res<Assets<ParticlesAsset>>,
     systems: Query<(&Particles3d, Option<&EffectDrives>)>,
@@ -251,7 +300,11 @@ pub fn sync_effect_lights(
             .filter(|v| v.is_finite())
             .unwrap_or(1.0);
 
-        let intensity = (data.intensity * envelope * intensity_mul).max(0.0);
+        // The gate multiplies rather than short-circuiting, so range, colour
+        // and every drive still resolve normally while the light is dark --
+        // recompute, never latch.
+        let gate = if light_is_off(&data.time, runtime) { 0.0 } else { 1.0 };
+        let intensity = (data.intensity * envelope * intensity_mul * gate).max(0.0);
         let range = (data.range * range_mul).max(0.0);
 
         let hue = resolved
@@ -829,5 +882,192 @@ mod tests {
                 "a steady hue drive must produce the same colour every frame, not drift: {samples:?}"
             );
         }
+    }
+
+    // --- I3: `delay` and `one_shot` are read, not just painted ------------
+
+    /// Builds an app whose one light uses `time` and an envelope curve that
+    /// starts BRIGHT, which is the shape that exposed the delay bug: a ramp
+    /// starting at 0 would have masked it, since `compute_phase` returns 0.0
+    /// during the delay window and a 0-at-phase-0 curve is dark there anyway.
+    fn app_with_flash(time: crate::asset::EmitterTime) -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        app.add_systems(
+            Update,
+            (setup_effect_lights, advance_light_clocks, sync_effect_lights).chain(),
+        );
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                100,
+            )));
+
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut a = ParticlesAsset::new(
+                "t".into(),
+                ParticlesDimension::D3,
+                Default::default(),
+                vec![],
+                vec![],
+                false,
+                ParticlesAuthors::default(),
+            );
+            a.lights = vec![LightData {
+                intensity: 1000.0,
+                // Flat 1.0: a muzzle flash that is fully on the instant it
+                // starts, so any brightness observed before `delay` elapses is
+                // the defect and not the curve.
+                intensity_over_life: Some(CurveTexture::new(vec![
+                    CurvePoint::new(0.0, 1.0),
+                    CurvePoint::new(1.0, 1.0),
+                ])),
+                time,
+                ..Default::default()
+            }];
+            assets.add(a)
+        };
+        let effect = app
+            .world_mut()
+            .spawn((Particles3d(handle), Transform::default()))
+            .id();
+        app.update();
+        (app, effect)
+    }
+
+    fn light_intensity(app: &App, effect: Entity) -> f32 {
+        app.world()
+            .iter_entities()
+            .find(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .and_then(|e| e.get::<PointLight>())
+            .expect("light child must exist")
+            .intensity
+    }
+
+    #[test]
+    fn a_delayed_light_stays_dark_until_its_delay_elapses() {
+        // 0.5s delay, 1.0s lifetime, 0.1s frames. `compute_phase` returns 0.0
+        // for the whole delay window, so without the gate this light sits at
+        // full brightness for half a second before it is supposed to exist.
+        let (mut app, effect) = app_with_flash(crate::asset::EmitterTime {
+            lifetime: 1.0,
+            delay: 0.5,
+            ..Default::default()
+        });
+
+        // Frames 2..=5 land the clock at 0.1, 0.2, 0.3, 0.4 -- all inside the
+        // delay window.
+        for _ in 0..4 {
+            app.update();
+            assert_eq!(
+                light_intensity(&app, effect),
+                0.0,
+                "a light must be dark before its delay elapses"
+            );
+        }
+
+        // Frame 6 lands at 0.5, exactly when the delay is spent.
+        app.update();
+        assert!(
+            light_intensity(&app, effect) > 0.0,
+            "the light must come up once its delay has elapsed"
+        );
+    }
+
+    #[test]
+    fn a_one_shot_light_goes_dark_after_its_cycle_and_stays_dark() {
+        // 0.3s total against 0.1s frames: the cycle completes on the frame
+        // that takes the clock to 0.3, and must never light again.
+        let (mut app, effect) = app_with_flash(crate::asset::EmitterTime {
+            lifetime: 0.3,
+            delay: 0.0,
+            one_shot: true,
+            ..Default::default()
+        });
+
+        app.update();
+        assert!(
+            light_intensity(&app, effect) > 0.0,
+            "sanity: a one-shot light must actually fire before it stops"
+        );
+
+        // Walk to the frame the cycle completes on. It must arrive: a bound of
+        // six 0.1s frames is twice the 0.3s cycle, so a light still lit here
+        // is one that never stops.
+        let mut frames_to_dark = None;
+        for frame in 0..6 {
+            app.update();
+            if light_intensity(&app, effect) == 0.0 {
+                frames_to_dark = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            frames_to_dark.is_some(),
+            "a one-shot light must go dark within twice its own cycle"
+        );
+
+        // Then it must STAY dark. Without `one_shot` honoured the clock wraps
+        // and the flat envelope brings the light straight back up -- the "a
+        // one-shot light loops forever" defect, invisible to any test that
+        // samples a single frame.
+        for frame in 0..20 {
+            app.update();
+            assert_eq!(
+                light_intensity(&app, effect),
+                0.0,
+                "a spent one-shot light must stay dark (frame {frame} after it went out)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spent_one_shot_lights_clock_stops_rather_than_running_on() {
+        let (mut app, effect) = app_with_flash(crate::asset::EmitterTime {
+            lifetime: 0.3,
+            delay: 0.0,
+            one_shot: true,
+            ..Default::default()
+        });
+        for _ in 0..10 {
+            app.update();
+        }
+
+        let child = app
+            .world()
+            .iter_entities()
+            .find(|e| e.get::<LightEntity>().map(|l| l.parent_system) == Some(effect))
+            .expect("light child must exist")
+            .id();
+        let runtime = app.world().get::<LightRuntime>(child).unwrap();
+        assert_eq!(
+            runtime.cycle, 1,
+            "a one-shot light must complete exactly one cycle, not keep counting"
+        );
+        assert_eq!(
+            runtime.system_time, 0.3,
+            "the clock parks at total_duration instead of wrapping or running on"
+        );
+    }
+
+    #[test]
+    fn a_looping_light_still_wraps_and_relights() {
+        // The counterpart guard: the one-shot stop must not have frozen every
+        // light. Same timings, `one_shot: false`.
+        let (mut app, effect) = app_with_flash(crate::asset::EmitterTime {
+            lifetime: 0.3,
+            delay: 0.0,
+            one_shot: false,
+            ..Default::default()
+        });
+        for _ in 0..20 {
+            app.update();
+        }
+        assert!(
+            light_intensity(&app, effect) > 0.0,
+            "a looping light must keep relighting after its cycle wraps"
+        );
     }
 }

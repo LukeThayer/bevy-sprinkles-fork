@@ -186,9 +186,27 @@ pub fn light_transform_section() -> (impl Bundle, InspectorSection) {
     )
 }
 
-// --- Time section: mirrors inspector/time.rs, minus the Lifetime drive
-// button -- `LightProp` has no `Lifetime` variant to attach one to, since
-// every light drive is ECS-stage, not spawn-stage. Pure declarative. --------
+// --- Time section: a light's THREE live fields, not an emitter's nine -------
+//
+// `LightData` reuses `EmitterTime` wholesale, but `lights.rs` reads exactly
+// `lifetime`, `delay` and `one_shot` of it -- the first two through
+// `total_duration()`/`compute_phase`, all three through `light_is_off`. This
+// section used to paint the emitter Time section unchanged, which put six
+// controls in front of an author that a light cannot possibly obey:
+//
+//   lifetime_randomness, spawn_time_randomness   per-PARTICLE spawn jitter
+//   explosiveness                                how spawns bunch in a cycle
+//   fixed_fps, fixed_seed                        simulation stepping + RNG
+//
+// A light spawns no particles and steps no simulation, so all five are cut.
+// (The sixth, `one_shot`, was equally inert -- but it is meaningful FOR a
+// light, so the fix wave taught `lights.rs` to honour it rather than removing
+// the control.) A slider that moves nothing is worse than a missing one: the
+// author turns it, sees no change, and goes looking for the bug somewhere real.
+//
+// Also minus the Lifetime drive button -- `LightProp` has no `Lifetime`
+// variant to attach one to, since every light drive is ECS-stage, not
+// spawn-stage. Pure declarative.
 
 pub fn light_time_section() -> (impl Bundle, InspectorSection) {
     (
@@ -201,34 +219,10 @@ pub fn light_time_section() -> (impl Bundle, InspectorSection) {
                         .with_icon(ICON_TIME)
                         .with_suffix("s")
                         .into(),
-                    InspectorFieldProps::new("time.lifetime_randomness")
-                        .percent()
-                        .with_icon(ICON_TIME)
-                        .into(),
-                ],
-                vec![
                     InspectorFieldProps::new("time.delay")
                         .with_min(0.)
                         .with_icon(ICON_TIME)
                         .with_suffix("s")
-                        .into(),
-                ],
-                vec![
-                    InspectorFieldProps::new("time.explosiveness")
-                        .percent()
-                        .into(),
-                    InspectorFieldProps::new("time.spawn_time_randomness")
-                        .percent()
-                        .into(),
-                ],
-                vec![
-                    InspectorFieldProps::new("time.fixed_fps")
-                        .u32_or_empty()
-                        .with_placeholder("Unlimited")
-                        .into(),
-                    InspectorFieldProps::new("time.fixed_seed")
-                        .optional_u32()
-                        .with_placeholder("Random")
                         .into(),
                 ],
                 vec![InspectorFieldProps::new("time.one_shot").bool().into()],

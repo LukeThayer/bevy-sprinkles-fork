@@ -23,6 +23,8 @@ struct ParticleEmitterUniforms {
     transform_align: u32,
     trail_thickness_curve: array<f32, 16>,
     drive_slots: array<f32, 9>,
+    // LAYOUT-LOCKSTEP with ParticleEmitterUniforms::max_screen_size.
+    max_screen_size: f32,
 }
 
 // LAYOUT-LOCKSTEP with DRIVE_SLOT_COUNT in asset/drive.rs.

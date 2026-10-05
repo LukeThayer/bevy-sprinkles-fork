@@ -55,6 +55,10 @@ pub struct ParticleEmitterUniforms {
     /// (1.0 for multipliers, which is every current slot), written by
     /// `write_emitter_uniforms`.
     pub drive_slots: [f32; DRIVE_SLOT_COUNT],
+    /// [`EmitterDrawPass::max_screen_size`](crate::asset::EmitterDrawPass::max_screen_size):
+    /// the largest fraction of the view's height one camera-facing particle
+    /// may span. `0.0` is off. LAYOUT-LOCKSTEP with `common.wgsl`.
+    pub max_screen_size: f32,
 }
 
 impl Default for ParticleEmitterUniforms {
@@ -68,6 +72,7 @@ impl Default for ParticleEmitterUniforms {
             transform_align: 0,
             trail_thickness_curve: [1.0; TRAIL_THICKNESS_CURVE_SAMPLES],
             drive_slots: [1.0; DRIVE_SLOT_COUNT],
+            max_screen_size: 0.0,
         }
     }
 }

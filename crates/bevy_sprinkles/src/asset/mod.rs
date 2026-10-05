@@ -391,6 +391,28 @@ pub struct EmitterDrawPass {
     /// alignment is applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform_align: Option<TransformAlign>,
+    /// The largest fraction of the view's height one particle may span, for
+    /// the camera-facing (billboard) alignments. `0.0`, the default, is off.
+    ///
+    /// The cost of a transparent particle is the screen area it covers, so a
+    /// particle near the camera is the expensive one: a few hundred of them
+    /// right in front of the lens each cover most of the screen, and every
+    /// covered pixel is shaded once per particle. This shrinks such a
+    /// particle (about its centre, in the vertex shader) until it spans at
+    /// most this fraction, which bounds the worst case at roughly
+    /// `count * max_screen_size^2` screens of shading however close the
+    /// camera gets. At normal distances nothing changes. The same knob is
+    /// Unity's "Max Particle Size".
+    ///
+    /// Measured on an M2 at 2560x1440 (2026-10-04): an 800-particle
+    /// additive flame 1 m from the camera ran at ~110 ms a frame uncapped.
+    ///
+    /// The size it caps is the particle's scaled size assuming a unit-sized
+    /// mesh (`Quad` of size `(1, 1)`); a larger mesh is capped
+    /// proportionally more loosely. Trails and the non-billboard alignments
+    /// are not capped.
+    #[serde(skip_serializing_if = "is_zero_f32")]
+    pub max_screen_size: f32,
     /// Whether particles use local coordinates and follow the emitter's transform.
     ///
     /// When `false` (default), particles are emitted into world space and remain
@@ -413,6 +435,7 @@ impl Default for EmitterDrawPass {
             material: DrawPassMaterial::default(),
             shadow_caster: true,
             transform_align: None,
+            max_screen_size: 0.0,
             use_local_coords: false,
             visibility_aabb: VisibilityAabb::default(),
         }
@@ -1601,5 +1624,31 @@ mod mesh_fx_tests {
         // zero initial velocity does not cancel an acceleration. Without this,
         // a "pinned" mesh visibly falls over its lifetime.
         assert_eq!(mesh_fx_emitter().accelerations.gravity, Vec3::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod max_screen_size_tests {
+    use super::*;
+
+    /// Every effect authored before the field existed has no
+    /// `max_screen_size` line; it must load with the cap OFF, and a cap left
+    /// at zero must not start appearing in files the editor saves.
+    #[test]
+    fn a_draw_pass_without_the_field_loads_uncapped_and_zero_is_not_written() {
+        let pass: EmitterDrawPass = ron::from_str("()").expect("an empty draw pass parses");
+        assert_eq!(pass.max_screen_size, 0.0);
+        let written = ron::to_string(&pass).expect("serializes");
+        assert!(!written.contains("max_screen_size"), "{written}");
+    }
+
+    #[test]
+    fn an_authored_cap_round_trips() {
+        let pass: EmitterDrawPass =
+            ron::from_str("(max_screen_size: 0.35)").expect("parses");
+        assert_eq!(pass.max_screen_size, 0.35);
+        let back: EmitterDrawPass =
+            ron::from_str(&ron::to_string(&pass).unwrap()).expect("re-parses");
+        assert_eq!(back.max_screen_size, 0.35);
     }
 }

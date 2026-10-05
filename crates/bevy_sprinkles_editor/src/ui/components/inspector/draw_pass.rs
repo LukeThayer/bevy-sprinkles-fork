@@ -65,6 +65,15 @@ pub fn draw_pass_section() -> (impl Bundle, InspectorSection) {
                         .into(),
                 ],
                 vec![
+                    // Billboard-only; 0 is off. See
+                    // `EmitterDrawPass::max_screen_size`.
+                    InspectorFieldProps::new("draw_pass.max_screen_size")
+                        .with_label("Max screen size")
+                        .with_min(0.0)
+                        .with_max(1.0)
+                        .into(),
+                ],
+                vec![
                     InspectorFieldProps::new("draw_pass.shadow_caster")
                         .bool()
                         .into(),

@@ -55,6 +55,31 @@
 
 const STANDARD_MATERIAL_FLAGS_UNLIT_BIT: u32 = 1u << 5u;
 
+// How much to shrink a camera-facing particle of world size `size` centred at
+// `center` so it spans at most `cap` of the view's height; 1.0 when it already
+// fits or the cap is off (`cap <= 0`). See `EmitterDrawPass::max_screen_size`.
+//
+// A particle's screen height at view depth d is size * f / (2 d), with
+// f = clip_from_view[1][1], so the largest allowed size is cap * 2 d / f. An
+// orthographic view (clip_from_view[3][3] == 1) has no depth term: the span
+// is size * f / 2. Defined at file scope, taking the cap as a parameter,
+// because `emitter_uniforms` is not bound in every pipeline variant this file
+// compiles into, while `view` is.
+fn screen_size_cap(center: vec3<f32>, size: f32, cap: f32) -> f32 {
+    if cap <= 0.0 || size <= 0.0 {
+        return 1.0;
+    }
+    let f = view.clip_from_view[1][1];
+    var max_size: f32;
+    if view.clip_from_view[3][3] == 1.0 {
+        max_size = cap * 2.0 / f;
+    } else {
+        let depth = max(-(view.view_from_world * vec4(center, 1.0)).z, 1e-4);
+        max_size = cap * 2.0 * depth / f;
+    }
+    return min(1.0, max_size / size);
+}
+
 #ifdef PREPASS_PIPELINE
 #ifndef PREPASS_FRAGMENT
 #ifndef MAY_DISCARD
@@ -351,7 +376,11 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
         } else {
             particle_world_pos = particle_position;
         }
-        let scale = vec3(particle_scale) * emitter_scale;
+        let scale = vec3(particle_scale) * emitter_scale * screen_size_cap(
+            particle_world_pos,
+            particle_scale * max(emitter_scale.x, emitter_scale.y),
+            emitter_uniforms.max_screen_size,
+        );
 
         if transform_align == TRANSFORM_ALIGN_BILLBOARD_Y_TO_VELOCITY {
             var v = particle.alignment_dir.xyz;
@@ -695,7 +724,11 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
         } else {
             particle_world_pos = particle_position;
         }
-        let scale = vec3(particle_scale) * emitter_scale;
+        let scale = vec3(particle_scale) * emitter_scale * screen_size_cap(
+            particle_world_pos,
+            particle_scale * max(emitter_scale.x, emitter_scale.y),
+            emitter_uniforms.max_screen_size,
+        );
 
         if transform_align == TRANSFORM_ALIGN_BILLBOARD_Y_TO_VELOCITY {
             var v = particle.alignment_dir.xyz;
@@ -1039,7 +1072,11 @@ fn particle_vertex_impl(vertex: Vertex) -> VertexOutput {
         } else {
             particle_world_pos = particle_position;
         }
-        let scale = vec3(particle_scale) * emitter_scale;
+        let scale = vec3(particle_scale) * emitter_scale * screen_size_cap(
+            particle_world_pos,
+            particle_scale * max(emitter_scale.x, emitter_scale.y),
+            emitter_uniforms.max_screen_size,
+        );
 
         if transform_align == TRANSFORM_ALIGN_BILLBOARD_Y_TO_VELOCITY {
             var v = particle.alignment_dir.xyz;

@@ -854,6 +854,7 @@ pub fn write_emitter_uniforms(
             transform_align: transform_align_to_u32(emitter_data.draw_pass.transform_align),
             trail_thickness_curve,
             drive_slots,
+            max_screen_size: emitter_data.draw_pass.max_screen_size,
         };
 
         if let Some(mut buffer) = buffers.get_mut(&buffer_handle.emitter_uniforms_buffer) {

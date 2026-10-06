@@ -313,6 +313,34 @@ pub struct UnknownVariablesWarned;
 ///
 /// Runs in `Update` before the render-uniform write in `PostUpdate`, so a
 /// value set by host code this frame reaches the GPU the same frame.
+///
+/// ## Why both inserts are `try_insert`
+///
+/// An effect can be despawned inside the window between this body running and
+/// its command buffer being applied, and that is the ordinary case rather than
+/// a corner: effects are owned by short-lived things (a projectile, an
+/// explosion, a networked entity whose despawn is some other system's deferred
+/// command), so "alive when the query was iterated, gone by the flush" arrives
+/// as soon as one explosion lands inside another's radius. Every
+/// `EntityCommand` resolves its entity at APPLY time — `with_entity` does
+/// `world.get_entity_mut(entity)?`
+/// (`bevy_ecs-0.19.0/src/system/commands/entity_command.rs:95-103`) — so a
+/// plain `insert` against a dead effect hands that fetch error to the fallback
+/// handler, whose default `match_severity` dispatches the `Severity::Panic`
+/// arm and kills the process (`.../src/error/handler.rs:128-140` and `:145`).
+/// Reported from a real game, 1653 particles across 5 emitters, as
+/// `Encountered a panic when applying buffers for system
+/// bevy_sprinkles::drives::evaluate_drives`.
+///
+/// `try_insert` is the whole fix, because both inserts here are BARE component
+/// writes against the effect and nothing else: `try_insert` is the same
+/// `entity_command::insert` queued through `queue_silenced` rather than `queue`
+/// (`.../src/system/commands/mod.rs:1626-1628` against `:1434-1437`), so the
+/// identical fetch failure is discarded instead of raised. Unlike
+/// [`setup_effect_lights`](crate::lights::setup_effect_lights), which needed
+/// its whole body folded into one `queue_silenced` closure, no child is spawned
+/// ahead of these inserts, so the dead path leaves no second half alive to
+/// orphan — a closure would buy nothing here.
 pub fn evaluate_drives(
     mut commands: Commands,
     assets: Res<Assets<ParticlesAsset>>,
@@ -340,7 +368,7 @@ pub fn evaluate_drives(
                     unknown,
                     asset.variables.iter().map(|v| &v.name).collect::<Vec<_>>(),
                 );
-                commands.entity(entity).insert(UnknownVariablesWarned);
+                commands.entity(entity).try_insert(UnknownVariablesWarned);
             }
         }
 
@@ -348,7 +376,7 @@ pub fn evaluate_drives(
         let next = resolve_drives(&values, asset);
         match resolved {
             Some(mut slot) => slot.0 = next,
-            None => { commands.entity(entity).insert(EffectDrives(next)); }
+            None => { commands.entity(entity).try_insert(EffectDrives(next)); }
         }
     }
 }
@@ -1012,5 +1040,83 @@ mod tests {
     fn undershooting_the_declared_minimum_saturates_at_the_curves_start() {
         let range = Range { min: 20.0, max: 120.0 };
         assert_eq!(resolved_t(range, -5.0), resolved_t(range, 20.0));
+    }
+
+    /// Spawns an effect that needs BOTH of [`evaluate_drives`]'s inserts on its
+    /// first visit: no [`EffectDrives`] yet, and a `ParticleVariables` name the
+    /// asset does not declare, so the `UnknownVariablesWarned` branch is taken
+    /// too. One entity therefore covers both guarded sites.
+    fn spawn_effect_needing_both_inserts(app: &mut App) -> Entity {
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            assets.add(asset_with_drives(vec![d(
+                EmitterProp::SizeMul,
+                flat(1.0),
+                Range { min: 0.0, max: 4.0 },
+                DriveOp::Replace,
+            )]))
+        };
+        let mut vars = ParticleVariables::default();
+        vars.set("not_declared_anywhere", 0.5);
+        app.world_mut().spawn((Particles3d(handle), vars)).id()
+    }
+
+    /// Drives [`evaluate_drives`] across the exact window the reported crash
+    /// lives in: the body runs, THEN the effect dies, THEN the buffers are
+    /// applied. `App::update` cannot express that — the scheduler puts a sync
+    /// point between a system with deferred params and anything ordered after
+    /// it, so an in-schedule despawner would always find the inserts already
+    /// flushed. `run_without_applying_deferred` and `apply_deferred` are the
+    /// two halves `System::run` fuses together
+    /// (`bevy_ecs-0.19.0/src/system/system.rs:126-148`), so splitting them is
+    /// the window itself, not an approximation of it.
+    #[test]
+    fn an_effect_that_dies_before_its_buffers_flush_applies_them_without_panicking() {
+        // Deliberately NOT `test_app()`: that registers `evaluate_drives` in
+        // `Update`, and this test runs it by hand to get between its two halves.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        let effect = spawn_effect_needing_both_inserts(&mut app);
+
+        let mut system = IntoSystem::into_system(evaluate_drives);
+        let _ = system.initialize(app.world_mut());
+        system
+            .run_without_applying_deferred((), app.world_mut())
+            .expect("the system body itself must run");
+        app.world_mut().entity_mut(effect).despawn();
+        system.apply_deferred(app.world_mut());
+        assert!(
+            app.world().get_entity(effect).is_err(),
+            "the effect really must be gone -- otherwise this test proves nothing"
+        );
+    }
+
+    /// The live path the guard must not have cost. A `try_insert` that silences
+    /// the dead-entity error silences nothing else, but that is only worth
+    /// asserting against the actual effect: `EffectDrives` carries this frame's
+    /// resolved values, and `UnknownVariablesWarned` is what demotes the
+    /// unknown-name warning from every-frame to once.
+    #[test]
+    fn a_surviving_effect_still_gets_its_drives_and_its_warned_marker() {
+        let mut app = test_app();
+        let effect = spawn_effect_needing_both_inserts(&mut app);
+        app.update();
+
+        let slot = EmitterProp::SizeMul.slot().unwrap();
+        let drives = app
+            .world()
+            .get::<EffectDrives>(effect)
+            .expect("a live effect must receive this frame's resolved drives");
+        assert_eq!(
+            drives.0.emitters[0].render[slot],
+            Some(4.0),
+            "the resolved value must reach its slot, not merely a default struct"
+        );
+        assert!(
+            app.world().get::<UnknownVariablesWarned>(effect).is_some(),
+            "without the marker the unknown-name warning fires every frame forever"
+        );
     }
 }

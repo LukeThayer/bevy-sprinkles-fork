@@ -1,7 +1,7 @@
 use bevy::color::Hsva;
 use bevy::prelude::*;
 
-use crate::asset::{FxLightKind, LightProp, ParticlesAsset};
+use crate::asset::{FxLightKind, LightData, LightProp, ParticlesAsset};
 use crate::drives::EffectDrives;
 use crate::runtime::{compute_phase, ParticleSystemRuntime, Particles3d};
 
@@ -63,6 +63,53 @@ impl LightRuntime {
 /// Idempotent via [`EffectLightsSpawned`]: the `Without<EffectLightsSpawned>`
 /// filter means an effect is only ever visited by this system once, no matter
 /// how many frames pass.
+///
+/// ## Why the whole per-effect body is one silenced `EntityCommand`
+///
+/// An effect can be despawned inside the window between this body running and
+/// its command buffer being applied, and that is the ordinary case rather than
+/// a corner: an effect is normally owned by something short-lived (a
+/// projectile, an explosion, a networked entity whose despawn is some other
+/// system's deferred command), so "spawned and despawned in the same frame"
+/// arrives as soon as one explosion lands inside another's radius. Issued as
+/// three separate commands against `entity`, that window had two distinct
+/// failures, only one of which was visible:
+///
+/// - `commands.entity(entity).add_child(..)` and `.insert(EffectLightsSpawned)`
+///   resolve the effect at apply time and error if it is gone; the default
+///   handler turns that into a process-killing panic. `match_severity` is
+///   `#[track_caller]` and `#[inline]`, which is why the reported crash site is
+///   `bevy_ecs-0.19.0/src/error/handler.rs:130` — that function's own signature
+///   — rather than the `Severity::Panic` arm it dispatches through (:138) or
+///   the `panic` handler it lands in (:145). Reported from a real game as
+///   `Encountered a panic when applying buffers for system
+///   bevy_sprinkles::lights::setup_effect_lights`.
+/// - the light child was `commands.spawn`ed BEFORE it was parented, so even a
+///   panic-proof `add_child` would have left it ALIVE at the world origin with
+///   a dangling `LightEntity { parent_system }`: `ChildOf`'s `on_insert` hook
+///   warns and strips the dangling relationship off the CHILD instead of
+///   despawning it (`bevy_ecs-0.19.0/src/relationship/mod.rs:194-213`), and
+///   nothing reaps a light whose parent is gone — [`sync_effect_lights`] only
+///   ever reads `parent_system`. One stray `PointLight`/`SpotLight` per dead
+///   effect, owned by nothing, and absent from any crash report.
+///
+/// One `queue_silenced` closure on the effect buys both at once.
+/// `EntityCommand::with_entity` fetches the entity FIRST and propagates the
+/// fetch failure with `?`, so the closure — and every `spawn` inside it — is
+/// dropped unrun when the effect is already gone
+/// (`bevy_ecs-0.19.0/src/system/commands/entity_command.rs:100-103`), and
+/// `queue_silenced` discards that error rather than handing it to the
+/// panicking handler (`.../system/commands/mod.rs:2011`). Nothing is spawned
+/// on the dead path, so there is nothing left to orphan; on the live path the
+/// parent is held as an `EntityWorldMut` across the whole closure, so a child
+/// can never be spawned into a world where it has since vanished.
+///
+/// The closure is `move`, which is what forces the clone: `asset` borrows
+/// `Res<Assets<ParticlesAsset>>` and cannot cross into a command that runs
+/// later. [`LightData`](crate::asset::LightData) is `Clone`, and the clone is
+/// narrowed to the ENABLED lights — a disabled light costs nothing, and the
+/// rest of the asset (emitters, materials, baked curve textures) is never
+/// copied.
 pub fn setup_effect_lights(
     mut commands: Commands,
     assets: Res<Assets<ParticlesAsset>>,
@@ -73,48 +120,53 @@ pub fn setup_effect_lights(
             continue;
         };
 
-        for (i, light) in asset.lights.iter().enumerate() {
-            if !light.enabled {
-                continue;
-            }
+        let lights: Vec<(usize, LightData)> = asset
+            .lights
+            .iter()
+            .enumerate()
+            .filter(|(_, light)| light.enabled)
+            .map(|(i, light)| (i, light.clone()))
+            .collect();
 
-            let transform = light.transform.to_transform();
-            let mut child = commands.spawn((
-                transform,
-                Visibility::default(),
-                LightEntity {
-                    parent_system: entity,
-                    light_index: i,
-                },
-                LightRuntime::new(),
-            ));
+        commands
+            .entity(entity)
+            .queue_silenced(move |mut effect: EntityWorldMut| {
+                effect.with_children(|parent| {
+                    for (i, light) in &lights {
+                        let mut child = parent.spawn((
+                            light.transform.to_transform(),
+                            Visibility::default(),
+                            LightEntity {
+                                parent_system: entity,
+                                light_index: *i,
+                            },
+                            LightRuntime::new(),
+                        ));
 
-            match light.kind {
-                FxLightKind::Point => {
-                    child.insert(PointLight {
-                        color: light.color,
-                        intensity: light.intensity,
-                        range: light.range,
-                        shadow_maps_enabled: light.shadows,
-                        ..default()
-                    });
-                }
-                FxLightKind::Spot => {
-                    child.insert(SpotLight {
-                        color: light.color,
-                        intensity: light.intensity,
-                        range: light.range,
-                        shadow_maps_enabled: light.shadows,
-                        ..default()
-                    });
-                }
-            }
-
-            let child = child.id();
-            commands.entity(entity).add_child(child);
-        }
-
-        commands.entity(entity).insert(EffectLightsSpawned);
+                        match light.kind {
+                            FxLightKind::Point => {
+                                child.insert(PointLight {
+                                    color: light.color,
+                                    intensity: light.intensity,
+                                    range: light.range,
+                                    shadow_maps_enabled: light.shadows,
+                                    ..default()
+                                });
+                            }
+                            FxLightKind::Spot => {
+                                child.insert(SpotLight {
+                                    color: light.color,
+                                    intensity: light.intensity,
+                                    range: light.range,
+                                    shadow_maps_enabled: light.shadows,
+                                    ..default()
+                                });
+                            }
+                        }
+                    }
+                });
+                effect.insert(EffectLightsSpawned);
+            });
     }
 }
 
@@ -1069,5 +1121,140 @@ mod tests {
             light_intensity(&app, effect) > 0.0,
             "a looping light must keep relighting after its cycle wraps"
         );
+    }
+
+    /// Drives `setup_effect_lights` across the exact window the reported crash
+    /// lives in: the body runs, THEN the effect dies, THEN the buffers are
+    /// applied. `App::update` cannot express that — the scheduler puts a sync
+    /// point between a system with deferred params and anything ordered after
+    /// it, so an in-schedule despawner would always find the spawns already
+    /// flushed. `run_without_applying_deferred` and `apply_deferred` are the
+    /// two halves `System::run` fuses together
+    /// (`bevy_ecs-0.19.0/src/system/system.rs:126-148`), so splitting them is
+    /// the window, not an approximation of it.
+    fn despawned_inside_the_command_window(lights: Vec<LightData>) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default());
+        app.init_asset::<ParticlesAsset>();
+        let handle = {
+            let mut assets = app.world_mut().resource_mut::<Assets<ParticlesAsset>>();
+            let mut a = ParticlesAsset::new(
+                "t".into(),
+                ParticlesDimension::D3,
+                Default::default(),
+                vec![],
+                vec![],
+                false,
+                ParticlesAuthors::default(),
+            );
+            a.lights = lights;
+            assets.add(a)
+        };
+        let effect = app
+            .world_mut()
+            .spawn((Particles3d(handle), Transform::default()))
+            .id();
+
+        let mut system = IntoSystem::into_system(setup_effect_lights);
+        let _ = system.initialize(app.world_mut());
+        system
+            .run_without_applying_deferred((), app.world_mut())
+            .expect("the system body itself must run");
+        app.world_mut().entity_mut(effect).despawn();
+        system.apply_deferred(app.world_mut());
+        app
+    }
+
+    /// The reported crash, from a real game: one flame explodes inside
+    /// another's radius, so an effect is spawned and despawned in the same
+    /// frame, and `insert<EffectLightsSpawned>` / `add_child` resolve a dead
+    /// entity while the buffers flush.
+    #[test]
+    fn an_effect_that_dies_before_its_buffers_flush_applies_them_without_panicking() {
+        let app = despawned_inside_the_command_window(vec![LightData::default()]);
+        assert_eq!(
+            app.world().iter_entities().filter(|e| e.contains::<Particles3d>()).count(),
+            0,
+            "the effect really must be gone -- otherwise this test proves nothing"
+        );
+    }
+
+    /// The half a panic-only fix would miss. The light child used to be
+    /// spawned BEFORE it was parented, so guarding only `add_child` and
+    /// `insert` stops the crash and still leaks: `ChildOf`'s `on_insert` hook
+    /// strips the dangling relationship off the child and keeps the child
+    /// (`bevy_ecs-0.19.0/src/relationship/mod.rs:194-213`), leaving a
+    /// `PointLight` at the world origin that nothing owns and nothing reaps.
+    #[test]
+    fn an_effect_that_dies_before_its_buffers_flush_leaves_no_orphan_light() {
+        let app = despawned_inside_the_command_window(vec![
+            LightData::default(),
+            LightData {
+                kind: FxLightKind::Spot,
+                ..Default::default()
+            },
+        ]);
+        let orphans = app.world().iter_entities().filter(|e| e.contains::<LightEntity>()).count();
+        assert_eq!(orphans, 0, "a dead effect must spawn no light at all");
+        let stray_lights = app
+            .world()
+            .iter_entities()
+            .filter(|e| e.contains::<PointLight>() || e.contains::<SpotLight>())
+            .count();
+        assert_eq!(stray_lights, 0, "no light component may survive at the world origin");
+    }
+
+    /// The live path the guard must not have cost: a surviving effect still
+    /// gets one child per enabled light, each actually PARENTED to it (not
+    /// merely pointing at it via `LightEntity`), and carries the idempotency
+    /// marker itself.
+    #[test]
+    fn a_surviving_effect_gets_its_lights_as_real_children_and_the_marker() {
+        let (app, effect) = app_with(vec![
+            LightData::default(),
+            LightData {
+                enabled: false,
+                ..Default::default()
+            },
+            LightData {
+                kind: FxLightKind::Spot,
+                ..Default::default()
+            },
+        ]);
+        assert!(
+            app.world().get::<EffectLightsSpawned>(effect).is_some(),
+            "the marker belongs on the effect, or the next frame spawns a second set"
+        );
+        let children = app
+            .world()
+            .get::<Children>(effect)
+            .expect("the effect must own its lights through the hierarchy")
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 2, "one child per ENABLED light, disabled ones skipped");
+        for child in children {
+            let link = app
+                .world()
+                .get::<LightEntity>(child)
+                .expect("every child here is a light");
+            assert_eq!(link.parent_system, effect);
+            assert!(
+                app.world().get::<PointLight>(child).is_some()
+                    || app.world().get::<SpotLight>(child).is_some(),
+                "a light child must carry the light component its kind asked for"
+            );
+        }
+        // Index 1 is the disabled light, so the two children must be the
+        // asset's lights 0 and 2 -- a fix that renumbered them while filtering
+        // would send `sync_effect_lights` to the wrong `LightData` forever.
+        let mut indices = app
+            .world()
+            .iter_entities()
+            .filter_map(|e| e.get::<LightEntity>())
+            .map(|l| l.light_index)
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 2]);
     }
 }
